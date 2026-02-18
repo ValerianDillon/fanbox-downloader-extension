@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "pixiv FANBOX の投稿を ZIP として一括ダウンロード",
   "permissions": [],
-  "host_permissions": ["*://*.fanbox.cc/*"],
+  "host_permissions": ["*://*.fanbox.cc/*", "*://*.pximg.net/*"],
   "content_scripts": [
     {
       "matches": ["*://*.fanbox.cc/*"],
