@@ -1,0 +1,25 @@
+{
+  "name": "fanbox-downloader-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "pixiv FANBOX 一括ダウンロード Chrome 拡張 (Manifest V3)",
+  "scripts": {
+    "build": "bun build ./src/content/content.ts --outfile ./dist/content.js --target browser --bundle && bun build ./src/service-worker/service-worker.ts --outfile ./dist/service-worker.js --target browser --bundle && cp static/manifest.json dist/ && cp -r static/icons dist/",
+    "lint": "biome check --write .",
+    "test": "bun test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ValerianDillon/fanbox-downloader-extension.git"
+  },
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/ValerianDillon/fanbox-downloader-extension/issues"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.0.0"
+  },
+  "dependencies": {
+    "download-helper": "github:ValerianDillon/download-helper#v3.5.0"
+  }
+}
