@@ -89,6 +89,7 @@ async function getItemsByCreator(
 
   for (let i = 0; i < urls.length; i++) {
     if (signal.aborted) return;
+    if (!downloadManage.isLimitValid()) break;
     console.log(`${i + 1}回目`);
     try {
       const postList = await fetchPostList(urls[i]);
