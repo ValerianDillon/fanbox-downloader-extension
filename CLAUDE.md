@@ -25,7 +25,7 @@ src/
       download-manage.ts    # DownloadManage
       types.ts              # FANBOX API 型定義
   service-worker/
-    service-worker.ts       # 最小限 (lifecycle のみ)
+    service-worker.ts       # lifecycle + fetch プロキシ (CORS 回避)
 test/
   fanbox/
     collector.test.ts       # convert*Map テスト
@@ -43,12 +43,16 @@ dist/                       # ビルド成果物 (git 管理対象外)
 - Bun でバンドル (TypeScript → 単一 JS)
 - Biome で静的解析・フォーマット
 - Chrome Manifest V3
-- 唯一の runtime 依存: `download-helper` (GitHub git tag)
+- 唯一の runtime 依存: `download-helper` (`github:ValerianDillon/download-helper#v3.5.0`)
 
 ## アーキテクチャ
 
-- content script のみで完結 (host_permissions で CORS 回避)
+- content script + service worker 構成
+  - content script: UI (FAB / overlay) + データ収集 + ZIP 生成
+  - service worker: fetch プロキシ (host_permissions で CORS 回避、ArrayBuffer → base64 変換)
 - FAB ボタンをページに挿入 → overlay パネルで設定 → データ収集 → ZIP ダウンロード
+- overlay は状態マシン: `settings` → `collecting` → `downloading` → `complete`
+- AbortController によるキャンセル対応
 - SPA ナビゲーション対応 (pushState/replaceState フック)
 - shadow DOM でスタイル隔離
 
