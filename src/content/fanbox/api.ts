@@ -64,7 +64,7 @@ export async function fetchPlans(creatorId: string): Promise<Plans['body']> {
 export async function fetchTags(creatorId: string): Promise<string[]> {
   try {
     const result = await fetchJson<Tags>(`https://api.fanbox.cc/tag.getFeatured?creatorId=${creatorId}`);
-    return result.body?.map((tag) => tag.tag) ?? [];
+    return Array.isArray(result.body) ? result.body.map((tag) => tag.tag) : [];
   } catch (e) {
     console.error('タグ情報の取得に失敗:', e);
     return [];
