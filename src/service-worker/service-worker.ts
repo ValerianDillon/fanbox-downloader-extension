@@ -4,9 +4,12 @@ chrome.runtime.onInstalled.addListener(() => {
 
 /**
  * content script からの fetch プロキシ要求を処理する
+ *
  * Manifest V3 では content script の fetch はページのオリジンとして扱われるため、
- * downloads.fanbox.cc への fetch が CORS でブロックされる。
- * service worker は拡張のオリジンで動作し host_permissions が適用されるため CORS を回避できる。
+ * - downloads.fanbox.cc への fetch は CORS でブロックされる
+ * - api.fanbox.cc の 429 レスポンスは CORS ヘッダが無く、JS が status / Retry-After を読めない
+ *
+ * service worker は拡張のオリジンで動作し host_permissions が適用されるため、これらを回避できる。
  */
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'fetch') {
@@ -32,6 +35,26 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .catch(() => {
         sendResponse({ ok: false });
       });
-    return true; // 非同期レスポンスを返すことを示す
+    return true;
+  }
+  if (message.type === 'fetchApi') {
+    fetch(message.url, { credentials: 'include' })
+      .then(async (r) => {
+        const retryAfter = r.headers.get('Retry-After');
+        if (r.status === 429) {
+          sendResponse({ ok: false, status: 429, retryAfter });
+          return;
+        }
+        if (!r.ok) {
+          sendResponse({ ok: false, status: r.status, retryAfter });
+          return;
+        }
+        const body = await r.text();
+        sendResponse({ ok: true, status: r.status, retryAfter, body });
+      })
+      .catch((e) => {
+        sendResponse({ ok: false, status: 0, retryAfter: null, error: String(e) });
+      });
+    return true;
   }
 });

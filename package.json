@@ -4,7 +4,7 @@
   "private": true,
   "description": "pixiv FANBOX 一括ダウンロード Chrome 拡張 (Manifest V3)",
   "scripts": {
-    "build": "bun build ./src/content/content.ts --outfile ./dist/content.js --target browser --bundle && bun build ./src/service-worker/service-worker.ts --outfile ./dist/service-worker.js --target browser --bundle && cp static/manifest.json dist/ && cp -r static/icons dist/",
+    "build": "bun build ./src/content/content.ts --outfile ./dist/content.js --target browser --bundle && bun build ./src/service-worker/service-worker.ts --outfile ./dist/service-worker.js --target browser --bundle && cp static/manifest.json dist/ && cp static/rules.json dist/ && cp -r static/icons dist/",
     "lint": "biome check --write .",
     "test": "bun test"
   },

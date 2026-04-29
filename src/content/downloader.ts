@@ -8,6 +8,19 @@ async function toUint8Array(parts: BlobPart[]): Promise<Uint8Array> {
   return new Uint8Array(await blob.arrayBuffer());
 }
 
+function pad2(n: number): string {
+  return `00${n}`.slice(-2);
+}
+
+function formatRemain(seconds: number): string {
+  if (seconds < 0 || !Number.isFinite(seconds)) return '-:--';
+  const h = (seconds / 3600) | 0;
+  const m = ((seconds - h * 3600) / 60) | 0;
+  const s = seconds - h * 3600 - m * 60;
+  if (h > 0) return `${h}:${pad2(m)}:${pad2(s)}`;
+  return `${pad2(m)}:${pad2(s)}`;
+}
+
 /**
  * service worker 経由で fetch する (CORS 回避)
  * content script の fetch はページのオリジンとして扱われるため、
@@ -52,9 +65,19 @@ export type DownloadProgress = {
 };
 
 /**
+ * 「ダウンロード開始」直後のユーザジェスチャー有効中に呼ぶ。
+ * 収集処理が長引いてジェスチャーが失効する前にファイルハンドルを確保する。
+ */
+export async function pickSaveHandle(suggestedBaseName: string): Promise<FileSystemFileHandle> {
+  const safeName = utils.encodeFileName(suggestedBaseName);
+  return showSaveFilePicker({ suggestedName: `${safeName}.zip` });
+}
+
+/**
  * DownloadObject を ZIP ファイルとして書き出す
  */
 export async function downloadAsZip(
+  handle: FileSystemFileHandle,
   downloadObjJson: string,
   progress: DownloadProgress,
   signal: AbortSignal,
@@ -65,7 +88,6 @@ export async function downloadAsZip(
   }
   const encodedId = utils.encodeFileName(downloadObj.id);
 
-  const handle = await showSaveFilePicker({ suggestedName: `${encodedId}.zip` });
   const writable = await handle.createWritable();
   const zip = new ZipWriter(writable);
 
@@ -115,12 +137,9 @@ export async function downloadAsZip(
         progress.onLog(`${file.encodedName}のダウンロードに失敗`);
       }
       count++;
-      const remain = Math.floor(
-        (Math.abs(Math.floor(Date.now() / 1000) - startTime) * (downloadObj.fileCount - count)) / count,
-      );
-      const h = (remain / (60 * 60)) | 0;
-      const m = Math.ceil((remain - 60 * 60 * h) / 60);
-      progress.onRemainTime(`${h}:${`00${m}`.slice(-2)}`);
+      const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
+      const remain = Math.floor((elapsedSec * (downloadObj.fileCount - count)) / count);
+      progress.onRemainTime(formatRemain(remain));
       progress.onProgress(((count * 100) / downloadObj.fileCount) | 0);
       await utils.sleep(100);
     }
@@ -138,7 +157,7 @@ declare function showSaveFilePicker(options?: {
   types?: { description?: string; accept: Record<string, string[]> }[];
 }): Promise<FileSystemFileHandle>;
 
-interface FileSystemFileHandle {
+export interface FileSystemFileHandle {
   createWritable(): Promise<FileSystemWritableFileStream>;
 }
 

@@ -1,5 +1,5 @@
-import type { DownloadProgress } from './downloader';
-import { downloadAsZip } from './downloader';
+import type { DownloadProgress, FileSystemFileHandle } from './downloader';
+import { downloadAsZip, pickSaveHandle } from './downloader';
 import type { PageType } from './fanbox/api';
 import type { CollectorSettings } from './fanbox/collector';
 import { collect } from './fanbox/collector';
@@ -84,6 +84,7 @@ export class OverlayController {
 
     let ignoreFreeCheckbox: HTMLInputElement | undefined;
     let limitInput: HTMLInputElement | undefined;
+    let intervalInput: HTMLInputElement | undefined;
 
     if (isCreator) {
       const freeLabel = document.createElement('label');
@@ -104,6 +105,20 @@ export class OverlayController {
       limitRow.appendChild(limitLabel);
       limitRow.appendChild(limitInput);
       this.panelEl.appendChild(limitRow);
+
+      const intervalRow = document.createElement('div');
+      intervalRow.className = 'setting-row';
+      const intervalLabel = document.createElement('span');
+      intervalLabel.textContent = 'API 間隔(ms):';
+      intervalInput = document.createElement('input');
+      intervalInput.type = 'number';
+      intervalInput.min = '100';
+      intervalInput.max = '2000';
+      intervalInput.step = '50';
+      intervalInput.value = '500';
+      intervalRow.appendChild(intervalLabel);
+      intervalRow.appendChild(intervalInput);
+      this.panelEl.appendChild(intervalRow);
     }
 
     const btnRow = document.createElement('div');
@@ -111,12 +126,24 @@ export class OverlayController {
     const dlBtn = document.createElement('button');
     dlBtn.className = 'btn-primary';
     dlBtn.textContent = 'ダウンロード開始';
-    dlBtn.addEventListener('click', () => {
+    dlBtn.addEventListener('click', async () => {
+      if (!this.pageType) return;
       const settings: CollectorSettings = {
         isIgnoreFree: ignoreFreeCheckbox?.checked ?? false,
         limit: limitInput?.value ? Number.parseInt(limitInput.value, 10) : null,
+        apiIntervalMs: intervalInput?.value ? Number.parseInt(intervalInput.value, 10) : null,
       };
-      this.startCollecting(settings);
+      // ジェスチャー有効中にファイル保存先を確保する
+      // (収集に時間がかかると transient activation が失効するため)
+      let handle: Awaited<ReturnType<typeof pickSaveHandle>>;
+      try {
+        handle = await pickSaveHandle(this.pageType.creatorId);
+      } catch (e) {
+        if (e instanceof DOMException && e.name === 'AbortError') return;
+        console.error('ファイル保存先の取得に失敗:', e);
+        return;
+      }
+      this.startCollecting(settings, handle);
     });
     btnRow.appendChild(dlBtn);
 
@@ -213,11 +240,12 @@ export class OverlayController {
     this.panelEl.appendChild(btnRow);
   }
 
-  private async startCollecting(settings: CollectorSettings) {
+  private async startCollecting(settings: CollectorSettings, saveHandle: FileSystemFileHandle) {
     if (!this.pageType) return;
     this.state = 'collecting';
     this.renderCollecting();
     this.abortController = new AbortController();
+    const signal = this.abortController.signal;
 
     const beforeUnload = (e: BeforeUnloadEvent) => {
       e.returnValue = 'downloading';
@@ -228,7 +256,7 @@ export class OverlayController {
       const creatorId = this.pageType.creatorId;
       const postId = this.pageType.type === 'post' ? this.pageType.postId : undefined;
 
-      const downloadObject = await collect(
+      const { downloadObject, failedPostCount } = await collect(
         creatorId,
         postId,
         settings,
@@ -236,10 +264,10 @@ export class OverlayController {
           const el = this.shadowRoot.getElementById('collect-progress');
           if (el) el.textContent = `投稿情報を収集中... (${current}/${total})`;
         },
-        this.abortController.signal,
+        signal,
       );
 
-      if (this.abortController.signal.aborted) return;
+      if (signal.aborted) return;
 
       this.state = 'downloading';
       this.renderDownloading();
@@ -263,12 +291,16 @@ export class OverlayController {
       };
 
       const json = downloadObject.stringify();
-      await downloadAsZip(json, downloadProgress, this.abortController.signal);
+      await downloadAsZip(saveHandle, json, downloadProgress, signal);
 
       this.state = 'complete';
-      this.renderComplete('ダウンロードが完了しました');
+      const failedSuffix =
+        failedPostCount > 0
+          ? `\n${failedPostCount} 件は取得に失敗しました (FANBOX のレート制限の可能性があります)`
+          : '';
+      this.renderComplete(`ダウンロードが完了しました${failedSuffix}`);
     } catch (e) {
-      if (this.abortController?.signal.aborted) return;
+      if (signal.aborted) return;
       console.error('ダウンロードエラー:', e);
       this.state = 'complete';
       this.renderComplete(`エラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);
