@@ -91,8 +91,14 @@ export async function downloadAsZip(
   const writable = await handle.createWritable();
   const zip = new ZipWriter(writable);
 
-  const enqueue = async (fileBits: BlobPart[], path: string) => {
-    await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits));
+  const enqueue = async (fileBits: BlobPart[], path: string, date?: Date) => {
+    await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
+  };
+
+  const parsePublishedDate = (iso?: string): Date | undefined => {
+    if (!iso) return undefined;
+    const d = new Date(iso);
+    return Number.isFinite(d.getTime()) ? d : undefined;
   };
 
   const startTime = Math.floor(Date.now() / 1000);
@@ -109,15 +115,24 @@ export async function downloadAsZip(
       return;
     }
     progress.onLog(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
+    const postDate = parsePublishedDate(post.publishedDatetime);
     const informationFile = utils.createInformationFile(post.informationText);
-    await enqueue(informationFile.content, `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`);
-    await enqueue([helper.createHtmlFromBody(post.originalName, post.htmlText)], `${post.encodedName}/index.html`);
+    await enqueue(
+      informationFile.content,
+      `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`,
+      postDate,
+    );
+    await enqueue(
+      [helper.createHtmlFromBody(post.originalName, post.htmlText)],
+      `${post.encodedName}/index.html`,
+      postDate,
+    );
 
     if (post.cover) {
       progress.onLog(`download ${post.cover.name}`);
       const blob = await fetchWithRetry(post.cover.url, post.cover.name, 1);
       if (blob) {
-        await enqueue([blob], `${post.encodedName}/${post.cover.name}`);
+        await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
       }
     }
 
@@ -130,7 +145,7 @@ export async function downloadAsZip(
       progress.onLog(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
       const blob = await fetchWithRetry(file.url, file.encodedName, 1);
       if (blob) {
-        await enqueue([blob], `${post.encodedName}/${file.encodedName}`);
+        await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
       } else {
         failedCount++;
         console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);

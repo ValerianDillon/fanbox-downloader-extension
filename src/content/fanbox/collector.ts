@@ -151,6 +151,10 @@ export function addByPostInfo(downloadManage: DownloadManage, postInfo: PostInfo
   }
   const postName = postInfo.title;
   const postObject = downloadManage.downloadObject.addPost(postName);
+  const publishedDatetime = (postInfo as { publishedDatetime?: unknown }).publishedDatetime;
+  if (typeof publishedDatetime === 'string' && publishedDatetime.length > 0) {
+    postObject.setPublishedDatetime(publishedDatetime);
+  }
   postObject.setTags([downloadManage.getTagByFee(postInfo.feeRequired), ...postInfo.tags]);
   downloadManage.addFee(postInfo.feeRequired);
   downloadManage.addTags(...postInfo.tags);

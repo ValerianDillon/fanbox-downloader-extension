@@ -1,11 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  addByPostInfo,
   convertEmbedMap,
   convertFileMap,
   convertImageMap,
   convertUrlEmbedMap,
 } from '../../src/content/fanbox/collector';
-import type { Block, EmbedInfo, FileInfo, ImageInfo, UrlEmbedInfo } from '../../src/content/fanbox/types';
+import { DownloadManage } from '../../src/content/fanbox/download-manage';
+import type { Block, EmbedInfo, FileInfo, ImageInfo, PostInfo, UrlEmbedInfo } from '../../src/content/fanbox/types';
 
 describe('convertImageMap', () => {
   test('blocks 順にソートされる', () => {
@@ -149,5 +151,55 @@ describe('convertUrlEmbedMap', () => {
     const result = convertUrlEmbedMap(urlEmbedMap, blocks);
     expect(result[0].id).toBe('ue1');
     expect(result[1].id).toBe('ueX');
+  });
+});
+
+describe('addByPostInfo - publishedDatetime', () => {
+  const createManage = () => new DownloadManage('testUser', new Map<number, string>());
+
+  // text タイプは addFile を呼ばず、coverImageUrl: null で header の画像分岐も回避できる最小構成
+  const baseTextPost = (publishedDatetime: string): PostInfo => ({
+    title: 'タイトル',
+    feeRequired: 0,
+    id: 'post-1',
+    creatorId: 'creator',
+    coverImageUrl: null,
+    excerpt: '',
+    isRestricted: false,
+    tags: [],
+    publishedDatetime,
+    updatedDatetime: '2024-05-02T00:00:00Z',
+    likeCount: 0,
+    commentCount: 0,
+    type: 'text',
+    body: { text: 'hello' },
+  });
+
+  const firstPost = (m: DownloadManage) => JSON.parse(m.downloadObject.stringify()).posts[0];
+
+  test('publishedDatetime が posts に含まれる', () => {
+    const m = createManage();
+    addByPostInfo(m, baseTextPost('2024-05-01T12:34:56Z'));
+    expect(firstPost(m).publishedDatetime).toBe('2024-05-01T12:34:56Z');
+  });
+
+  test('空文字 publishedDatetime → setPublishedDatetime を呼ばず例外なし', () => {
+    const m = createManage();
+    expect(() => addByPostInfo(m, baseTextPost(''))).not.toThrow();
+    expect(firstPost(m).publishedDatetime).toBeUndefined();
+  });
+
+  test('未定義 publishedDatetime でも例外なし', () => {
+    const m = createManage();
+    const bad = { ...baseTextPost('x'), publishedDatetime: undefined } as unknown as PostInfo;
+    expect(() => addByPostInfo(m, bad)).not.toThrow();
+    expect(firstPost(m).publishedDatetime).toBeUndefined();
+  });
+
+  test('非文字列 publishedDatetime でも例外なし', () => {
+    const m = createManage();
+    const bad = { ...baseTextPost('x'), publishedDatetime: 12345 } as unknown as PostInfo;
+    expect(() => addByPostInfo(m, bad)).not.toThrow();
+    expect(firstPost(m).publishedDatetime).toBeUndefined();
   });
 });
