@@ -11,7 +11,8 @@
     },
     "condition": {
       "urlFilter": "||fanbox.cc/",
-      "resourceTypes": ["xmlhttprequest"]
+      "resourceTypes": ["xmlhttprequest"],
+      "excludedInitiatorDomains": ["fanbox.cc"]
     }
   }
 ]
