@@ -1,25 +1,10 @@
-import { DownloadHelper, DownloadUtils, ZipWriter } from 'download-helper/download-helper';
+import type { FileSystemFileHandle } from 'download-helper/download-helper';
+import { DownloadHelper, DownloadUtils } from 'download-helper/download-helper';
+
+export type { FileSystemFileHandle } from 'download-helper/download-helper';
 
 const utils = new DownloadUtils();
 const helper = new DownloadHelper(utils);
-
-async function toUint8Array(parts: BlobPart[]): Promise<Uint8Array> {
-  const blob = new Blob(parts);
-  return new Uint8Array(await blob.arrayBuffer());
-}
-
-function pad2(n: number): string {
-  return `00${n}`.slice(-2);
-}
-
-function formatRemain(seconds: number): string {
-  if (seconds < 0 || !Number.isFinite(seconds)) return '-:--';
-  const h = (seconds / 3600) | 0;
-  const m = ((seconds - h * 3600) / 60) | 0;
-  const s = seconds - h * 3600 - m * 60;
-  if (h > 0) return `${h}:${pad2(m)}:${pad2(s)}`;
-  return `${pad2(m)}:${pad2(s)}`;
-}
 
 /**
  * service worker 経由で fetch する (CORS 回避)
@@ -83,100 +68,14 @@ export async function downloadAsZip(
   signal: AbortSignal,
 ): Promise<void> {
   const downloadObj: unknown = JSON.parse(downloadObjJson);
-  if (!helper.isDownloadJsonObj(downloadObj)) {
-    throw new Error('ダウンロード対象オブジェクトの型が不正');
-  }
-  const encodedId = utils.encodeFileName(downloadObj.id);
-
-  const writable = await handle.createWritable();
-  const zip = new ZipWriter(writable);
-
-  const enqueue = async (fileBits: BlobPart[], path: string, date?: Date) => {
-    await zip.addFile(`${encodedId}/${path}`, await toUint8Array(fileBits), date);
-  };
-
-  const parsePublishedDate = (iso?: string): Date | undefined => {
-    if (!iso) return undefined;
-    const d = new Date(iso);
-    return Number.isFinite(d.getTime()) ? d : undefined;
-  };
-
-  const startTime = Math.floor(Date.now() / 1000);
-  let count = 0;
-  let failedCount = 0;
-
-  progress.onLog(`@${downloadObj.id} 投稿:${downloadObj.postCount} ファイル:${downloadObj.fileCount}`);
-  await enqueue([helper.createRootHtmlFromPosts(downloadObj)], 'index.html');
-
-  let postCount = 0;
-  for (const post of downloadObj.posts) {
-    if (signal.aborted) {
-      await zip.close();
-      return;
-    }
-    progress.onLog(`${post.originalName} (${++postCount}/${downloadObj.postCount})`);
-    const postDate = parsePublishedDate(post.publishedDatetime);
-    const informationFile = utils.createInformationFile(post.informationText);
-    await enqueue(
-      informationFile.content,
-      `${post.encodedName}/${utils.encodeFileName(informationFile.name)}`,
-      postDate,
-    );
-    await enqueue(
-      [helper.createHtmlFromBody(post.originalName, post.htmlText)],
-      `${post.encodedName}/index.html`,
-      postDate,
-    );
-
-    if (post.cover) {
-      progress.onLog(`download ${post.cover.name}`);
-      const blob = await fetchWithRetry(post.cover.url, post.cover.name, 1);
-      if (blob) {
-        await enqueue([blob], `${post.encodedName}/${post.cover.name}`, postDate);
-      }
-    }
-
-    let fileCount = 0;
-    for (const file of post.files) {
-      if (signal.aborted) {
-        await zip.close();
-        return;
-      }
-      progress.onLog(`download ${file.encodedName} (${++fileCount}/${post.files.length})`);
-      const blob = await fetchWithRetry(file.url, file.encodedName, 1);
-      if (blob) {
-        await enqueue([blob], `${post.encodedName}/${file.encodedName}`, postDate);
-      } else {
-        failedCount++;
-        console.error(`${file.encodedName}(${file.url})のダウンロードに失敗、読み飛ばすよ`);
-        progress.onLog(`${file.encodedName}のダウンロードに失敗`);
-      }
-      count++;
-      const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - startTime);
-      const remain = Math.floor((elapsedSec * (downloadObj.fileCount - count)) / count);
-      progress.onRemainTime(formatRemain(remain));
-      progress.onProgress(((count * 100) / downloadObj.fileCount) | 0);
-      await utils.sleep(100);
-    }
-  }
-  if (failedCount > 0) {
-    progress.onLog(`完了 (${failedCount}件のダウンロードに失敗)`);
-  } else {
-    progress.onLog('完了');
-  }
-  await zip.close();
+  await helper.downloadZip(downloadObj, progress.onProgress, progress.onLog, progress.onRemainTime, {
+    handle,
+    signal,
+    fetchFile: (url, name) => fetchWithRetry(url, name, 1),
+  });
 }
 
 declare function showSaveFilePicker(options?: {
   suggestedName?: string;
   types?: { description?: string; accept: Record<string, string[]> }[];
 }): Promise<FileSystemFileHandle>;
-
-export interface FileSystemFileHandle {
-  createWritable(): Promise<FileSystemWritableFileStream>;
-}
-
-interface FileSystemWritableFileStream extends WritableStream {
-  write(data: BufferSource | Blob | string): Promise<void>;
-  close(): Promise<void>;
-}

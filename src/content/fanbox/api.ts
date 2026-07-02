@@ -1,4 +1,4 @@
-import type { Plans, PostInfo, Tags } from './types';
+import type { Plans, PostInfo, Tags } from 'download-helper/fanbox-collector';
 
 export const DEFAULT_API_RATE_LIMIT_MS = 500;
 const RETRY_BACKOFF_MS = [5_000, 15_000, 45_000];
