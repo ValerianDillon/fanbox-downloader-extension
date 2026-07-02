@@ -18,20 +18,17 @@ src/
     fab.ts                  # FAB ボタン (shadow DOM)
     overlay.ts              # オーバーレイパネル (shadow DOM)
     overlay.css             # FAB + overlay スタイル
-    downloader.ts           # ZIP ダウンロード (ZipWriter 利用)
+    downloader.ts           # download-helper への薄いアダプタ (service worker 経由 fetch, ハンドル取得)
     fanbox/
       api.ts                # FANBOX API クライアント (async fetch)
-      collector.ts          # データ収集 (searchBy 相当)
-      download-manage.ts    # DownloadManage
-      types.ts              # FANBOX API 型定義
+      collector.ts          # データ収集 (searchBy 相当, addByPostInfo は download-helper から利用)
   service-worker/
     service-worker.ts       # lifecycle + fetch プロキシ (CORS 回避)
 test/
   fanbox/
-    collector.test.ts       # convert*Map テスト
-    download-manage.test.ts # DownloadManage テスト
     api.test.ts             # detectPage テスト
   overlay.test.ts           # 状態遷移テスト
+  downloader.test.ts        # downloadAsZip (publishedDatetime の mtime 反映) テスト
 static/
   manifest.json
   icons/
@@ -43,7 +40,9 @@ dist/                       # ビルド成果物 (git 管理対象外)
 - Bun でバンドル (TypeScript → 単一 JS)
 - Biome で静的解析・フォーマット
 - Chrome Manifest V3
-- 唯一の runtime 依存: `download-helper` (`github:ValerianDillon/download-helper#v3.5.0`)
+- 唯一の runtime 依存: `download-helper` (`github:ValerianDillon/download-helper#v3.7.0`)
+  - `download-helper/download-helper`: `DownloadHelper.downloadZip` (ZIP 生成本体), `DownloadUtils`, `ZipWriter` など
+  - `download-helper/fanbox-collector`: FANBOX API 型定義 (`PostInfo` 等), `DownloadManage`, `addByPostInfo`, `convert*Map` など FANBOX 固有の共通ロジック (fanbox-downloader と共用)
 
 ## アーキテクチャ
 
@@ -55,6 +54,7 @@ dist/                       # ビルド成果物 (git 管理対象外)
 - AbortController によるキャンセル対応
 - SPA ナビゲーション対応 (pushState/replaceState フック)
 - shadow DOM でスタイル隔離
+- FANBOX 固有の収集ロジックと ZIP 生成本体 (downloadZip) は `download-helper` に集約されており、拡張側は service worker 経由の fetch 差し替えや FileSystemFileHandle 取得など拡張固有の処理のみを担う
 
 ## コーディング規約
 
