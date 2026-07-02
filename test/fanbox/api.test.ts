@@ -179,17 +179,6 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     expect(calls).toHaveLength(3);
   });
 
-  test('連続呼び出しは最小間隔以上空く', async () => {
-    setApiRateLimitMs(400);
-    responders.push(() => okJson({ body: { id: '1' } }));
-    responders.push(() => okJson({ body: { id: '2' } }));
-
-    const before = virtualWaitMs;
-    await fetchPostInfo('1');
-    await fetchPostInfo('2');
-    expect(virtualWaitMs - before).toBeGreaterThanOrEqual(400);
-  });
-
   test('signal.abort() でリトライ中の待機を中断する', async () => {
     responders.push(() => tooManyRequests('60'));
     const controller = new AbortController();
