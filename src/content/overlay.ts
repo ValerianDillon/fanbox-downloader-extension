@@ -4,6 +4,7 @@ import type { PageType } from './fanbox/api';
 import type { CollectorSettings } from './fanbox/collector';
 import { collect } from './fanbox/collector';
 import css from './overlay.css' with { type: 'text' };
+import { publishTestState, resetTestState, SHADOW_ROOT_MODE } from './test-hooks';
 
 export type OverlayState = 'settings' | 'collecting' | 'downloading' | 'complete';
 
@@ -16,7 +17,7 @@ export class OverlayController {
   private pageType: PageType = null;
 
   constructor(hostEl: HTMLElement) {
-    this.shadowRoot = hostEl.attachShadow({ mode: 'closed' });
+    this.shadowRoot = hostEl.attachShadow({ mode: SHADOW_ROOT_MODE });
     const style = document.createElement('style');
     style.textContent = css;
     this.shadowRoot.appendChild(style);
@@ -26,12 +27,33 @@ export class OverlayController {
     return this.state;
   }
 
+  private setState(state: OverlayState) {
+    this.state = state;
+    publishTestState({ 'overlay-state': state });
+  }
+
+  /**
+   * signal がまだ「現行の」実行 (this.abortController) のものである場合に限り
+   * data-fbdl-aborted を publish する。
+   *
+   * startCollecting は連続で呼ばれ得る (キャンセル直後に再度「ダウンロード開始」を押す等)。
+   * この時、旧実行の非同期処理 (collect/downloadAsZip 内の Promise) が abort による reject
+   * で遅れて解決すると、旧実行のクロージャが持つ signal はまだ aborted のままだが、
+   * this.abortController は既に新しい実行のものに差し替わっている。
+   * この判定なしに publish すると、旧実行の遅延 publish が新実行の状態を上書きしうる。
+   */
+  private publishAbortedIfCurrent(signal: AbortSignal) {
+    if (signal === this.abortController?.signal) {
+      publishTestState({ aborted: '1' });
+    }
+  }
+
   setPageType(pageType: PageType) {
     this.pageType = pageType;
   }
 
   showPanel() {
-    this.state = 'settings';
+    this.setState('settings');
     this.renderPanel();
   }
 
@@ -45,7 +67,7 @@ export class OverlayController {
       this.backdropEl = null;
       this.panelEl = null;
     }
-    this.state = 'settings';
+    this.setState('settings');
   }
 
   private renderPanel() {
@@ -242,7 +264,8 @@ export class OverlayController {
 
   private async startCollecting(settings: CollectorSettings, saveHandle: FileSystemFileHandle) {
     if (!this.pageType) return;
-    this.state = 'collecting';
+    resetTestState();
+    this.setState('collecting');
     this.renderCollecting();
     this.abortController = new AbortController();
     const signal = this.abortController.signal;
@@ -267,9 +290,14 @@ export class OverlayController {
         signal,
       );
 
-      if (signal.aborted) return;
+      if (signal.aborted) {
+        this.publishAbortedIfCurrent(signal);
+        return;
+      }
 
-      this.state = 'downloading';
+      publishTestState({ 'failed-post-count': String(failedPostCount) });
+
+      this.setState('downloading');
       this.renderDownloading();
 
       const downloadProgress: DownloadProgress = {
@@ -293,16 +321,20 @@ export class OverlayController {
       const json = downloadObject.stringify();
       await downloadAsZip(saveHandle, json, downloadProgress, signal);
 
-      this.state = 'complete';
+      this.setState('complete');
       const failedSuffix =
         failedPostCount > 0
           ? `\n${failedPostCount} 件は取得に失敗しました (FANBOX のレート制限の可能性があります)`
           : '';
       this.renderComplete(`ダウンロードが完了しました${failedSuffix}`);
     } catch (e) {
-      if (signal.aborted) return;
+      if (signal.aborted) {
+        this.publishAbortedIfCurrent(signal);
+        return;
+      }
       console.error('ダウンロードエラー:', e);
-      this.state = 'complete';
+      publishTestState({ error: '1' });
+      this.setState('complete');
       this.renderComplete(`エラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       window.removeEventListener('beforeunload', beforeUnload);

@@ -1,3 +1,5 @@
+import { uint8ArrayToBase64 } from '../base64';
+
 chrome.runtime.onInstalled.addListener(() => {
   console.log('FANBOX Downloader installed');
 });
@@ -25,12 +27,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
         // ArrayBuffer → base64 (messaging 経由で転送するため)
         const bytes = new Uint8Array(buf);
-        const chunks: string[] = [];
-        const chunkSize = 0x8000;
-        for (let i = 0; i < bytes.length; i += chunkSize) {
-          chunks.push(String.fromCharCode(...bytes.subarray(i, i + chunkSize)));
-        }
-        sendResponse({ ok: true, data: btoa(chunks.join('')) });
+        sendResponse({ ok: true, data: uint8ArrayToBase64(bytes) });
       })
       .catch(() => {
         sendResponse({ ok: false });

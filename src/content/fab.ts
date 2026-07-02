@@ -1,5 +1,6 @@
 import type { PageType } from './fanbox/api';
 import { OverlayController } from './overlay';
+import { SHADOW_ROOT_MODE } from './test-hooks';
 
 const FAB_STYLES = `
   :host {
@@ -54,7 +55,7 @@ export class FabManager {
     if (!this.fabHost) {
       this.fabHost = document.createElement('div');
       this.fabHost.id = 'fanbox-downloader-ext-fab';
-      this.fabShadow = this.fabHost.attachShadow({ mode: 'closed' });
+      this.fabShadow = this.fabHost.attachShadow({ mode: SHADOW_ROOT_MODE });
 
       const style = document.createElement('style');
       style.textContent = FAB_STYLES;

@@ -22,7 +22,28 @@ jobs:
         run: bun run lint
 
       - name: Test
-        run: bun test
+        run: bun run test
 
       - name: Build
         run: bun run build
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - run: bun install
+
+      - name: Install Playwright Chromium
+        run: bunx playwright install --with-deps chromium
+
+      - name: Smoke test (Playwright, extension e2e)
+        run: bun run test:smoke

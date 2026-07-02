@@ -1,5 +1,6 @@
 import type { FileSystemFileHandle } from 'download-helper/download-helper';
 import { DownloadHelper, DownloadUtils } from 'download-helper/download-helper';
+import { createTestSaveHandle, IS_TEST_BUILD, wrapFetchFileForTest } from './test-hooks';
 
 export type { FileSystemFileHandle } from 'download-helper/download-helper';
 
@@ -54,6 +55,9 @@ export type DownloadProgress = {
  * 収集処理が長引いてジェスチャーが失効する前にファイルハンドルを確保する。
  */
 export async function pickSaveHandle(suggestedBaseName: string): Promise<FileSystemFileHandle> {
+  if (IS_TEST_BUILD) {
+    return createTestSaveHandle();
+  }
   const safeName = utils.encodeFileName(suggestedBaseName);
   return showSaveFilePicker({ suggestedName: `${safeName}.zip` });
 }
@@ -68,10 +72,11 @@ export async function downloadAsZip(
   signal: AbortSignal,
 ): Promise<void> {
   const downloadObj: unknown = JSON.parse(downloadObjJson);
+  const fetchFile = wrapFetchFileForTest((url, name) => fetchWithRetry(url, name, 1));
   await helper.downloadZip(downloadObj, progress.onProgress, progress.onLog, progress.onRemainTime, {
     handle,
     signal,
-    fetchFile: (url, name) => fetchWithRetry(url, name, 1),
+    fetchFile,
   });
 }
 

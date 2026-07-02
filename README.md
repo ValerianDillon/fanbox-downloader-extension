@@ -43,11 +43,18 @@ bun run build
 ## 開発
 
 ```bash
-bun install        # 依存関係インストール
-bun run build      # ビルド (dist/ に出力)
-bun run lint       # 静的解析・フォーマット
-bun test           # テスト実行
+bun install         # 依存関係インストール
+bun run build       # ビルド (dist/ に出力)
+bun run lint        # 静的解析・フォーマット
+bun test            # ユニットテスト実行
+bun run test:smoke  # 拡張の smoke test (Playwright, headless Chromium)
 ```
+
+`bun run test:smoke` は拡張の smoke test を実行する。
+テストビルド (`dist-test/`) を実際に Chromium (headless, WSL2 で動作確認済み) に読み込み、FAB クリックから収集・ZIP 生成までの一連の流れを検証する。
+検証範囲は「収集の完走・全ファイル取得成功・ZIP の妥当性 (エントリ一致・EOCD の整合性)」までである。
+実ファイルへの保存 (`showSaveFilePicker` はネイティブダイアログのためブラウザ自動化では扱えない) と、ZIP エントリの mtime 反映 (`test/downloader.test.ts` でカバー済み) は対象外である。
+詳細は `CLAUDE.md` の「smoke test (Playwright)」を参照。
 
 ## 技術スタック
 
