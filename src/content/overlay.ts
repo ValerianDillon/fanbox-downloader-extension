@@ -279,7 +279,7 @@ export class OverlayController {
       const creatorId = this.pageType.creatorId;
       const postId = this.pageType.type === 'post' ? this.pageType.postId : undefined;
 
-      const { downloadObject, failedPostCount, failedPageCount } = await collect(
+      const { downloadObject, failedPostCount, failedPageCount, stoppedReason } = await collect(
         creatorId,
         postId,
         settings,
@@ -298,6 +298,7 @@ export class OverlayController {
       publishTestState({
         'failed-post-count': String(failedPostCount),
         'failed-page-count': String(failedPageCount),
+        ...(stoppedReason ? { 'stopped-reason': stoppedReason } : {}),
       });
 
       this.setState('downloading');
@@ -340,7 +341,12 @@ export class OverlayController {
       const failedSuffix = failures.length
         ? `\n${failures.join(' と ')}の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`
         : '';
-      this.renderComplete(`ダウンロードが完了しました${failedSuffix}`);
+      // 打ち切った場合もそこまでの分は保存済みなので、完了ではなく不完全と伝える
+      const headline =
+        stoppedReason === 'rate-limit-exhausted'
+          ? 'レート制限のため途中で打ち切りました (取得できた分のみ保存しています)'
+          : 'ダウンロードが完了しました';
+      this.renderComplete(`${headline}${failedSuffix}`);
     } catch (e) {
       if (signal.aborted) {
         this.publishAbortedIfCurrent(signal);

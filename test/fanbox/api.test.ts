@@ -1,15 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
+  ApiSession,
   DEFAULT_API_RATE_LIMIT_MS,
   detectPage,
-  fetchPaginatedPosts,
-  fetchPlans,
-  fetchPostInfo,
-  fetchPostList,
-  fetchTags,
-  getApiRateLimitMs,
-  resetApiRateLimitState,
-  setApiRateLimitMs,
+  RateLimitExhaustedError,
 } from '../../src/content/fanbox/api';
 
 describe('detectPage', () => {
@@ -99,6 +93,7 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
   const origChrome = (globalThis as any).chrome;
   let calls: ApiCall[];
   let responders: ApiResponder[];
+  let api: ApiSession;
   // 仮想時間: setTimeout を即時実行に置換し、待機時間の累積だけ測る
   let virtualWaitMs: number;
 
@@ -120,8 +115,8 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
   beforeEach(() => {
     calls = [];
     responders = [];
-    resetApiRateLimitState();
-    setApiRateLimitMs(DEFAULT_API_RATE_LIMIT_MS);
+    ApiSession.resetSharedBackoff();
+    api = new ApiSession(DEFAULT_API_RATE_LIMIT_MS);
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = {
       runtime: {
@@ -141,14 +136,14 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = origChrome;
     restoreTimers();
-    resetApiRateLimitState();
+    ApiSession.resetSharedBackoff();
   });
 
   test('429 + Retry-After (秒) を読んでリトライする', async () => {
     responders.push(() => tooManyRequests('2'));
     responders.push(() => okJson({ body: { post: { id: '1', title: 'x', type: 'image', isRestricted: false } } }));
 
-    const result = await fetchPostInfo('1');
+    const result = await api.fetchPostInfo('1');
     expect(result).toEqual({ id: '1', title: 'x', type: 'image', isRestricted: false } as never);
     expect(calls).toHaveLength(2);
     expect(virtualWaitMs).toBeGreaterThanOrEqual(2_000);
@@ -159,7 +154,7 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     responders.push(() => tooManyRequests(future));
     responders.push(() => okJson({ body: { post: { id: '2', type: 'image', isRestricted: false } } }));
 
-    const result = await fetchPostInfo('2');
+    const result = await api.fetchPostInfo('2');
     expect(result).toEqual({ id: '2', type: 'image', isRestricted: false } as never);
     expect(calls).toHaveLength(2);
   });
@@ -169,51 +164,181 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     responders.push(() => tooManyRequests());
     responders.push(() => okJson({ body: { post: { id: '3', type: 'image', isRestricted: false } } }));
 
-    await fetchPostInfo('3');
+    await api.fetchPostInfo('3');
     expect(calls).toHaveLength(3);
     expect(virtualWaitMs).toBeGreaterThanOrEqual(5_000 + 15_000);
   });
 
-  test('リトライ上限を超えると例外を投げる', async () => {
-    responders.push(() => tooManyRequests());
-    responders.push(() => tooManyRequests());
-    responders.push(() => tooManyRequests());
+  test('5s / 15s / 45s を実際に待って再試行し、4 回目で枯渇する', async () => {
+    for (let i = 0; i < 4; i++) responders.push(() => tooManyRequests());
 
-    await expect(fetchPostInfo('x')).rejects.toThrow(/HTTP 429/);
-    expect(calls).toHaveLength(3);
+    await expect(api.fetchPostInfo('x')).rejects.toThrow(RateLimitExhaustedError);
+    // 初回 + 再試行 3 回 = 4 リクエスト、累積待機 65 秒
+    expect(calls).toHaveLength(4);
+    expect(virtualWaitMs).toBeGreaterThanOrEqual(5_000 + 15_000 + 45_000);
+  });
+
+  test('通信失敗は 429 の再試行枠を消費しない', async () => {
+    // 通信失敗 → 再試行 → 429 が 3 回続いても、429 の枠は使い切られない
+    responders.push(() => Promise.reject(new Error('network')));
+    for (let i = 0; i < 3; i++) responders.push(() => tooManyRequests());
+    responders.push(() => okJson({ body: { post: { id: '1', type: 'image', isRestricted: false } } }));
+
+    const result = await api.fetchPostInfo('1');
+    expect(result).toEqual({ id: '1', type: 'image', isRestricted: false } as never);
+    expect(calls).toHaveLength(5);
+  });
+
+  const okPost = () => okJson({ body: { post: { id: '1', type: 'image', isRestricted: false } } });
+
+  /** 引き上がった状態にしてから n 回成功させる */
+  async function escalateThenSucceed(n: number): Promise<number> {
+    responders.push(() => tooManyRequests('1'));
+    responders.push(okPost);
+    await api.fetchPostInfo('1');
+    const escalated = api.getIntervalMs();
+    for (let i = 0; i < n; i++) {
+      responders.push(okPost);
+      await api.fetchPostInfo('1');
+    }
+    return escalated;
+  }
+
+  test('静穏期間を満たさないうちは引き上げた間隔を戻さない', async () => {
+    api = new ApiSession(500);
+    const escalated = await escalateThenSucceed(20);
+    expect(escalated).toBeGreaterThan(500);
+    expect(api.getIntervalMs()).toBe(escalated);
+  });
+
+  test('連続成功と静穏期間を満たしたら引き上げた間隔を戻す', async () => {
+    api = new ApiSession(500);
+    const escalated = await escalateThenSucceed(19);
+    // 静穏期間を跨がせる
+    const origNow = Date.now;
+    const shifted = origNow() + 61_000;
+    Date.now = () => shifted;
+    try {
+      responders.push(okPost);
+      await api.fetchPostInfo('1');
+    } finally {
+      Date.now = origNow;
+    }
+    expect(api.getIntervalMs()).toBeLessThan(escalated);
+  });
+
+  test('途中で失敗すると連続成功が切れて減衰しない', async () => {
+    api = new ApiSession(500);
+    const escalated = await escalateThenSucceed(19);
+    // 19 回成功した後に HTTP 500 を挟むと、次の成功は 1 回目として数え直される
+    responders.push(() => errorStatus(500));
+    await expect(api.fetchPostInfo('1')).rejects.toThrow(/HTTP 500/);
+    const origNow = Date.now;
+    const shifted = origNow() + 61_000;
+    Date.now = () => shifted;
+    try {
+      responders.push(okPost);
+      await api.fetchPostInfo('1');
+    } finally {
+      Date.now = origNow;
+    }
+    expect(api.getIntervalMs()).toBe(escalated);
+  });
+
+  test('service worker が status 0 で返す通信失敗も再試行する', async () => {
+    // service worker は fetch の失敗を reject せず status 0 で返す
+    responders.push(() => ({ ok: false, status: 0, retryAfter: null, error: 'Failed to fetch' }));
+    responders.push(okPost);
+
+    const result = await api.fetchPostInfo('1');
+    expect(result).toEqual({ id: '1', type: 'image', isRestricted: false } as never);
+    expect(calls).toHaveLength(2);
+  });
+
+  test('status 0 が続けば再試行上限で投げる', async () => {
+    responders.push(() => ({ ok: false, status: 0, retryAfter: null, error: 'Failed to fetch' }));
+    responders.push(() => ({ ok: false, status: 0, retryAfter: null, error: 'Failed to fetch' }));
+
+    await expect(api.fetchPostInfo('1')).rejects.toThrow(/通信に失敗/);
+    expect(calls).toHaveLength(2);
+  });
+
+  test('サーバー指定のバックオフは収集をまたいでも守る', async () => {
+    // 打ち切った直後に再実行しても、Retry-After の期限までは発行しない
+    api = new ApiSession(50);
+    for (let i = 0; i < 3; i++) responders.push(() => tooManyRequests('0'));
+    responders.push(() => tooManyRequests('120'));
+    await expect(api.fetchPostInfo('x')).rejects.toThrow(RateLimitExhaustedError);
+
+    const next = new ApiSession(50);
+    responders.push(okPost);
+    const before = virtualWaitMs;
+    await next.fetchPostInfo('1');
+    expect(virtualWaitMs - before).toBeGreaterThanOrEqual(119_000);
+  });
+
+  test('壊れたレスポンスは成功として数えない', async () => {
+    api = new ApiSession(500);
+    const escalated = await escalateThenSucceed(19);
+    // JSON として読めないレスポンスで連続成功が切れる
+    responders.push(() => ({ ok: true, status: 200, retryAfter: null, body: '{ broken' }));
+    await expect(api.fetchPostInfo('1')).rejects.toThrow();
+    const origNow = Date.now;
+    const shifted = origNow() + 61_000;
+    Date.now = () => shifted;
+    try {
+      responders.push(okPost);
+      await api.fetchPostInfo('1');
+    } finally {
+      Date.now = origNow;
+    }
+    expect(api.getIntervalMs()).toBe(escalated);
+  });
+
+  test('枯渇した最後の 429 の Retry-After も後続のために記録する', async () => {
+    api = new ApiSession(50);
+    for (let i = 0; i < 3; i++) responders.push(() => tooManyRequests('0'));
+    responders.push(() => tooManyRequests('120'));
+    await expect(api.fetchPostInfo('x')).rejects.toThrow(RateLimitExhaustedError);
+
+    // 後続のリクエストは記録された 120 秒のバックオフを待つ
+    responders.push(okPost);
+    const before = virtualWaitMs;
+    await api.fetchPostInfo('1');
+    expect(virtualWaitMs - before).toBeGreaterThanOrEqual(119_000);
   });
 
   test('signal.abort() でリトライ中の待機を中断する', async () => {
     responders.push(() => tooManyRequests('60'));
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 0);
-    await expect(fetchPostInfo('z', controller.signal)).rejects.toThrow();
+    await expect(api.fetchPostInfo('z', controller.signal)).rejects.toThrow();
   });
 
   test('429 以外のエラーは即時例外', async () => {
     responders.push(() => errorStatus(500));
-    await expect(fetchPostInfo('w')).rejects.toThrow(/HTTP 500/);
+    await expect(api.fetchPostInfo('w')).rejects.toThrow(/HTTP 500/);
     expect(calls).toHaveLength(1);
   });
 
   test('429 を踏むと最小間隔が引き上がる (適応スロットル)', async () => {
-    setApiRateLimitMs(400);
-    expect(getApiRateLimitMs()).toBe(400);
+    api = new ApiSession(400);
+    expect(api.getIntervalMs()).toBe(400);
     responders.push(() => tooManyRequests('1'));
     responders.push(() => okJson({ body: { post: { id: '1', type: 'image', isRestricted: false } } }));
 
-    await fetchPostInfo('1');
-    expect(getApiRateLimitMs()).toBeGreaterThan(400);
+    await api.fetchPostInfo('1');
+    expect(api.getIntervalMs()).toBeGreaterThan(400);
   });
 
   test('適応スロットルは上限 (3000ms) を超えない', async () => {
-    setApiRateLimitMs(2500);
+    api = new ApiSession(2500);
     responders.push(() => tooManyRequests('1'));
     responders.push(() => tooManyRequests('1'));
     responders.push(() => okJson({ body: { post: { id: '1', type: 'image', isRestricted: false } } }));
 
-    await fetchPostInfo('1');
-    expect(getApiRateLimitMs()).toBeLessThanOrEqual(3_000);
+    await api.fetchPostInfo('1');
+    expect(api.getIntervalMs()).toBeLessThanOrEqual(3_000);
   });
 });
 
@@ -221,9 +346,11 @@ describe('レスポンスのアンラップ', () => {
   // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
   const origChrome = (globalThis as any).chrome;
   let nextResponse: ProxyApiResponse;
+  let api: ApiSession;
 
   beforeEach(() => {
-    resetApiRateLimitState();
+    ApiSession.resetSharedBackoff();
+    api = new ApiSession();
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = {
       runtime: { sendMessage: () => Promise.resolve(nextResponse) },
@@ -233,37 +360,48 @@ describe('レスポンスのアンラップ', () => {
   afterEach(() => {
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = origChrome;
-    resetApiRateLimitState();
   });
 
   test('fetchPlans は body.plans を返す', async () => {
     nextResponse = okJson({ body: { plans: [{ fee: 500, title: 'プランA' }] } });
-    expect(await fetchPlans('c')).toEqual([{ fee: 500, title: 'プランA' }] as never);
+    expect(await api.fetchPlans('c')).toEqual([{ fee: 500, title: 'プランA' }] as never);
+  });
+
+  test('fetchPlans はレート制限の枯渇だけは握りつぶさず投げる', async () => {
+    // 既に最大回数・累積待機を費やした後で投稿取得を始めるのは、
+    // 再試行上限を別のエンドポイントで実質的に延長することになる
+    nextResponse = { ok: false, status: 429, retryAfter: '0' };
+    await expect(api.fetchPlans('c')).rejects.toThrow(RateLimitExhaustedError);
+  });
+
+  test('fetchTags はレート制限の枯渇だけは握りつぶさず投げる', async () => {
+    nextResponse = { ok: false, status: 429, retryAfter: '0' };
+    await expect(api.fetchTags('c')).rejects.toThrow(RateLimitExhaustedError);
   });
 
   test('fetchPlans は形状が想定外でも収集を止めず空配列を返す', async () => {
     nextResponse = okJson({ body: [{ fee: 500, title: 'プランA' }] });
-    expect(await fetchPlans('c')).toEqual([]);
+    expect(await api.fetchPlans('c')).toEqual([]);
   });
 
   test('fetchTags は body.featuredTags のタグ名を返す', async () => {
     nextResponse = okJson({ body: { featuredTags: [{ tag: 'イラスト' }, { tag: '漫画' }] } });
-    expect(await fetchTags('c')).toEqual(['イラスト', '漫画']);
+    expect(await api.fetchTags('c')).toEqual(['イラスト', '漫画']);
   });
 
   test('fetchTags は形状が想定外でも収集を止めず空配列を返す', async () => {
     nextResponse = okJson({ body: [{ tag: 'イラスト' }] });
-    expect(await fetchTags('c')).toEqual([]);
+    expect(await api.fetchTags('c')).toEqual([]);
   });
 
   test('fetchPaginatedPosts は body.pageUrls を返す', async () => {
     nextResponse = okJson({ body: { pageUrls: ['https://api.fanbox.cc/post.listCreator?creatorId=c'] } });
-    expect(await fetchPaginatedPosts('c')).toEqual(['https://api.fanbox.cc/post.listCreator?creatorId=c']);
+    expect(await api.fetchPaginatedPosts('c')).toEqual(['https://api.fanbox.cc/post.listCreator?creatorId=c']);
   });
 
   test('fetchPaginatedPosts は形状が想定外なら投げる (0件と区別できないため)', async () => {
     nextResponse = okJson({ body: ['https://api.fanbox.cc/post.listCreator?creatorId=c'] });
-    await expect(fetchPaginatedPosts('c')).rejects.toThrow(/形状が想定外/);
+    await expect(api.fetchPaginatedPosts('c')).rejects.toThrow(/形状が想定外/);
   });
 
   test('fetchPostList は body.posts を返す', async () => {
@@ -272,68 +410,74 @@ describe('レスポンスのアンラップ', () => {
       { id: '2', isRestricted: true },
     ];
     nextResponse = okJson({ body: { posts } });
-    expect(await fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c')).toEqual(posts as never);
+    expect(await api.fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c')).toEqual(posts as never);
   });
 
   test('fetchPostList は要素が id / isRestricted を欠いていれば投げる', async () => {
     nextResponse = okJson({ body: { posts: [{ id: '1', isRestricted: 'false' }] } });
-    await expect(fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c')).rejects.toThrow(/形状が想定外/);
+    await expect(api.fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c')).rejects.toThrow(
+      /形状が想定外/,
+    );
   });
 
   test('fetchPaginatedPosts は要素が文字列でなければ投げる', async () => {
     nextResponse = okJson({ body: { pageUrls: [{ url: 'https://api.fanbox.cc/post.listCreator?creatorId=c' }] } });
-    await expect(fetchPaginatedPosts('c')).rejects.toThrow(/形状が想定外/);
+    await expect(api.fetchPaginatedPosts('c')).rejects.toThrow(/形状が想定外/);
   });
 
   test('fetchPostList は形状が想定外なら投げる (0件と区別できないため)', async () => {
     nextResponse = okJson({ body: [{ id: '1' }] });
-    await expect(fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c')).rejects.toThrow(/形状が想定外/);
+    await expect(api.fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c')).rejects.toThrow(
+      /形状が想定外/,
+    );
   });
 
   test('fetchPostInfo は body.post を返す', async () => {
     nextResponse = okJson({ body: { post: { id: '1', title: 'x', type: 'image', isRestricted: false } } });
-    expect(await fetchPostInfo('1')).toEqual({ id: '1', title: 'x', type: 'image', isRestricted: false } as never);
+    expect(await api.fetchPostInfo('1')).toEqual({ id: '1', title: 'x', type: 'image', isRestricted: false } as never);
   });
 
   test('fetchPostInfo は body.post が無ければ投げる (投稿単位の失敗に丸めない)', async () => {
     nextResponse = okJson({ body: {} });
-    await expect(fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
+    await expect(api.fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
   });
 
   test('fetchPostInfo はラッパーが正しくても投稿が id / type を欠いていれば投げる', async () => {
     nextResponse = okJson({ body: { post: { id: '1' } } });
-    await expect(fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
+    await expect(api.fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
   });
 
   test('fetchPostInfo は isRestricted が真偽値でなければ投げる (無言の全件スキップを防ぐ)', async () => {
     nextResponse = okJson({ body: { post: { id: '1', type: 'image', isRestricted: 'false' } } });
-    await expect(fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
+    await expect(api.fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
   });
 
   test('fetchPlans は要素が壊れていても収集を止めず空配列を返す', async () => {
     // 素通りさせると collector の for-of で TypeError になり収集全体が落ちる
     nextResponse = okJson({ body: { plans: [null] } });
-    expect(await fetchPlans('c')).toEqual([]);
+    expect(await api.fetchPlans('c')).toEqual([]);
   });
 
   test('fetchTags は要素が壊れていても収集を止めず空配列を返す', async () => {
     nextResponse = okJson({ body: { featuredTags: [{}] } });
-    expect(await fetchTags('c')).toEqual([]);
+    expect(await api.fetchTags('c')).toEqual([]);
   });
 
   test('レスポンス本体が JSON null でも形状エラーとして扱う', async () => {
     nextResponse = okJson(null);
-    await expect(fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
+    await expect(api.fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
     nextResponse = okJson(null);
-    await expect(fetchPaginatedPosts('c')).rejects.toThrow(/形状が想定外/);
+    await expect(api.fetchPaginatedPosts('c')).rejects.toThrow(/形状が想定外/);
     nextResponse = okJson(null);
-    await expect(fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c')).rejects.toThrow(/形状が想定外/);
+    await expect(api.fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c')).rejects.toThrow(
+      /形状が想定外/,
+    );
     nextResponse = okJson(null);
-    expect(await fetchPlans('c')).toEqual([]);
+    expect(await api.fetchPlans('c')).toEqual([]);
   });
 
   test('fetchPostInfo は旧形状 (body 直下が投稿) なら投げる', async () => {
     nextResponse = okJson({ body: { id: '1', title: 'x' } });
-    await expect(fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
+    await expect(api.fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
   });
 });

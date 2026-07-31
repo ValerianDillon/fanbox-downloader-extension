@@ -70,6 +70,7 @@ export function resetTestState(): void {
       'aborted',
       'failed-post-count',
       'failed-page-count',
+      'stopped-reason',
       'failed-file-count',
       'fetched-urls',
       'zip-b64',

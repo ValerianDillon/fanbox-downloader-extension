@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { resetApiRateLimitState } from '../../src/content/fanbox/api';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { ApiSession } from '../../src/content/fanbox/api';
 import { collect } from '../../src/content/fanbox/collector';
 
 const CREATOR_ID = 'testcreator';
@@ -70,14 +70,10 @@ describe('collect', () => {
   // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
   const origChrome = (globalThis as any).chrome;
 
-  beforeEach(() => {
-    resetApiRateLimitState();
-  });
-
   afterEach(() => {
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = origChrome;
-    resetApiRateLimitState();
+    ApiSession.resetSharedBackoff();
   });
 
   test('新形状のレスポンスから投稿を収集できる', async () => {
@@ -142,6 +138,35 @@ describe('collect', () => {
       new AbortController().signal,
     );
     expect(result.failedPostCount).toBe(0);
+  });
+
+  test('レート制限の枯渇は投稿単位の失敗に丸めず収集を打ち切る', async () => {
+    // 丸めると、制限が続いている間ずっと残りの投稿が 1 件ずつ順に失敗していく
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: () => ({ ok: false, status: 429, retryAfter: '0' }) });
+
+    const result = await collectCreator();
+    expect(result.stoppedReason).toBe('rate-limit-exhausted');
+    // 打ち切りであって投稿単位の失敗ではない
+    expect(result.failedPostCount).toBe(0);
+  });
+
+  test('打ち切りでもそこまでに集めた投稿は捨てない', async () => {
+    const second = { ...POST_STUB, id: '1002' };
+    let infoCalls = 0;
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [POST_STUB, second] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+      'https://api.fanbox.cc/post.info?postId=1002': () => {
+        infoCalls++;
+        return { ok: false, status: 429, retryAfter: '0' };
+      },
+    });
+
+    const result = await collectCreator();
+    expect(result.stoppedReason).toBe('rate-limit-exhausted');
+    expect(infoCalls).toBeGreaterThan(0);
+    expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(1);
   });
 
   test('投稿一覧ページの取得失敗は投稿件数と分けて数える', async () => {

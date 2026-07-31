@@ -1,15 +1,6 @@
 import type { DownloadObject } from 'download-helper/download-helper';
 import { type AddPostResult, addByPostInfo, DownloadManage } from 'download-helper/fanbox-collector';
-import {
-  ApiShapeError,
-  DEFAULT_API_RATE_LIMIT_MS,
-  fetchPaginatedPosts,
-  fetchPlans,
-  fetchPostInfo,
-  fetchPostList,
-  fetchTags,
-  setApiRateLimitMs,
-} from './api';
+import { ApiSession, ApiShapeError, DEFAULT_API_RATE_LIMIT_MS, RateLimitExhaustedError } from './api';
 
 export type CollectorSettings = {
   isIgnoreFree: boolean;
@@ -25,6 +16,11 @@ export type CollectResult = {
    * 1 ページ落ちると複数投稿が欠落するので、投稿単位の失敗件数とは足し合わせない。
    */
   failedPageCount: number;
+  /**
+   * 収集を最後まで走査せずに打ち切った理由。未設定なら全ページを走査した。
+   * 打ち切った場合もそこまでに集めた分は捨てず、不完全と明示したうえで保存できるようにする。
+   */
+  stoppedReason?: 'rate-limit-exhausted';
 };
 
 export type ProgressCallback = (current: number, total: number) => void;
@@ -47,9 +43,10 @@ export async function collect(
   onProgress: ProgressCallback,
   signal: AbortSignal,
 ): Promise<CollectResult> {
-  setApiRateLimitMs(settings.apiIntervalMs ?? DEFAULT_API_RATE_LIMIT_MS);
+  // レート制限の状態は収集ごとに持つ。前回引き上がった間隔を次の収集に持ち越さない
+  const api = new ApiSession(settings.apiIntervalMs ?? DEFAULT_API_RATE_LIMIT_MS);
 
-  const plans = await fetchPlans(creatorId, signal);
+  const plans = await api.fetchPlans(creatorId, signal);
   const feeMapper = new Map<number, string>();
   for (const plan of plans) {
     feeMapper.set(plan.fee, plan.title);
@@ -62,46 +59,64 @@ export async function collect(
     downloadManage.setLimit(settings.limit);
   }
 
-  const definedTags = await fetchTags(creatorId, signal);
-  downloadManage.addTags(...definedTags);
-
   let failedPostCount = 0;
   let failedPageCount = 0;
-  if (postId) {
-    onProgress(0, 1);
-    try {
-      if (isFailure(addByPostInfo(downloadManage, await fetchPostInfo(postId, signal)))) {
+  let stoppedReason: CollectResult['stoppedReason'];
+  try {
+    const definedTags = await api.fetchTags(creatorId, signal);
+    downloadManage.addTags(...definedTags);
+
+    if (postId) {
+      onProgress(0, 1);
+      try {
+        if (isFailure(addByPostInfo(downloadManage, await api.fetchPostInfo(postId, signal)))) {
+          failedPostCount++;
+        }
+      } catch (e) {
+        if (signal.aborted) throw e;
+        if (e instanceof ApiShapeError || e instanceof RateLimitExhaustedError) throw e;
+        console.error(`投稿情報の取得に失敗 (postId: ${postId}):`, e);
         failedPostCount++;
       }
-    } catch (e) {
-      if (signal.aborted) throw e;
-      if (e instanceof ApiShapeError) throw e;
-      console.error(`投稿情報の取得に失敗 (postId: ${postId}):`, e);
-      failedPostCount++;
+      onProgress(1, 1);
+    } else {
+      const collected = await getItemsByCreator(api, downloadManage, onProgress, signal);
+      failedPostCount = collected.failedPostCount;
+      failedPageCount = collected.failedPageCount;
+      if (collected.stopped) stoppedReason = 'rate-limit-exhausted';
     }
-    onProgress(1, 1);
-  } else {
-    ({ failedPostCount, failedPageCount } = await getItemsByCreator(downloadManage, onProgress, signal));
+  } catch (e) {
+    // 再試行を使い切った時点までに集めた分は捨てない。長時間の収集が終盤で
+    // 枯渇したときに全部やり直しになる方が損失が大きい
+    if (!(e instanceof RateLimitExhaustedError)) throw e;
+    console.error('レート制限のため収集を打ち切りました:', e);
+    stoppedReason = 'rate-limit-exhausted';
   }
 
   downloadManage.applyTags();
-  return { downloadObject: downloadManage.downloadObject, failedPostCount, failedPageCount };
+  return { downloadObject: downloadManage.downloadObject, failedPostCount, failedPageCount, stoppedReason };
 }
 
-type CreatorCollectCounts = { failedPostCount: number; failedPageCount: number };
+type CreatorCollectCounts = {
+  failedPostCount: number;
+  failedPageCount: number;
+  /** レート制限の枯渇で全ページを走査せずに打ち切ったか */
+  stopped?: boolean;
+};
 
 async function getItemsByCreator(
+  api: ApiSession,
   downloadManage: DownloadManage,
   onProgress: ProgressCallback,
   signal: AbortSignal,
 ): Promise<CreatorCollectCounts> {
   let urls: string[];
   try {
-    urls = await fetchPaginatedPosts(downloadManage.userId, signal);
+    urls = await api.fetchPaginatedPosts(downloadManage.userId, signal);
   } catch (e) {
     console.error('投稿一覧の取得に失敗:', e);
-    // 形状エラーは仕様変更を示すので、汎用の文言に潰さずそのまま伝える
-    if (e instanceof ApiShapeError) throw e;
+    // 形状エラーと枯渇は原因が特定できているので、汎用の文言に潰さずそのまま伝える
+    if (e instanceof ApiShapeError || e instanceof RateLimitExhaustedError) throw e;
     throw new Error('投稿一覧の取得に失敗しました');
   }
 
@@ -116,7 +131,7 @@ async function getItemsByCreator(
     if (!downloadManage.isLimitValid()) break;
     console.log(`${i + 1}回目`);
     try {
-      const postList = await fetchPostList(urls[i], signal);
+      const postList = await api.fetchPostList(urls[i], signal);
       if (i === 0) {
         totalEstimate = urls.length * postList.length;
       }
@@ -135,12 +150,14 @@ async function getItemsByCreator(
         }
         // 一覧レスポンスに本文は含まれないため、投稿ごとに post.info を叩く必要がある
         try {
-          if (isFailure(addByPostInfo(downloadManage, await fetchPostInfo(post.id, signal)))) {
+          if (isFailure(addByPostInfo(downloadManage, await api.fetchPostInfo(post.id, signal)))) {
             failedPostCount++;
           }
         } catch (e) {
           if (signal.aborted) return counts();
-          if (e instanceof ApiShapeError) throw e;
+          // レート制限の枯渇を投稿単位の失敗に丸めると、制限が続いている間ずっと
+          // 残りの投稿が 1 件ずつ順に失敗していく
+          if (e instanceof ApiShapeError || e instanceof RateLimitExhaustedError) throw e;
           console.error(`投稿情報の取得に失敗 (postId: ${post.id}):`, e);
           failedPostCount++;
         }
@@ -153,6 +170,12 @@ async function getItemsByCreator(
       // 失敗件数に丸めず中断する。丸めると投稿ゼロの ZIP を「完了 (1件失敗)」として
       // 出してしまい、ユーザーが取得漏れに気付けない。
       if (e instanceof ApiShapeError) throw e;
+      // 枯渇したらそこで打ち切るが、集計は返す。throw すると、それまでに
+      // 数えた失敗件数が呼び出し側に伝わらない
+      if (e instanceof RateLimitExhaustedError) {
+        console.error('レート制限のため収集を打ち切りました:', e);
+        return { ...counts(), stopped: true };
+      }
       // 1 ページには複数の投稿が載るため、欠落数は不明。投稿 1 件の失敗として
       // 数えると実際の欠落を過少報告するので、ページ単位で別に数える。
       console.error(`${i + 1}回目の投稿リスト取得に失敗:`, e);
