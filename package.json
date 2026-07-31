@@ -23,6 +23,6 @@
     "@playwright/test": "^1.61.1"
   },
   "dependencies": {
-    "download-helper": "github:ValerianDillon/download-helper#v3.7.0"
+    "download-helper": "github:ValerianDillon/download-helper#v4.0.0"
   }
 }
