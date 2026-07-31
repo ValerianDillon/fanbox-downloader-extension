@@ -9,7 +9,7 @@ fanbox-downloader のブックマークレット版を Chrome 拡張に移行し
 - `bun run build:test` — 上記のテストビルド版 (`__FBDL_TEST__=true`)、dist-test/ に出力
 - `bun run lint` — Biome による静的解析・フォーマット修正
 - `bun run typecheck` — tsc による型検査 (ビルドは bun build が行うため `--noEmit`)
-- `bun test` (= `bun run test`) — test/ 配下のユニットテストを実行 (e2e/ は対象外)
+- `bun run test` (= `bun test test`) — test/ 配下のユニットテストを実行 (e2e/ は対象外)。素の `bun test` はリポジトリ全体を探索して `e2e/*.spec.ts` も拾うため使わない
 - `bun run test:smoke` — dist-test/ をビルドし、Playwright で拡張の smoke test を実行
 
 ## プロジェクト構成
