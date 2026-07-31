@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   DEFAULT_API_RATE_LIMIT_MS,
   detectPage,
+  fetchPaginatedPosts,
+  fetchPlans,
   fetchPostInfo,
+  fetchPostList,
+  fetchTags,
   getApiRateLimitMs,
   resetApiRateLimitState,
   setApiRateLimitMs,
@@ -142,10 +146,10 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
 
   test('429 + Retry-After (秒) を読んでリトライする', async () => {
     responders.push(() => tooManyRequests('2'));
-    responders.push(() => okJson({ body: { id: '1', title: 'x' } }));
+    responders.push(() => okJson({ body: { post: { id: '1', title: 'x', type: 'image', isRestricted: false } } }));
 
     const result = await fetchPostInfo('1');
-    expect(result).toEqual({ id: '1', title: 'x' } as never);
+    expect(result).toEqual({ id: '1', title: 'x', type: 'image', isRestricted: false } as never);
     expect(calls).toHaveLength(2);
     expect(virtualWaitMs).toBeGreaterThanOrEqual(2_000);
   });
@@ -153,17 +157,17 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
   test('429 + Retry-After (HTTP-date) を読んでリトライする', async () => {
     const future = new Date(Date.now() + 3_000).toUTCString();
     responders.push(() => tooManyRequests(future));
-    responders.push(() => okJson({ body: { id: '2' } }));
+    responders.push(() => okJson({ body: { post: { id: '2', type: 'image', isRestricted: false } } }));
 
     const result = await fetchPostInfo('2');
-    expect(result).toEqual({ id: '2' } as never);
+    expect(result).toEqual({ id: '2', type: 'image', isRestricted: false } as never);
     expect(calls).toHaveLength(2);
   });
 
   test('Retry-After 不在時は指数バックオフ (5s → 15s)', async () => {
     responders.push(() => tooManyRequests());
     responders.push(() => tooManyRequests());
-    responders.push(() => okJson({ body: { id: '3' } }));
+    responders.push(() => okJson({ body: { post: { id: '3', type: 'image', isRestricted: false } } }));
 
     await fetchPostInfo('3');
     expect(calls).toHaveLength(3);
@@ -196,7 +200,7 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     setApiRateLimitMs(400);
     expect(getApiRateLimitMs()).toBe(400);
     responders.push(() => tooManyRequests('1'));
-    responders.push(() => okJson({ body: { id: '1' } }));
+    responders.push(() => okJson({ body: { post: { id: '1', type: 'image', isRestricted: false } } }));
 
     await fetchPostInfo('1');
     expect(getApiRateLimitMs()).toBeGreaterThan(400);
@@ -206,9 +210,130 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     setApiRateLimitMs(2500);
     responders.push(() => tooManyRequests('1'));
     responders.push(() => tooManyRequests('1'));
-    responders.push(() => okJson({ body: { id: '1' } }));
+    responders.push(() => okJson({ body: { post: { id: '1', type: 'image', isRestricted: false } } }));
 
     await fetchPostInfo('1');
     expect(getApiRateLimitMs()).toBeLessThanOrEqual(3_000);
+  });
+});
+
+describe('レスポンスのアンラップ', () => {
+  // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+  const origChrome = (globalThis as any).chrome;
+  let nextResponse: ProxyApiResponse;
+
+  beforeEach(() => {
+    resetApiRateLimitState();
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: { sendMessage: () => Promise.resolve(nextResponse) },
+    };
+  });
+
+  afterEach(() => {
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = origChrome;
+    resetApiRateLimitState();
+  });
+
+  test('fetchPlans は body.plans を返す', async () => {
+    nextResponse = okJson({ body: { plans: [{ fee: 500, title: 'プランA' }] } });
+    expect(await fetchPlans('c')).toEqual([{ fee: 500, title: 'プランA' }] as never);
+  });
+
+  test('fetchPlans は形状が想定外でも収集を止めず空配列を返す', async () => {
+    nextResponse = okJson({ body: [{ fee: 500, title: 'プランA' }] });
+    expect(await fetchPlans('c')).toEqual([]);
+  });
+
+  test('fetchTags は body.featuredTags のタグ名を返す', async () => {
+    nextResponse = okJson({ body: { featuredTags: [{ tag: 'イラスト' }, { tag: '漫画' }] } });
+    expect(await fetchTags('c')).toEqual(['イラスト', '漫画']);
+  });
+
+  test('fetchTags は形状が想定外でも収集を止めず空配列を返す', async () => {
+    nextResponse = okJson({ body: [{ tag: 'イラスト' }] });
+    expect(await fetchTags('c')).toEqual([]);
+  });
+
+  test('fetchPaginatedPosts は body.pageUrls を返す', async () => {
+    nextResponse = okJson({ body: { pageUrls: ['https://api.fanbox.cc/post.listCreator?creatorId=c'] } });
+    expect(await fetchPaginatedPosts('c')).toEqual(['https://api.fanbox.cc/post.listCreator?creatorId=c']);
+  });
+
+  test('fetchPaginatedPosts は形状が想定外なら投げる (0件と区別できないため)', async () => {
+    nextResponse = okJson({ body: ['https://api.fanbox.cc/post.listCreator?creatorId=c'] });
+    await expect(fetchPaginatedPosts('c')).rejects.toThrow(/形状が想定外/);
+  });
+
+  test('fetchPostList は body.posts を返す', async () => {
+    const posts = [
+      { id: '1', isRestricted: false },
+      { id: '2', isRestricted: true },
+    ];
+    nextResponse = okJson({ body: { posts } });
+    expect(await fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c')).toEqual(posts as never);
+  });
+
+  test('fetchPostList は要素が id / isRestricted を欠いていれば投げる', async () => {
+    nextResponse = okJson({ body: { posts: [{ id: '1', isRestricted: 'false' }] } });
+    await expect(fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c')).rejects.toThrow(/形状が想定外/);
+  });
+
+  test('fetchPaginatedPosts は要素が文字列でなければ投げる', async () => {
+    nextResponse = okJson({ body: { pageUrls: [{ url: 'https://api.fanbox.cc/post.listCreator?creatorId=c' }] } });
+    await expect(fetchPaginatedPosts('c')).rejects.toThrow(/形状が想定外/);
+  });
+
+  test('fetchPostList は形状が想定外なら投げる (0件と区別できないため)', async () => {
+    nextResponse = okJson({ body: [{ id: '1' }] });
+    await expect(fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c')).rejects.toThrow(/形状が想定外/);
+  });
+
+  test('fetchPostInfo は body.post を返す', async () => {
+    nextResponse = okJson({ body: { post: { id: '1', title: 'x', type: 'image', isRestricted: false } } });
+    expect(await fetchPostInfo('1')).toEqual({ id: '1', title: 'x', type: 'image', isRestricted: false } as never);
+  });
+
+  test('fetchPostInfo は body.post が無ければ投げる (投稿単位の失敗に丸めない)', async () => {
+    nextResponse = okJson({ body: {} });
+    await expect(fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
+  });
+
+  test('fetchPostInfo はラッパーが正しくても投稿が id / type を欠いていれば投げる', async () => {
+    nextResponse = okJson({ body: { post: { id: '1' } } });
+    await expect(fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
+  });
+
+  test('fetchPostInfo は isRestricted が真偽値でなければ投げる (無言の全件スキップを防ぐ)', async () => {
+    nextResponse = okJson({ body: { post: { id: '1', type: 'image', isRestricted: 'false' } } });
+    await expect(fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
+  });
+
+  test('fetchPlans は要素が壊れていても収集を止めず空配列を返す', async () => {
+    // 素通りさせると collector の for-of で TypeError になり収集全体が落ちる
+    nextResponse = okJson({ body: { plans: [null] } });
+    expect(await fetchPlans('c')).toEqual([]);
+  });
+
+  test('fetchTags は要素が壊れていても収集を止めず空配列を返す', async () => {
+    nextResponse = okJson({ body: { featuredTags: [{}] } });
+    expect(await fetchTags('c')).toEqual([]);
+  });
+
+  test('レスポンス本体が JSON null でも形状エラーとして扱う', async () => {
+    nextResponse = okJson(null);
+    await expect(fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
+    nextResponse = okJson(null);
+    await expect(fetchPaginatedPosts('c')).rejects.toThrow(/形状が想定外/);
+    nextResponse = okJson(null);
+    await expect(fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c')).rejects.toThrow(/形状が想定外/);
+    nextResponse = okJson(null);
+    expect(await fetchPlans('c')).toEqual([]);
+  });
+
+  test('fetchPostInfo は旧形状 (body 直下が投稿) なら投げる', async () => {
+    nextResponse = okJson({ body: { id: '1', title: 'x' } });
+    await expect(fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
   });
 });

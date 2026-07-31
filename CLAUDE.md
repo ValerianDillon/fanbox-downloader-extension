@@ -80,9 +80,8 @@ dist-test/                 # テストビルド成果物 (git 管理対象外, s
 - `showSaveFilePicker` はネイティブのファイル選択ダイアログを要求するため、ブラウザ自動化では扱えない。
 - publishedDatetime の ZIP エントリへの反映は `test/downloader.test.ts` (ユニットテスト) でカバー済みである。
 - テスト構成は `e2e/smoke.spec.ts` (本体)、`e2e/fixtures.ts` (FANBOX API レスポンス fixture)、`e2e/zip-util.ts` (ZIP の Central Directory / EOCD を読む最小パーサ) の 3 ファイルからなる。
-- fixture は投稿を 2 件用意している。
-- 投稿A (image type) は `post.listCreator` の一覧レスポンスに `body` 込みで含まれる。
-- 投稿B (file type) は一覧レスポンスに `body` がなく `isRestricted: false` のため、`post.info` への追加リクエストが発生する経路を検証する。
+- fixture は投稿を 2 件用意している。投稿A は image type の無料投稿、投稿B は file type の有料投稿である。
+- `post.listCreator` の一覧レスポンスには本文が含まれないため、どちらの投稿も `post.info` への追加リクエストを経て収集される。
 - WSL2 上の headless Chromium で拡張を読み込むには `channel: 'chromium'` の指定が必要である (新しい headless 実装でのみ拡張の読み込みに対応するため)。
 
 ## コーディング規約

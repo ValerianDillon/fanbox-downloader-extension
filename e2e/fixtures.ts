@@ -1,15 +1,13 @@
 /**
  * smoke test 用の FANBOX API レスポンス fixture。
  *
- * 形状は node_modules/download-helper/fanbox-collector.ts の Plans / Tags / PostInfo 型と
- * src/content/fanbox/api.ts のレスポンス処理 (`{ body: ... }` ラッパー) に厳密に合わせている。
+ * 形状は node_modules/download-helper/fanbox-collector.ts の Plans / Tags / PaginatedPosts /
+ * PostList / PostListItem / PostInfoResponse 型と src/content/fanbox/api.ts のアンラップ処理
+ * (配列は `body` 直下ではなく `body.<キー>` に入る) に厳密に合わせている。
  *
- * 投稿構成:
- * - 投稿A (id=1001, image type): post.listCreator の一覧レスポンスに body 込みで含まれる
- *   (api.ts の `if (post.body)` 分岐 → post.info への追加リクエストなしで addByPostInfo される)
- * - 投稿B (id=1002, file type): post.listCreator の一覧レスポンスには body なし (`isRestricted: false`)
- *   で含まれ、collector.ts の `else if (!post.isRestricted)` 分岐により post.info への
- *   追加リクエストが発生し、そこで初めて body (files) が返る
+ * 投稿構成 (どちらも一覧に本文が載らないため post.info への追加リクエストが走る):
+ * - 投稿A (id=1001, image type): 無料投稿
+ * - 投稿B (id=1002, file type): 有料投稿
  *
  * カバー画像は cover 用に pximg.net (i.pximg.net)、投稿内ファイルは fanbox.cc 系
  * (downloads.fanbox.cc) にして、両方の host_permissions (`*://*.fanbox.cc/*` /
@@ -23,18 +21,18 @@ export const PLANS_URL = `https://api.fanbox.cc/plan.listCreator?creatorId=${CRE
 export const TAGS_URL = `https://api.fanbox.cc/tag.getFeatured?creatorId=${CREATOR_ID}`;
 export const PAGINATE_URL = `https://api.fanbox.cc/post.paginateCreator?creatorId=${CREATOR_ID}`;
 export const LIST_PAGE_URL = `https://api.fanbox.cc/post.listCreator?creatorId=${CREATOR_ID}&cursor=1`;
+export const POST_INFO_URL_A = 'https://api.fanbox.cc/post.info?postId=1001';
 export const POST_INFO_URL_B = 'https://api.fanbox.cc/post.info?postId=1002';
 
-// 投稿A: image type、listCreator に body 込みで載る
+// 投稿A: image type、無料
 const POST_A_COVER_URL = 'https://i.pximg.net/c/testcreator/cover-a.jpg';
 const POST_A_IMAGE_URL = 'https://downloads.fanbox.cc/images/1001/image1.png';
 
-export const POST_A = {
+const POST_A_COMMON = {
   id: '1001',
   title: 'リンゴ',
   feeRequired: 0,
   creatorId: CREATOR_ID,
-  coverImageUrl: POST_A_COVER_URL,
   excerpt: '',
   isRestricted: false,
   tags: [],
@@ -42,14 +40,9 @@ export const POST_A = {
   updatedDatetime: '2024-01-01T00:00:00+09:00',
   likeCount: 0,
   commentCount: 0,
-  type: 'image',
-  body: {
-    text: 'テキストA',
-    images: [{ originalUrl: POST_A_IMAGE_URL, extension: 'png' }],
-  },
 };
 
-// 投稿B: file type、listCreator では body なし (post.info への追加取得が走る)
+// 投稿B: file type、有料
 const POST_B_COVER_URL = 'https://i.pximg.net/c/testcreator/cover-b.png';
 const POST_B_FILE_URL = 'https://downloads.fanbox.cc/files/1002/document.pdf';
 
@@ -58,7 +51,6 @@ const POST_B_COMMON = {
   title: 'バナナ',
   feeRequired: 500,
   creatorId: CREATOR_ID,
-  coverImageUrl: POST_B_COVER_URL,
   excerpt: '',
   isRestricted: false,
   tags: ['限定'],
@@ -68,12 +60,24 @@ const POST_B_COMMON = {
   commentCount: 0,
 };
 
-// listCreator 一覧レスポンスに載る投稿B (body なし)
-export const POST_B_STUB = { ...POST_B_COMMON };
+// listCreator 一覧レスポンスに載る要素 (type / body を持たず、カバー画像は cover.url)
+export const POST_A_STUB = { ...POST_A_COMMON, cover: { type: 'cover_image', url: POST_A_COVER_URL } };
+export const POST_B_STUB = { ...POST_B_COMMON, cover: { type: 'cover_image', url: POST_B_COVER_URL } };
 
-// post.info?postId=1002 のレスポンス (body あり)
+// post.info のレスポンスに載る投稿 (type / body / coverImageUrl を持つ)
+export const POST_A_FULL = {
+  ...POST_A_COMMON,
+  coverImageUrl: POST_A_COVER_URL,
+  type: 'image',
+  body: {
+    text: 'テキストA',
+    images: [{ originalUrl: POST_A_IMAGE_URL, extension: 'png' }],
+  },
+};
+
 export const POST_B_FULL = {
   ...POST_B_COMMON,
+  coverImageUrl: POST_B_COVER_URL,
   type: 'file',
   body: {
     text: 'テキストB',
@@ -81,11 +85,12 @@ export const POST_B_FULL = {
   },
 };
 
-export const PLANS_RESPONSE = { body: [] };
-export const TAGS_RESPONSE = { body: [] };
-export const PAGINATE_RESPONSE = { body: [LIST_PAGE_URL] };
-export const LIST_PAGE_RESPONSE = { body: [POST_A, POST_B_STUB] };
-export const POST_INFO_RESPONSE_B = { body: POST_B_FULL };
+export const PLANS_RESPONSE = { body: { plans: [] } };
+export const TAGS_RESPONSE = { body: { featuredTags: [] } };
+export const PAGINATE_RESPONSE = { body: { pageUrls: [LIST_PAGE_URL] } };
+export const LIST_PAGE_RESPONSE = { body: { posts: [POST_A_STUB, POST_B_STUB] } };
+export const POST_INFO_RESPONSE_A = { body: { post: POST_A_FULL } };
+export const POST_INFO_RESPONSE_B = { body: { post: POST_B_FULL } };
 
 /**
  * ダミーのファイルバイナリ。実体の形式は問わない (ZIP へはそのまま格納されるだけで、

@@ -1,4 +1,13 @@
-import type { Plans, PostInfo, Tags } from 'download-helper/fanbox-collector';
+import type {
+  PaginatedPosts,
+  PlanInfo,
+  Plans,
+  PostInfo,
+  PostInfoResponse,
+  PostList,
+  PostListItem,
+  Tags,
+} from 'download-helper/fanbox-collector';
 
 export const DEFAULT_API_RATE_LIMIT_MS = 500;
 const RETRY_BACKOFF_MS = [5_000, 15_000, 45_000];
@@ -166,21 +175,72 @@ async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   }
 }
 
-export async function fetchPlans(creatorId: string, signal?: AbortSignal): Promise<Plans['body']> {
+/**
+ * API レスポンスの形状が想定と違うことを表すエラー。
+ * 通信失敗や個別投稿の取得失敗 (収集を続行してよい) と区別するために専用の型にしている。
+ */
+export class ApiShapeError extends Error {
+  constructor(url: string) {
+    super(`API レスポンスの形状が想定外: ${url}`);
+    this.name = 'ApiShapeError';
+  }
+}
+
+/**
+ * FANBOX API の配列レスポンスは `body` 直下ではなく `body.<キー>` に入る。
+ * 形状が想定外なら空配列扱いにせず投げる: 空配列にフォールバックすると
+ * 「0 件だった」と区別が付かず、API 変更が無言で通り抜けてしまうため。
+ */
+function unwrapArray<T>(value: unknown, url: string, isValidItem?: (item: unknown) => boolean): T[] {
+  if (!Array.isArray(value)) {
+    throw new ApiShapeError(url);
+  }
+  if (isValidItem && !value.every(isValidItem)) {
+    throw new ApiShapeError(url);
+  }
+  return value as T[];
+}
+
+/**
+ * 一覧要素のうち、収集の分岐に使う 2 つだけを検証する。
+ * id は post.info の URL を組み立てるのに使い、isRestricted は投稿を飛ばすかの判断に使う。
+ * 型が変わると前者は「取得失敗が N 件」、後者は「無言で全件スキップ」になるため、
+ * ここで形状エラーとして止める。それ以外のフィールドは download-helper 側が
+ * 欠損を許容するので検証しない。
+ */
+function isValidPostListItem(item: unknown): boolean {
+  const post = item as PostListItem | null;
+  return !!post && typeof post.id === 'string' && typeof post.isRestricted === 'boolean';
+}
+
+/** 支援額タグの表示名の組み立てに使う 2 つを検証する */
+function isValidPlan(item: unknown): boolean {
+  const plan = item as PlanInfo | null;
+  return !!plan && typeof plan.fee === 'number' && typeof plan.title === 'string';
+}
+
+export async function fetchPlans(creatorId: string, signal?: AbortSignal): Promise<PlanInfo[]> {
+  const url = `https://api.fanbox.cc/plan.listCreator?creatorId=${creatorId}`;
   try {
-    const result = await fetchJson<Plans>(`https://api.fanbox.cc/plan.listCreator?creatorId=${creatorId}`, signal);
-    return result.body;
+    const result = await fetchJson<Plans>(url, signal);
+    return unwrapArray<PlanInfo>(result?.body?.plans, url, isValidPlan);
   } catch (e) {
     if (signal?.aborted) throw e;
+    // プラン名は支援額タグの表示名に使うだけなので、失敗しても収集自体は続行する
     console.error('プラン情報の取得に失敗:', e);
-    return undefined;
+    return [];
   }
 }
 
 export async function fetchTags(creatorId: string, signal?: AbortSignal): Promise<string[]> {
+  const url = `https://api.fanbox.cc/tag.getFeatured?creatorId=${creatorId}`;
   try {
-    const result = await fetchJson<Tags>(`https://api.fanbox.cc/tag.getFeatured?creatorId=${creatorId}`, signal);
-    return Array.isArray(result.body) ? result.body.map((tag) => tag.tag) : [];
+    const result = await fetchJson<Tags>(url, signal);
+    return unwrapArray<{ tag: string }>(
+      result?.body?.featuredTags,
+      url,
+      (item) => typeof (item as { tag?: unknown } | null)?.tag === 'string',
+    ).map((tag) => tag.tag);
   } catch (e) {
     if (signal?.aborted) throw e;
     console.error('タグ情報の取得に失敗:', e);
@@ -188,22 +248,34 @@ export async function fetchTags(creatorId: string, signal?: AbortSignal): Promis
   }
 }
 
-export async function fetchPostInfo(postId: string, signal?: AbortSignal): Promise<PostInfo | undefined> {
-  const result = await fetchJson<{ body?: PostInfo }>(`https://api.fanbox.cc/post.info?postId=${postId}`, signal);
-  return result.body;
+/**
+ * 閲覧できない投稿は HTTP 4xx で返るため、200 なのに body.post が無いのは形状の想定違いとみなす。
+ * 全投稿がこの経路を通る以上、undefined を返して投稿単位の失敗に丸めると、
+ * 仕様変更時に「中身が空の ZIP を完了扱い」で出してしまう。
+ *
+ * 投稿オブジェクト側は収集の分岐に使う id / type / isRestricted だけを検査する。
+ * body は支援額が足りない投稿では正常に欠落しうる (addByPostInfo がそれを検出して
+ * スキップする) ので、必須にはできない。
+ */
+export async function fetchPostInfo(postId: string, signal?: AbortSignal): Promise<PostInfo> {
+  const url = `https://api.fanbox.cc/post.info?postId=${postId}`;
+  const result = await fetchJson<PostInfoResponse>(url, signal);
+  const post = result?.body?.post;
+  if (!post || typeof post.id !== 'string' || typeof post.type !== 'string' || typeof post.isRestricted !== 'boolean') {
+    throw new ApiShapeError(url);
+  }
+  return post;
 }
 
 export async function fetchPaginatedPosts(creatorId: string, signal?: AbortSignal): Promise<string[]> {
-  const result = await fetchJson<{ body: string[] }>(
-    `https://api.fanbox.cc/post.paginateCreator?creatorId=${creatorId}`,
-    signal,
-  );
-  return result.body;
+  const url = `https://api.fanbox.cc/post.paginateCreator?creatorId=${creatorId}`;
+  const result = await fetchJson<PaginatedPosts>(url, signal);
+  return unwrapArray<string>(result?.body?.pageUrls, url, (item) => typeof item === 'string');
 }
 
-export async function fetchPostList(url: string, signal?: AbortSignal): Promise<PostInfo[]> {
-  const result = await fetchJson<{ body: PostInfo[] }>(url, signal);
-  return result.body;
+export async function fetchPostList(url: string, signal?: AbortSignal): Promise<PostListItem[]> {
+  const result = await fetchJson<PostList>(url, signal);
+  return unwrapArray<PostListItem>(result?.body?.posts, url, isValidPostListItem);
 }
 
 export { sleep };
