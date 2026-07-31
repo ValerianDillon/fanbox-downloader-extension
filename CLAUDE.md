@@ -8,6 +8,7 @@ fanbox-downloader のブックマークレット版を Chrome 拡張に移行し
 - `bun run build` — content script + service worker をバンドルし、静的ファイルを dist/ にコピー
 - `bun run build:test` — 上記のテストビルド版 (`__FBDL_TEST__=true`)、dist-test/ に出力
 - `bun run lint` — Biome による静的解析・フォーマット修正
+- `bun run typecheck` — tsc による型検査 (ビルドは bun build が行うため `--noEmit`)
 - `bun test` (= `bun run test`) — test/ 配下のユニットテストを実行 (e2e/ は対象外)
 - `bun run test:smoke` — dist-test/ をビルドし、Playwright で拡張の smoke test を実行
 
@@ -24,6 +25,7 @@ src/
     overlay.ts             # オーバーレイパネル (shadow DOM)
     overlay.css            # FAB + overlay スタイル
     downloader.ts          # download-helper への薄いアダプタ (service worker 経由 fetch, ハンドル取得)
+    messaging.ts           # service worker との messaging を AbortSignal 対応にするラッパー
     test-hooks.ts          # __FBDL_TEST__ 専用の観測フック (data-fbdl-* 属性 publish)
     fanbox/
       api.ts               # FANBOX API クライアント (async fetch)
@@ -32,8 +34,10 @@ src/
     service-worker.ts      # lifecycle + fetch プロキシ (CORS 回避)
 test/
   fanbox/
-    api.test.ts            # detectPage テスト
+    api.test.ts            # detectPage / レート制限 / レスポンス形状のテスト
+    collector.test.ts      # 収集フローと失敗件数の数え分けのテスト
   overlay.test.ts          # 状態遷移テスト
+  messaging.test.ts        # sendMessageAbortable の中断テスト
   downloader.test.ts       # downloadAsZip (publishedDatetime の mtime 反映) テスト
 e2e/
   smoke.spec.ts            # 拡張の smoke test (Playwright, WSL headless 対応)
@@ -51,7 +55,7 @@ dist-test/                 # テストビルド成果物 (git 管理対象外, s
 - Bun でバンドル (TypeScript → 単一 JS)
 - Biome で静的解析・フォーマット
 - Chrome Manifest V3
-- 唯一の runtime 依存: `download-helper` (`github:ValerianDillon/download-helper#v3.7.0`)
+- 唯一の runtime 依存: `download-helper` (`github:ValerianDillon/download-helper#v4.2.0`)
   - `download-helper/download-helper`: `DownloadHelper.downloadZip` (ZIP 生成本体), `DownloadUtils`, `ZipWriter` など
   - `download-helper/fanbox-collector`: FANBOX API 型定義 (`PostInfo` 等), `DownloadManage`, `addByPostInfo`, `convert*Map` など FANBOX 固有の共通ロジック (fanbox-downloader と共用)
 
@@ -62,7 +66,9 @@ dist-test/                 # テストビルド成果物 (git 管理対象外, s
   - service worker: fetch プロキシ (host_permissions で CORS 回避、ArrayBuffer → base64 変換)
 - FAB ボタンをページに挿入 → overlay パネルで設定 → データ収集 → ZIP ダウンロード
 - overlay は状態マシン: `settings` → `collecting` → `downloading` → `complete`
-- AbortController によるキャンセル対応
+- FANBOX API の配列レスポンスは `body` 直下ではなく `body.<キー>` に入る。形状が想定と違うとき、プラン名とタグは表示の補助なので握りつぶして続行し、投稿一覧と投稿詳細は `ApiShapeError` で中断する (空配列に落とすと「本当に 0 件だった」と区別が付かず、中身のない ZIP を完了として出してしまうため)
+- 取得できなかった投稿は失敗件数として報告する。投稿一覧ページの失敗は欠落した投稿数が不明なので、投稿単位の件数とは分けて数える
+- AbortController によるキャンセル対応 (`chrome.runtime.sendMessage` も signal と競争させる)
 - SPA ナビゲーション対応 (pushState/replaceState フック)
 - shadow DOM でスタイル隔離
 - FANBOX 固有の収集ロジックと ZIP 生成本体 (downloadZip) は `download-helper` に集約されており、拡張側は service worker 経由の fetch 差し替えや FileSystemFileHandle 取得など拡張固有の処理のみを担う

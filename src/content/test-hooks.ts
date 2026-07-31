@@ -65,7 +65,16 @@ export function publishTestState(partial: Record<string, string>): void {
  */
 export function resetTestState(): void {
   if (typeof __FBDL_TEST__ !== 'undefined' && __FBDL_TEST__) {
-    const keys = ['error', 'aborted', 'failed-post-count', 'failed-file-count', 'fetched-urls', 'zip-b64', 'zip-done'];
+    const keys = [
+      'error',
+      'aborted',
+      'failed-post-count',
+      'failed-page-count',
+      'failed-file-count',
+      'fetched-urls',
+      'zip-b64',
+      'zip-done',
+    ];
     for (const key of keys) {
       document.documentElement.removeAttribute(`data-fbdl-${key}`);
     }

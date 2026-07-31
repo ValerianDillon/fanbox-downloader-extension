@@ -108,7 +108,7 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
       virtualWaitMs += timeout ?? 0;
       const id = origSetTimeout(handler as () => void, 0);
       return id;
-    }) as typeof setTimeout;
+    }) as unknown as typeof setTimeout;
     globalThis.clearTimeout = origClearTimeout;
   }
 

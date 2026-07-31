@@ -8,6 +8,7 @@ import type {
   PostListItem,
   Tags,
 } from 'download-helper/fanbox-collector';
+import { sendMessageAbortable } from '../messaging';
 
 export const DEFAULT_API_RATE_LIMIT_MS = 500;
 const RETRY_BACKOFF_MS = [5_000, 15_000, 45_000];
@@ -136,8 +137,8 @@ type ApiFetchResponse = {
  * content script から直接 fetch するとページオリジンとして扱われ、
  * 429 のような CORS ヘッダ無しレスポンスを JS から読めないため。
  */
-async function proxyFetchApi(url: string): Promise<ApiFetchResponse> {
-  return chrome.runtime.sendMessage({ type: 'fetchApi', url });
+async function proxyFetchApi(url: string, signal?: AbortSignal): Promise<ApiFetchResponse> {
+  return sendMessageAbortable<ApiFetchResponse>({ type: 'fetchApi', url }, signal);
 }
 
 async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -147,7 +148,7 @@ async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     let response: ApiFetchResponse;
     try {
-      response = await proxyFetchApi(url);
+      response = await proxyFetchApi(url, signal);
     } catch (e) {
       if (signal?.aborted) throw e;
       if (networkRetried) throw e;

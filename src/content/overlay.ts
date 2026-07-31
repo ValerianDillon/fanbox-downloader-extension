@@ -279,7 +279,7 @@ export class OverlayController {
       const creatorId = this.pageType.creatorId;
       const postId = this.pageType.type === 'post' ? this.pageType.postId : undefined;
 
-      const { downloadObject, failedPostCount } = await collect(
+      const { downloadObject, failedPostCount, failedPageCount } = await collect(
         creatorId,
         postId,
         settings,
@@ -295,7 +295,10 @@ export class OverlayController {
         return;
       }
 
-      publishTestState({ 'failed-post-count': String(failedPostCount) });
+      publishTestState({
+        'failed-post-count': String(failedPostCount),
+        'failed-page-count': String(failedPageCount),
+      });
 
       this.setState('downloading');
       this.renderDownloading();
@@ -321,11 +324,22 @@ export class OverlayController {
       const json = downloadObject.stringify();
       await downloadAsZip(saveHandle, json, downloadProgress, signal);
 
+      // downloadZip は中断されても ZIP を閉じて正常に戻るため、ここで見ないと
+      // 途中までの ZIP を「完了しました」と表示してしまう
+      if (signal.aborted) {
+        this.publishAbortedIfCurrent(signal);
+        return;
+      }
+
       this.setState('complete');
-      const failedSuffix =
-        failedPostCount > 0
-          ? `\n${failedPostCount} 件は取得に失敗しました (FANBOX のレート制限の可能性があります)`
-          : '';
+      // ページ単位の失敗は欠落した投稿数が分からないため、投稿単位の件数とは足し合わせない
+      const failures = [
+        failedPostCount > 0 ? `${failedPostCount} 件の投稿` : '',
+        failedPageCount > 0 ? `${failedPageCount} ページ分の投稿一覧 (投稿数は不明)` : '',
+      ].filter(Boolean);
+      const failedSuffix = failures.length
+        ? `\n${failures.join(' と ')}の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`
+        : '';
       this.renderComplete(`ダウンロードが完了しました${failedSuffix}`);
     } catch (e) {
       if (signal.aborted) {

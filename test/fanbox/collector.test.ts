@@ -85,6 +85,7 @@ describe('collect', () => {
 
     const result = await collectCreator();
     expect(result.failedPostCount).toBe(0);
+    expect(result.failedPageCount).toBe(0);
     expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(1);
   });
 
@@ -117,6 +118,53 @@ describe('collect', () => {
     mockApi({ ...BASE_RESPONSES, [LIST_PAGE_URL]: { body: { posts: [{ id: '1001', isRestricted: 'false' }] } } });
 
     await expect(collectCreator()).rejects.toThrow(/形状が想定外/);
+  });
+
+  test('閲覧できない投稿も欠落するので失敗件数に数える', async () => {
+    // 一覧が全件 isRestricted になったとき、空の ZIP を失敗 0 件で完了させないため
+    const restricted = { ...POST_STUB, isRestricted: true };
+    mockApi({ ...BASE_RESPONSES, [LIST_PAGE_URL]: { body: { posts: [restricted] } } });
+
+    const result = await collectCreator();
+    expect(result.failedPostCount).toBe(1);
+    expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(0);
+  });
+
+  test('isIgnoreFree のとき閲覧できない無料投稿は失敗に数えない', async () => {
+    const restricted = { ...POST_STUB, isRestricted: true, feeRequired: 0 };
+    mockApi({ ...BASE_RESPONSES, [LIST_PAGE_URL]: { body: { posts: [restricted] } } });
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      { ...SETTINGS, isIgnoreFree: true },
+      () => {},
+      new AbortController().signal,
+    );
+    expect(result.failedPostCount).toBe(0);
+  });
+
+  test('投稿一覧ページの取得失敗は投稿件数と分けて数える', async () => {
+    // 1 ページに複数投稿が載るため、投稿 1 件の失敗として数えると欠落を過少報告する
+    mockApi({ ...BASE_RESPONSES, [LIST_PAGE_URL]: () => ({ ok: false, status: 500, retryAfter: null }) });
+
+    const result = await collectCreator();
+    expect(result.failedPageCount).toBe(1);
+    expect(result.failedPostCount).toBe(0);
+  });
+
+  test('isIgnoreFree で除外した無料投稿は失敗に数えない', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      { ...SETTINGS, isIgnoreFree: true },
+      () => {},
+      new AbortController().signal,
+    );
+    expect(result.failedPostCount).toBe(0);
+    expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(0);
   });
 
   test('本文のない投稿は無言で消さず失敗件数に数える', async () => {

@@ -7,6 +7,7 @@
     "build": "bun scripts/build.ts",
     "build:test": "bun scripts/build.ts --test",
     "lint": "biome check --write .",
+    "typecheck": "tsc --noEmit",
     "test": "bun test test",
     "test:smoke": "bun run build:test && playwright test"
   },
@@ -20,9 +21,12 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.0.0",
-    "@playwright/test": "^1.61.1"
+    "@playwright/test": "^1.61.1",
+    "@types/bun": "^1.3.14",
+    "@types/chrome": "^0.2.2",
+    "typescript": "^7.0.2"
   },
   "dependencies": {
-    "download-helper": "github:ValerianDillon/download-helper#v4.0.0"
+    "download-helper": "github:ValerianDillon/download-helper#v4.2.0"
   }
 }
