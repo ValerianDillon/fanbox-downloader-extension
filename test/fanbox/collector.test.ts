@@ -140,14 +140,52 @@ describe('collect', () => {
     expect(result.failedPostCount).toBe(0);
   });
 
-  test('レート制限の枯渇は投稿単位の失敗に丸めず収集を打ち切る', async () => {
-    // 丸めると、制限が続いている間ずっと残りの投稿が 1 件ずつ順に失敗していく
+  test('投稿を集める前の枯渇は打ち切りではなくエラーにする', async () => {
+    // プラン名とタグは投稿収集の前に走る。ここで枯渇したとき打ち切り扱いにすると、
+    // 中身のない ZIP を「取得できた分のみ保存」として出してしまう
+    const rateLimited = () => ({ ok: false, status: 429, retryAfter: '0' });
+    for (const url of [
+      `https://api.fanbox.cc/plan.listCreator?creatorId=${CREATOR_ID}`,
+      `https://api.fanbox.cc/tag.getFeatured?creatorId=${CREATOR_ID}`,
+    ]) {
+      mockApi({ ...BASE_RESPONSES, [url]: rateLimited });
+      await expect(collectCreator()).rejects.toThrow(/レート制限の再試行上限/);
+    }
+  });
+
+  test('1 件も取り込めないまま枯渇したら打ち切りではなくエラーにする', async () => {
+    // 投稿単位の失敗に丸めない (丸めると、制限が続く間ずっと残りが 1 件ずつ失敗していく) が、
+    // 取り込めた投稿が無いので打ち切りとして返すこともしない。
+    // 中身のない ZIP を「取得できた分のみ保存しています」と表示して出さないため
     mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: () => ({ ok: false, status: 429, retryAfter: '0' }) });
 
-    const result = await collectCreator();
-    expect(result.stoppedReason).toBe('rate-limit-exhausted');
-    // 打ち切りであって投稿単位の失敗ではない
-    expect(result.failedPostCount).toBe(0);
+    await expect(collectCreator()).rejects.toThrow(/レート制限の再試行上限/);
+  });
+
+  test('一覧ページの取得が最初から枯渇した場合もエラーにする', async () => {
+    mockApi({ ...BASE_RESPONSES, [LIST_PAGE_URL]: () => ({ ok: false, status: 429, retryAfter: '0' }) });
+
+    await expect(collectCreator()).rejects.toThrow(/レート制限の再試行上限/);
+  });
+
+  test('ページ URL 一覧の取得が枯渇した場合もエラーにする', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [`https://api.fanbox.cc/post.paginateCreator?creatorId=${CREATOR_ID}`]: () => ({
+        ok: false,
+        status: 429,
+        retryAfter: '0',
+      }),
+    });
+
+    await expect(collectCreator()).rejects.toThrow(/レート制限の再試行上限/);
+  });
+
+  test('単一投稿モードで枯渇した場合もエラーにする', async () => {
+    // 取り込めるものが 1 件しかないので、枯渇は常に「取得できた分」が無い
+    mockApi({ [POST_INFO_URL]: () => ({ ok: false, status: 429, retryAfter: '0' }) });
+
+    await expect(collectSinglePost()).rejects.toThrow(/レート制限の再試行上限/);
   });
 
   test('打ち切りでもそこまでに集めた投稿は捨てない', async () => {
