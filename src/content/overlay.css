@@ -2,34 +2,6 @@
   all: initial;
 }
 
-.fab-button {
-  position: fixed;
-  bottom: 24px;
-  right: 24px;
-  width: 56px;
-  height: 56px;
-  border-radius: 50%;
-  background: #4caf50;
-  color: #fff;
-  border: none;
-  cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
-  font-size: 24px;
-  z-index: 2147483647;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition:
-    transform 0.2s,
-    background 0.2s;
-  font-family: system-ui, sans-serif;
-}
-
-.fab-button:hover {
-  transform: scale(1.1);
-  background: #43a047;
-}
-
 .overlay-backdrop {
   position: fixed;
   inset: 0;

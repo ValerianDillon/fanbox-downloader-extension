@@ -23,7 +23,7 @@ src/
     content.ts             # entry point: ページ検出, SPA 対応
     fab.ts                 # FAB ボタン (shadow DOM)
     overlay.ts             # オーバーレイパネル (shadow DOM)
-    overlay.css            # FAB + overlay スタイル
+    overlay.css            # overlay スタイル (FAB のスタイルは fab.ts の FAB_STYLES)
     downloader.ts          # download-helper への薄いアダプタ (service worker 経由 fetch, ハンドル取得)
     messaging.ts           # service worker との messaging を AbortSignal 対応にするラッパー
     test-hooks.ts          # __FBDL_TEST__ 専用の観測フック (data-fbdl-* 属性 publish)
@@ -89,6 +89,7 @@ dist-test/                 # テストビルド成果物 (git 管理対象外, s
 - fixture は投稿を 2 件用意している。投稿A は image type の無料投稿、投稿B は file type の有料投稿である。
 - `post.listCreator` の一覧レスポンスには本文が含まれないため、どちらの投稿も `post.info` への追加リクエストを経て収集される。
 - WSL2 上の headless Chromium で拡張を読み込むには `channel: 'chromium'` の指定が必要である (新しい headless 実装でのみ拡張の読み込みに対応するため)。
+- WSLg の `DISPLAY` / `WAYLAND_DISPLAY` を引き継いだまま headless Chromium を起動すると、最初の `requestAnimationFrame` の配送が 60〜100 秒止まる (2 フレーム目以降は 16ms で正常)。Playwright の actionability の stable 判定が連続 2 フレームの bounding box 比較を待つため、最初の操作がそこで固まって既定の 60 秒タイムアウトを超える。`browserEnv()` でこの 2 つを取り除いて起動している。
 
 ## コーディング規約
 

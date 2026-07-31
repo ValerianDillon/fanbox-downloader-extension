@@ -81,6 +81,23 @@ function deriveAllowedHostSuffixes(manifest: Manifest): string[] {
   });
 }
 
+/**
+ * WSLg の DISPLAY / WAYLAND_DISPLAY を取り除いた環境を返す。
+ *
+ * これらが設定されたまま headless Chromium を起動すると、最初の requestAnimationFrame の
+ * 配送が 60〜100 秒止まる (2 フレーム目以降は 16ms で正常)。Playwright の actionability の
+ * stable 判定は連続 2 フレームの bounding box 比較を待つため、最初の操作がそこで固まり、
+ * 既定の 60 秒タイムアウトを超える。CI には元から設定されていないので影響しない。
+ */
+function browserEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key === 'DISPLAY' || key === 'WAYLAND_DISPLAY') continue;
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
 /** background.service_worker (拡張自身の service worker のファイル名) を manifest から導出する */
 function deriveServiceWorkerFileName(manifest: Manifest): string {
   const swPath = manifest.background?.service_worker;
@@ -132,6 +149,7 @@ test('FANBOX creator ページ: 収集から ZIP 生成まで完走する', asyn
   const context = await chromium.launchPersistentContext(userDataDir, {
     channel: 'chromium',
     headless: true,
+    env: browserEnv(),
     args: [
       `--disable-extensions-except=${extensionPath}`,
       `--load-extension=${extensionPath}`,
