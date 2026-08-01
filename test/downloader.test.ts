@@ -128,6 +128,11 @@ describe('downloadAsZip - publishedDatetime (info/html, chrome 不要)', () => {
     expect(root.extraLen).toBe(0);
     expect(root.utMtime).toBeNull();
 
+    // ルートディレクトリの日時は、投稿の publishedDatetime のうち有効な値の最大値
+    // (このケースでは withDate のみが有効な値なので withDate の日時と一致する)
+    const rootDir = entryByName(entries, 'u/');
+    expect(rootDir.utMtime).toBe(expectedUnix);
+
     // publishedDatetime ありの post 配下は DOS time/date + UT extra
     for (const path of ['u/withDate/info.json', 'u/withDate/index.html']) {
       const e = entryByName(entries, path);
@@ -135,6 +140,10 @@ describe('downloadAsZip - publishedDatetime (info/html, chrome 不要)', () => {
       expect(e.extraLen).toBeGreaterThan(0);
       expect(e.utMtime).toBe(expectedUnix);
     }
+
+    // 投稿ディレクトリの UT extra の mtime も publishedDatetime と一致する
+    const withDateDir = entryByName(entries, 'u/withDate/');
+    expect(withDateDir.utMtime).toBe(expectedUnix);
 
     // publishedDatetime なしの post 配下は fallback (date なし)
     for (const path of ['u/noDate/info.json', 'u/noDate/index.html']) {
@@ -144,6 +153,13 @@ describe('downloadAsZip - publishedDatetime (info/html, chrome 不要)', () => {
       expect(e.extraLen).toBe(0);
       expect(e.utMtime).toBeNull();
     }
+
+    // publishedDatetime なしの post ディレクトリも fallback (date なし)
+    const noDateDir = entryByName(entries, 'u/noDate/');
+    expect(noDateDir.dosTime).toBe(0);
+    expect(noDateDir.dosDate).toBe(0);
+    expect(noDateDir.extraLen).toBe(0);
+    expect(noDateDir.utMtime).toBeNull();
   });
 
   test('不正値 publishedDatetime の post は date なし (fallback)', async () => {
@@ -174,6 +190,76 @@ describe('downloadAsZip - publishedDatetime (info/html, chrome 不要)', () => {
     expect(e.dosDate).toBe(0);
     expect(e.extraLen).toBe(0);
     expect(e.utMtime).toBeNull();
+
+    // 有効な publishedDatetime を持つ投稿が 1 件も無いので、投稿ディレクトリ・ルートディレクトリともに date なし
+    const dir = entryByName(entries, 'u/bad/');
+    expect(dir.dosTime).toBe(0);
+    expect(dir.dosDate).toBe(0);
+    expect(dir.extraLen).toBe(0);
+    expect(dir.utMtime).toBeNull();
+
+    const rootDir = entryByName(entries, 'u/');
+    expect(rootDir.dosTime).toBe(0);
+    expect(rootDir.dosDate).toBe(0);
+    expect(rootDir.extraLen).toBe(0);
+    expect(rootDir.utMtime).toBeNull();
+  });
+
+  test('ルートディレクトリの日時は複数投稿の publishedDatetime のうち最大値になる', async () => {
+    const earlier = '2024-01-01T00:00:00Z';
+    const later = '2024-12-31T23:59:59Z';
+    const expectedEarlierUnix = Math.floor(new Date(earlier).getTime() / 1000);
+    const expectedLaterUnix = Math.floor(new Date(later).getTime() / 1000);
+    const json = JSON.stringify({
+      id: 'u',
+      url: '#main',
+      tags: [],
+      postCount: 3,
+      fileCount: 0,
+      posts: [
+        {
+          originalName: 'earlier',
+          encodedName: 'earlier',
+          informationText: '{}',
+          htmlText: '<p>a</p>',
+          files: [],
+          tags: [],
+          publishedDatetime: earlier,
+        },
+        {
+          originalName: 'later',
+          encodedName: 'later',
+          informationText: '{}',
+          htmlText: '<p>b</p>',
+          files: [],
+          tags: [],
+          publishedDatetime: later,
+        },
+        {
+          originalName: 'none',
+          encodedName: 'none',
+          informationText: '{}',
+          htmlText: '<p>c</p>',
+          files: [],
+          tags: [],
+        },
+      ],
+    });
+    const { handle, mock } = makeHandle();
+    await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
+
+    const entries = parseLocalEntries(mock.toBuffer());
+
+    // ルートディレクトリは最大値 (later) を採用し、最小値 (earlier) には引きずられない
+    const rootDir = entryByName(entries, 'u/');
+    expect(rootDir.utMtime).toBe(expectedLaterUnix);
+
+    // 各投稿ディレクトリは自身の publishedDatetime をそのまま持つ
+    expect(entryByName(entries, 'u/earlier/').utMtime).toBe(expectedEarlierUnix);
+    expect(entryByName(entries, 'u/later/').utMtime).toBe(expectedLaterUnix);
+    const noneDir = entryByName(entries, 'u/none/');
+    expect(noneDir.dosTime).toBe(0);
+    expect(noneDir.utMtime).toBeNull();
   });
 });
 

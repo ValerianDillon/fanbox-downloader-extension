@@ -118,11 +118,14 @@ export const EXPECTED_FETCHED_URLS = [POST_A_COVER_URL, POST_A_IMAGE_URL, POST_B
  * - file type の投稿は addFile(file.name, file.extension, file.url) で呼ばれるため、ファイル名は FileInfo.name ベースになる
  */
 export const EXPECTED_ZIP_ENTRIES = [
+  'testcreator/',
   'testcreator/index.html',
+  'testcreator/リンゴ/',
   'testcreator/リンゴ/info.json',
   'testcreator/リンゴ/index.html',
   'testcreator/リンゴ/cover.jpg',
   'testcreator/リンゴ/リンゴ.png',
+  'testcreator/バナナ/',
   'testcreator/バナナ/info.json',
   'testcreator/バナナ/index.html',
   'testcreator/バナナ/cover.png',

@@ -55,7 +55,7 @@ dist-test/                 # テストビルド成果物 (git 管理対象外, s
 - Bun でバンドル (TypeScript → 単一 JS)
 - Biome で静的解析・フォーマット
 - Chrome Manifest V3
-- 唯一の runtime 依存: `download-helper` (`github:ValerianDillon/download-helper#v4.2.0`)
+- 唯一の runtime 依存: `download-helper` (`github:ValerianDillon/download-helper#v4.3.0`)
   - `download-helper/download-helper`: `DownloadHelper.downloadZip` (ZIP 生成本体), `DownloadUtils`, `ZipWriter` など
   - `download-helper/fanbox-collector`: FANBOX API 型定義 (`PostInfo` 等), `DownloadManage`, `addByPostInfo`, `convert*Map` など FANBOX 固有の共通ロジック (fanbox-downloader と共用)
 
