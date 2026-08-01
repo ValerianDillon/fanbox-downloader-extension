@@ -32,10 +32,17 @@ description: 実 FANBOX (https://www.fanbox.cc/) を相手に拡張を実ブラ�
 4. 終了する: ランチャーのプロセスに SIGINT または SIGTERM を送る (`kill <pid>`)。`context.close()` が実行されプロファイルに状態が保存されてから終了する
    - 終了後、`curl -s http://127.0.0.1:9222/json/version` が応答しなくなることで停止を確認できる
 
+## 拡張の操作レシピ
+
+1. 対象クリエイターのページ (`https://www.fanbox.cc/@<creatorId>` または `<creatorId>.fanbox.cc`) を開く
+2. 拡張の FAB ボタン (画面右下 `bottom: 24px; right: 24px` に固定表示、`src/content/fab.ts`) をクリックする。通常ビルドの shadow root は closed のため DOM セレクタでは shadow 内に届かない。スクリーンショットを撮って座標クリックするか、accessibility snapshot にボタンが出ていればそれを使う
+3. overlay パネルで収集対象を最小限 (1〜2 投稿) に設定して実行し、進行は overlay の表示で確認する
+4. 保存ステップ (`showSaveFilePicker`, `src/content/downloader.ts:69`) はネイティブのファイル保存ダイアログを要求するため、headless では完走できない可能性が高い (未検証)。headless での確認は収集完了までを責務範囲とし、保存まで確認したい場合は headed で行う
+
 ## 診断 (CDP が応答しない・操作できない場合)
 
 - ランチャーが `dist/ が見つかりません` と出力して終了した → `bun run build` を先に実行する (自動ビルドはしない設計)
-- `--remote-debugging-port` のポートが既に使用中 (bind エラー) → 前回のランチャーが残っていないか `pgrep -af live-browser.ts` で確認し、残っていれば SIGTERM で止める。別ポートで動かしたい場合のみ `--port` を変える
+- `--remote-debugging-port` のポートが既に使用中 (bind エラー) → 前回のランチャーが残っていないか `pgrep -af live-browser.ts` で確認し、残っていれば SIGTERM で止める。無関係なプロセスが占有している場合は勝手に kill せず、「ポートを変更する場合」(下記 MCP 接続確認の節) に従って別ポートで起動する
 - 同じ `--profile` を指す別プロセスが起動している → Chrome の profile ロックにより起動に失敗することがある。`pgrep -af live-browser.ts` で他のプロセスが同じ profile を使っていないか確認してから再起動する
 - CDP (`/json/version`) には応答するが拡張が見当たらない → `curl -s http://127.0.0.1:<port>/json/list` を見て `"type": "service_worker"` のエントリ (`chrome-extension://.../service-worker.js`) があるか確認する。無ければ拡張の読み込み自体に失敗しているので `dist/` の中身 (`manifest.json` の有無など) を確認する
 
@@ -48,6 +55,14 @@ FANBOX のログインには CAPTCHA があるため自動化しない。ユー�
 3. ログイン完了を確認したら Ctrl+C (SIGINT) でランチャーを終了する (セッション Cookie がプロファイルに保存される)
 4. 以降は通常どおり `--headed` なし (headless) で起動して使う
 
+### agent のシェルから headed 起動に失敗する場合
+
+agent の実行シェルには WSLg の X 認証が引き継がれないことがあり、`DISPLAY` が設定されていても `Missing X server or $DISPLAY` で headed 起動に失敗する (`XAUTHORITY` 未設定、または WSLg の X サーバ自体が無応答)。この失敗は環境要因であり、スクリプトや拡張の不具合ではない。
+
+- 同じ起動を繰り返さない。1 回失敗したら切り分け (`timeout 5 xset q` の応答有無) をして止める
+- ユーザに、**agent のシェルではなくユーザ自身のターミナル**で `bun scripts/live-browser.ts --headed` を実行して手順 2〜3 (ログイン → Ctrl+C) を行うよう依頼する。プロファイルは同じ場所を使うため、完了後は agent 側から headless で Cookie を利用できる
+- ユーザのターミナルでもウィンドウが出ない場合は WSLg 自体が無応答の可能性がある (`wsl --shutdown` からの再起動をユーザに提案する)
+
 ## フォールバック: Windows 側にウィンドウを出さず headed 実行する (未整備)
 
 headed 起動が恒常的に必要になった場合、Xvfb 仮想ディスプレイを使えば Windows 側にウィンドウを表示せずに headed 実行できる。現時点では未整備であり、必要になったタイミングで整備する。
@@ -59,6 +74,20 @@ headed 起動が恒常的に必要になった場合、Xvfb 仮想ディスプ�
 ```
 claude mcp add --scope local chrome-devtools -- npx chrome-devtools-mcp@latest --browser-url=http://127.0.0.1:9222
 ```
+
+### 登録済みでも MCP ツールを呼び出せない場合
+
+「`claude mcp list` で Connected」と「自分のツール一覧に `mcp__chrome-devtools__*` がある」は別レイヤーの確認である。次の場合、登録済みでもツールは呼び出せない。
+
+- subagent として実行されている (MCP ツールは subagent に継承されない)
+- 登録した直後のセッション (反映はセッション再起動後)
+
+ツールが無い場合は自動化の代替に走らず、生 CDP (`curl http://127.0.0.1:<port>/json/version`, `/json/list`) での起動・拡張ロード確認までに留め、ページ操作が必要ならその旨を報告して main セッション側に委ねる。
+
+### ポートを変更する場合
+
+- 代替ポートは `ss -ltn` で空きを確認してから 9223, 9224, … の順に採番する
+- 一時的なポート変更では MCP 登録 (`--browser-url`) は書き換えず、確認は生 CDP で行う。登録を書き換えた場合は、作業後に必ず 9222 に戻す (`claude mcp remove chrome-devtools` → 上記 add コマンド)
 
 ## 安全上の注意
 
