@@ -17,6 +17,7 @@ fanbox-downloader のブックマークレット版を Chrome 拡張に移行し
 ```
 scripts/
   build.ts                # ビルド本体 (bun scripts/build.ts [--test])
+  live-browser.ts          # 実 FANBOX での実機テスト用ランチャー (詳細は .claude/skills/extension-live-test/)
 src/
   types.d.ts               # __FBDL_TEST__ (ビルド時 define 定数) の型宣言
   content/
@@ -90,6 +91,11 @@ dist-test/                 # テストビルド成果物 (git 管理対象外, s
 - `post.listCreator` の一覧レスポンスには本文が含まれないため、どちらの投稿も `post.info` への追加リクエストを経て収集される。
 - WSL2 上の headless Chromium で拡張を読み込むには `channel: 'chromium'` の指定が必要である (新しい headless 実装でのみ拡張の読み込みに対応するため)。
 - WSLg の `DISPLAY` / `WAYLAND_DISPLAY` を引き継いだまま headless Chromium を起動すると、最初の `requestAnimationFrame` の配送が 60〜100 秒止まる (2 フレーム目以降は 16ms で正常)。Playwright の actionability の stable 判定が連続 2 フレームの bounding box 比較を待つため、最初の操作がそこで固まって既定の 60 秒タイムアウトを超える。`browserEnv()` でこの 2 つを取り除いて起動している。
+
+## 実機テスト (実 FANBOX)
+
+- `scripts/live-browser.ts` は fixture ではなく実 FANBOX (https://www.fanbox.cc/) に対して拡張を動かすためのランチャーである (`bun scripts/live-browser.ts [--headed] [--port <n>] [--profile <dir>]`)。CDP をポート公開し、`chrome-devtools` MCP から操作する想定。
+- 手順・診断・安全上の注意は `.claude/skills/extension-live-test/SKILL.md` を参照。
 
 ## コーディング規約
 
