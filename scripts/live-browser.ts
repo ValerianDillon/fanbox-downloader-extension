@@ -92,38 +92,16 @@ async function main() {
 
   mkdirSync(options.profileDir, { recursive: true });
 
-  const launch = (extraArgs: string[]) =>
-    chromium.launchPersistentContext(options.profileDir, {
-      channel: 'chromium',
-      headless: !options.headed,
-      env: launchEnv(options.headed),
-      args: [
-        `--disable-extensions-except=${extensionPath}`,
-        `--load-extension=${extensionPath}`,
-        `--remote-debugging-port=${options.port}`,
-        ...extraArgs,
-      ],
-    });
-
-  let context: Awaited<ReturnType<typeof launch>>;
-  try {
-    context = await launch([]);
-  } catch (error) {
-    // WSLg では Xwayland だけが死んで X ソケットに接続できないことがある。その場合でも
-    // Wayland コンポジタ側は生きていることがあるため、headed 時のみ Wayland で再試行する
-    // (--ozone-platform-hint=auto は Playwright 経由だと X11 に落ちることを実測済みなので明示指定)
-    if (!(options.headed && process.env.WAYLAND_DISPLAY)) throw error;
-    console.error('X11 での起動に失敗しました。Wayland で再試行します...');
-    try {
-      context = await launch(['--ozone-platform=wayland']);
-    } catch (waylandError) {
-      console.error(
-        'Wayland での起動にも失敗しました。WSLg 自体が壊れている可能性が高いため、' +
-          'Windows 側の PowerShell で `wsl --shutdown` を実行して WSL を再起動してから試してください。',
-      );
-      throw waylandError;
-    }
-  }
+  const context = await chromium.launchPersistentContext(options.profileDir, {
+    channel: 'chromium',
+    headless: !options.headed,
+    env: launchEnv(options.headed),
+    args: [
+      `--disable-extensions-except=${extensionPath}`,
+      `--load-extension=${extensionPath}`,
+      `--remote-debugging-port=${options.port}`,
+    ],
+  });
 
   const page = context.pages()[0] ?? (await context.newPage());
   await page.goto(START_URL);
