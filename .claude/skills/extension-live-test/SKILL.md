@@ -57,12 +57,11 @@ FANBOX のログインには CAPTCHA があるため自動化しない。ユー�
 
 ### agent のシェルから headed 起動に失敗する場合
 
-agent の実行シェルには WSLg の X 認証が引き継がれないことがあり、`DISPLAY` が設定されていても `Missing X server or $DISPLAY` で headed 起動に失敗する (`XAUTHORITY` 未設定、または WSLg の X サーバ自体が無応答)。この失敗は環境要因であり、スクリプトや拡張の不具合ではない。ランチャーは X11 での起動に失敗すると Wayland で自動的に再試行する。
+agent の実行シェルには WSLg の X 認証が引き継がれないことがあり、`DISPLAY` が設定されていても `Missing X server or $DISPLAY` で headed 起動に失敗する (`XAUTHORITY` 未設定、または WSLg の X サーバ自体が無応答)。この失敗は環境要因であり、スクリプトや拡張の不具合ではない。
 
 - 同じ起動を繰り返さない。1 回失敗したら切り分け (`timeout 5 xset q` の応答有無) をして止める
 - ユーザに、**agent のシェルではなくユーザ自身のターミナル**で `bun scripts/live-browser.ts --headed` を実行して手順 2〜3 (ログイン → Ctrl+C) を行うよう依頼する。プロファイルは同じ場所を使うため、完了後は agent 側から headless で Cookie を利用できる
-- ユーザのターミナルでも X11 / Wayland の両方で失敗する場合は WSLg 自体が壊れている (`wsl --shutdown` からの WSL 再起動をユーザに提案する。agent のセッションも道連れになるため、実行前に作業を push しておく)
-- WSL 起動直後は WSLg の初期化が終わっておらず失敗することがある。数十秒待って 1 回だけ再試行する
+- ユーザのターミナルでもウィンドウが出ない場合は WSLg 自体が無応答の可能性がある (`wsl --shutdown` からの再起動をユーザに提案する)
 
 ## フォールバック: Windows 側にウィンドウを出さず headed 実行する (未整備)
 
