@@ -70,6 +70,7 @@ type ProxyApiResponse = {
   retryAfter: string | null;
   body?: string;
   error?: string;
+  backoffUntil?: number;
 };
 type ApiCall = { url: string };
 type ApiResponder = () => ProxyApiResponse | Promise<ProxyApiResponse>;
@@ -78,8 +79,13 @@ function okJson(body: unknown): ProxyApiResponse {
   return { ok: true, status: 200, retryAfter: null, body: JSON.stringify(body) };
 }
 
-function tooManyRequests(retryAfter: string | null = null): ProxyApiResponse {
-  return { ok: false, status: 429, retryAfter };
+/**
+ * backoffUntil は本来 service worker (chrome.storage.session) が計算して返す値なので、
+ * ここでは呼び出し側が「service worker がこう応答したはず」という値を明示的に渡す。
+ * 省略時は cross-session の共有ゲートには関わらない 429 として振る舞う。
+ */
+function tooManyRequests(retryAfter: string | null = null, backoffUntil?: number): ProxyApiResponse {
+  return { ok: false, status: 429, retryAfter, backoffUntil };
 }
 
 function errorStatus(status: number): ProxyApiResponse {
@@ -121,6 +127,10 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     (globalThis as any).chrome = {
       runtime: {
         sendMessage: (message: { type: string; url: string }) => {
+          // gate() は発行の直前に毎回 getBackoffUntil を問い合わせる (Issue #16)。
+          // このテストでは別タブによる延長の有無は関心事ではないので常に未記録として返し、
+          // fetchApi の呼び出し回数を数える calls には含めない
+          if (message.type === 'getBackoffUntil') return Promise.resolve({ backoffUntil: 0 });
           if (message.type !== 'fetchApi') return Promise.reject(new Error('unexpected message type'));
           calls.push({ url: message.url });
           const responder = responders.shift();
@@ -264,10 +274,12 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
   });
 
   test('サーバー指定のバックオフは収集をまたいでも守る', async () => {
-    // 打ち切った直後に再実行しても、Retry-After の期限までは発行しない
+    // 打ち切った直後に再実行しても、Retry-After の期限までは発行しない。
+    // backoffUntil は本来 service worker が計算する値なので、ここでは
+    // 実際の service worker が返すはずの値 (Date.now() + Retry-After) を明示的に模擬する
     api = new ApiSession(50);
-    for (let i = 0; i < 3; i++) responders.push(() => tooManyRequests('0'));
-    responders.push(() => tooManyRequests('120'));
+    for (let i = 0; i < 3; i++) responders.push(() => tooManyRequests('0', Date.now()));
+    responders.push(() => tooManyRequests('120', Date.now() + 120_000));
     await expect(api.fetchPostInfo('x')).rejects.toThrow(RateLimitExhaustedError);
 
     const next = new ApiSession(50);
@@ -297,8 +309,8 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
 
   test('枯渇した最後の 429 の Retry-After も後続のために記録する', async () => {
     api = new ApiSession(50);
-    for (let i = 0; i < 3; i++) responders.push(() => tooManyRequests('0'));
-    responders.push(() => tooManyRequests('120'));
+    for (let i = 0; i < 3; i++) responders.push(() => tooManyRequests('0', Date.now()));
+    responders.push(() => tooManyRequests('120', Date.now() + 120_000));
     await expect(api.fetchPostInfo('x')).rejects.toThrow(RateLimitExhaustedError);
 
     // 後続のリクエストは記録された 120 秒のバックオフを待つ
@@ -313,6 +325,44 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 0);
     await expect(api.fetchPostInfo('z', controller.signal)).rejects.toThrow();
+  });
+
+  test('発行前の事前確認 (getBackoffUntil) が失敗しても収集は続行する (fail-open)', async () => {
+    // 最終判定は service worker 側 (handleFetchApi) のゲートが持つため、gate() の発行直前の
+    // 事前確認はベストエフォートでよい。メッセージ不達や storage エラーで失敗しても、
+    // それだけで収集全体を止めてはいけない
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: (message: { type: string; url: string }) => {
+          if (message.type === 'getBackoffUntil') return Promise.reject(new Error('getBackoffUntil failed'));
+          if (message.type !== 'fetchApi') return Promise.reject(new Error('unexpected message type'));
+          calls.push({ url: message.url });
+          const responder = responders.shift();
+          if (!responder) return Promise.reject(new Error(`unexpected fetch: ${message.url}`));
+          return Promise.resolve(responder());
+        },
+      },
+    };
+
+    responders.push(okPost);
+    const result = await api.fetchPostInfo('1');
+    expect(result).toEqual({ id: '1', type: 'image', isRestricted: false } as never);
+    expect(calls).toHaveLength(1);
+  });
+
+  test('中断中は事前確認の失敗を握りつぶさず、中断として伝播する', async () => {
+    // fail-open にするのは通常の (中断ではない) 失敗だけ。中断はそのまま伝播しないと、
+    // キャンセル操作が効かなくなる
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: () => Promise.reject(new Error('unreachable: 中断済みの signal では送信しないはず')),
+      },
+    };
+    const controller = new AbortController();
+    controller.abort();
+    await expect(api.fetchPostInfo('1', controller.signal)).rejects.toThrow(/Aborted/);
   });
 
   test('429 以外のエラーは即時例外', async () => {
