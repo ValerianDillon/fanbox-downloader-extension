@@ -86,13 +86,15 @@ export async function handleFetchApi(url: string, store: BackoffStore = backoffS
     // 割り込んで期限を延ばしうる (TOCTOU)。すべての fetchApi がここを通る以上、
     // fetch を発行する権限を最終的に持つのはここであるべきなので、ここでもう一度確認する。
     //
-    // この判定が保証するのは「既知の未経過期限があるときに fetch を開始しない」ことだけである。
-    // この if 判定と直後の fetch() 呼び出しの間には await が無く、JS の run-to-completion により
-    // 他のメッセージの処理はこの間に割り込めない (別タブの 429 の record がここに挟まることはない)。
-    // 不可避なのは、この判定を通過して fetch を開始した後、既に開始済みの別の fetch (自分自身が
-    // 直後に受け取る 429 を含む) が判明するケースである。この fetch は既に発行済みで取り消せない
-    // ため、サーバーの応答タイミングに起因する不可避なレースとして扱う (その 429 自体は通常どおり
-    // 下の分岐で記録される)。
+    // この判定が保証するのは「読み取れた既知の未経過期限があるときに fetch を開始しない」ことである。
+    // if 判定と直後の fetch() 呼び出しの間には await が無いため、そこに他メッセージの処理は
+    // 割り込めない (run-to-completion)。ただし期限の読み取り (safeGet) 自体は await を挟むので、
+    // 並行する別 fetch の 429 記録 (record) が storage.set を待っている間に、この読み取りが
+    // 記録前の古い値を返し、そのまま fetch が発行される経路は残る。つまり不可避なのは
+    // (1) 既に開始済みの別 fetch の 429 がこの fetch の開始後に判明するケースと、
+    // (2) 最終ゲートの読み取りと 429 の記録処理が並行するケースの 2 つで、どちらも
+    // 進行中の並行リクエストに由来する限定的なレースである (その 429 自体は通常どおり
+    // 下の分岐で記録され、次のリクエストからはゲートに反映される)。
     const knownBackoffUntil = await safeGet(store);
     if (Date.now() < knownBackoffUntil) {
       return { ok: false, status: 0, retryAfter: null, backoffUntil: knownBackoffUntil, kind: 'backoff' };
