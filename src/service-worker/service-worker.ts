@@ -1,4 +1,5 @@
 import { uint8ArrayToBase64 } from '../base64';
+import { handleFetchApi, handleGetBackoffUntil } from './handlers';
 
 chrome.runtime.onInstalled.addListener(() => {
   console.log('FANBOX Downloader installed');
@@ -12,6 +13,9 @@ chrome.runtime.onInstalled.addListener(() => {
  * - api.fanbox.cc の 429 レスポンスは CORS ヘッダが無く、JS が status / Retry-After を読めない
  *
  * service worker は拡張のオリジンで動作し host_permissions が適用されるため、これらを回避できる。
+ *
+ * fetchApi / getBackoffUntil の実処理は ./handlers.ts に切り出している (chrome.* への配線と
+ * ロジックを分け、後者をユニットテストから chrome のグローバルスタブなしに直接呼べるようにするため)。
  */
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'fetch') {
@@ -35,23 +39,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (message.type === 'fetchApi') {
-    fetch(message.url, { credentials: 'include' })
-      .then(async (r) => {
-        const retryAfter = r.headers.get('Retry-After');
-        if (r.status === 429) {
-          sendResponse({ ok: false, status: 429, retryAfter });
-          return;
-        }
-        if (!r.ok) {
-          sendResponse({ ok: false, status: r.status, retryAfter });
-          return;
-        }
-        const body = await r.text();
-        sendResponse({ ok: true, status: r.status, retryAfter, body });
-      })
-      .catch((e) => {
-        sendResponse({ ok: false, status: 0, retryAfter: null, error: String(e) });
-      });
+    handleFetchApi(message.url).then(sendResponse);
+    return true;
+  }
+  if (message.type === 'getBackoffUntil') {
+    handleGetBackoffUntil().then(sendResponse);
     return true;
   }
 });

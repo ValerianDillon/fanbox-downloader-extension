@@ -46,6 +46,11 @@ export async function collect(
   // レート制限の状態は収集ごとに持つ。前回引き上がった間隔を次の収集に持ち越さない
   const api = new ApiSession(settings.apiIntervalMs ?? DEFAULT_API_RATE_LIMIT_MS);
 
+  // 別タブや直前のリロードで service worker 側に記録が残っていることがあるので、
+  // 最初のリクエストを発行する前に取得しておく。ここを省くと、収集開始直後の
+  // 最初のリクエストだけ未経過の Retry-After を無視して発行してしまう (Issue #16)。
+  await ApiSession.syncBackoffUntil(signal);
+
   const plans = await api.fetchPlans(creatorId, signal);
   const feeMapper = new Map<number, string>();
   for (const plan of plans) {

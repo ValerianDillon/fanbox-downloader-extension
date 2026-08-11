@@ -70,6 +70,7 @@ type ProxyApiResponse = {
   retryAfter: string | null;
   body?: string;
   error?: string;
+  backoffUntil?: number;
 };
 type ApiCall = { url: string };
 type ApiResponder = () => ProxyApiResponse | Promise<ProxyApiResponse>;
@@ -78,8 +79,13 @@ function okJson(body: unknown): ProxyApiResponse {
   return { ok: true, status: 200, retryAfter: null, body: JSON.stringify(body) };
 }
 
-function tooManyRequests(retryAfter: string | null = null): ProxyApiResponse {
-  return { ok: false, status: 429, retryAfter };
+/**
+ * backoffUntil は本来 service worker (chrome.storage.session) が計算して返す値なので、
+ * ここでは呼び出し側が「service worker がこう応答したはず」という値を明示的に渡す。
+ * 省略時は cross-session の共有ゲートには関わらない 429 として振る舞う。
+ */
+function tooManyRequests(retryAfter: string | null = null, backoffUntil?: number): ProxyApiResponse {
+  return { ok: false, status: 429, retryAfter, backoffUntil };
 }
 
 function errorStatus(status: number): ProxyApiResponse {
@@ -264,10 +270,12 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
   });
 
   test('サーバー指定のバックオフは収集をまたいでも守る', async () => {
-    // 打ち切った直後に再実行しても、Retry-After の期限までは発行しない
+    // 打ち切った直後に再実行しても、Retry-After の期限までは発行しない。
+    // backoffUntil は本来 service worker が計算する値なので、ここでは
+    // 実際の service worker が返すはずの値 (Date.now() + Retry-After) を明示的に模擬する
     api = new ApiSession(50);
-    for (let i = 0; i < 3; i++) responders.push(() => tooManyRequests('0'));
-    responders.push(() => tooManyRequests('120'));
+    for (let i = 0; i < 3; i++) responders.push(() => tooManyRequests('0', Date.now()));
+    responders.push(() => tooManyRequests('120', Date.now() + 120_000));
     await expect(api.fetchPostInfo('x')).rejects.toThrow(RateLimitExhaustedError);
 
     const next = new ApiSession(50);
@@ -297,8 +305,8 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
 
   test('枯渇した最後の 429 の Retry-After も後続のために記録する', async () => {
     api = new ApiSession(50);
-    for (let i = 0; i < 3; i++) responders.push(() => tooManyRequests('0'));
-    responders.push(() => tooManyRequests('120'));
+    for (let i = 0; i < 3; i++) responders.push(() => tooManyRequests('0', Date.now()));
+    responders.push(() => tooManyRequests('120', Date.now() + 120_000));
     await expect(api.fetchPostInfo('x')).rejects.toThrow(RateLimitExhaustedError);
 
     // 後続のリクエストは記録された 120 秒のバックオフを待つ

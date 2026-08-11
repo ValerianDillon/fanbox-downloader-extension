@@ -39,6 +39,9 @@ function mockApi(responses: Record<string, unknown | (() => ProxyApiResponse)>) 
   (globalThis as any).chrome = {
     runtime: {
       sendMessage: (message: { type: string; url: string }) => {
+        // collect() は最初のリクエストの前に service worker 側の記録を一度取得する (Issue #16)。
+        // このテストでは別タブ・リロードをまたぐ記録の有無は関心事ではないので、常に未記録として返す
+        if (message.type === 'getBackoffUntil') return Promise.resolve({ backoffUntil: 0 });
         const entry = responses[message.url];
         if (entry === undefined) return Promise.resolve({ ok: false, status: 404, retryAfter: null });
         if (typeof entry === 'function') return Promise.resolve((entry as () => ProxyApiResponse)());

@@ -3,7 +3,7 @@
   "name": "FANBOX Downloader",
   "version": "1.0.0",
   "description": "pixiv FANBOX の投稿を ZIP として一括ダウンロード",
-  "permissions": ["declarativeNetRequest"],
+  "permissions": ["declarativeNetRequest", "storage"],
   "host_permissions": ["*://*.fanbox.cc/*", "*://*.pximg.net/*"],
   "content_scripts": [
     {

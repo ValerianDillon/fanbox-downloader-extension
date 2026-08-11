@@ -8,6 +8,7 @@ import type {
   PostListItem,
   Tags,
 } from 'download-helper/fanbox-collector';
+import { parseRetryAfter } from '../../retry-after';
 import { sendMessageAbortable } from '../messaging';
 
 export const DEFAULT_API_RATE_LIMIT_MS = 500;
@@ -79,23 +80,18 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function parseRetryAfter(header: string | null): number | null {
-  if (!header) return null;
-  const trimmed = header.trim();
-  if (/^\d+$/.test(trimmed)) {
-    return Number.parseInt(trimmed, 10) * 1000;
-  }
-  const dateMs = Date.parse(trimmed);
-  if (Number.isNaN(dateMs)) return null;
-  return Math.max(0, dateMs - Date.now());
-}
-
 type ApiFetchResponse = {
   ok: boolean;
   status: number;
   retryAfter: string | null;
   body?: string;
   error?: string;
+  /**
+   * service worker (chrome.storage.session) が記録している現在のバックオフ期限 (epoch ms)。
+   * 旧バージョンの service worker との組み合わせ等で欠けることもありうるので optional にし、
+   * 受け取り側は欠けていれば無視する (Math.max に undefined を渡すと NaN で壊れるため)。
+   */
+  backoffUntil?: number;
 };
 
 /**
@@ -175,22 +171,42 @@ function isValidPlan(item: unknown): boolean {
  */
 export class ApiSession {
   /**
-   * サーバーが指定したバックオフ期限。収集をまたいで共有する。
+   * サーバーが指定したバックオフ期限のローカルな参照値。収集をまたいで (同じ content script の
+   * 実行環境内では) 共有する。
    *
    * 適応スロットルの間隔はこちらの都合なので収集ごとに初期化してよいが、
    * Retry-After はサーバーが「いつまで待て」と言っている期限であり、
    * 収集を中断して再実行しても消えるわけではない。
    * セッションごとに持つと、枯渇した直後に再実行したときに即座に発行してしまう。
    *
-   * ただし共有されるのは同じ content script の実行環境内だけで、別タブや
-   * リロードをまたぐと 0 に戻る。全リクエストが通る service worker 側で
-   * 管理するのが本来の置き場所である。Issue #16 を参照。
+   * SoT は service worker 側 (chrome.storage.session、Issue #16) にあり、ここはその参照値
+   * (キャッシュ) にすぎない。別タブやリロードをまたぐとこの静的フィールド自体は 0 に戻るため、
+   * syncBackoffUntil() で service worker から取得して埋め直す必要がある。埋め直す前に
+   * 発行される最初のリクエストを守るため、収集の開始時に必ず 1 度呼ぶ (collector.ts)。
+   * 以降は fetchApi の応答に乗ってくる backoffUntil で継続的に更新される。
    */
   private static sharedBackoffUntil = 0;
 
-  /** テスト用。収集をまたぐ状態を初期化する */
+  /** テスト用。収集をまたぐ状態を初期化する (別タブ・リロードでの状態リセットの再現にも使う) */
   static resetSharedBackoff(): void {
     ApiSession.sharedBackoffUntil = 0;
+  }
+
+  /**
+   * service worker に記録されている現在のバックオフ期限を取得し、ローカルの参照値に反映する。
+   *
+   * 別タブや直前のリロードで service worker 側に記録が残っていても、この静的フィールドは
+   * content script の実行環境ごとに 0 から始まる。収集の最初のリクエストを発行する前に
+   * 一度だけ呼んでおかないと、未経過の Retry-After を無視して発行してしまう
+   * (Issue #16「別タブとリロードをまたぐと期限が消える」問題)。
+   *
+   * 応答が欠けている/型が違う場合は無視する (Math.max に undefined を渡すと NaN で壊れるため)。
+   */
+  static async syncBackoffUntil(signal?: AbortSignal): Promise<void> {
+    const response = await sendMessageAbortable<{ backoffUntil?: number }>({ type: 'getBackoffUntil' }, signal);
+    if (typeof response?.backoffUntil === 'number') {
+      ApiSession.sharedBackoffUntil = Math.max(ApiSession.sharedBackoffUntil, response.backoffUntil);
+    }
   }
 
   private lastRequestAt = 0;
@@ -204,8 +220,11 @@ export class ApiSession {
    *
    * 中断された呼び出しについては直列化を保証できない。sendMessageAbortable は
    * 呼び出し側の Promise を reject するだけで、service worker 側の fetch は走り続ける。
-   * キャンセル直後に再実行すると、前の fetch と新しい fetch が重なり、
-   * 前の fetch が受け取った Retry-After も失われる。Issue #16 を参照。
+   * キャンセル直後に再実行すると、前の fetch と新しい fetch が重なりうる。
+   * ただし service worker 側の fetch はそのまま完走し、429 の Retry-After は
+   * service worker 側に記録されるため (Issue #16)、失われるのは直列性だけで
+   * Retry-After 自体はもう失われない。真の直列化 (service worker 側で fetch を打ち切る仕組み)
+   * は Issue #16 のスコープ外としている。
    */
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -301,6 +320,14 @@ export class ApiSession {
           await abortableSleep(NETWORK_RETRY_BACKOFF_MS, signal);
           continue;
         }
+        // service worker (chrome.storage.session) が記録している現在のバックオフ期限を
+        // 応答のたびに取り込む。応答に乗せる方式にしているのは、収集開始時に一度
+        // 取得すれば (syncBackoffUntil)、以降は追加の往復なしに最新の期限へ追従できるため。
+        // 常に遠い方を採る: 別タブの収集が動いていると、後から届いた応答の期限がこちらの
+        // ローカルな参照値より古いことがある
+        if (typeof response.backoffUntil === 'number') {
+          ApiSession.sharedBackoffUntil = Math.max(ApiSession.sharedBackoffUntil, response.backoffUntil);
+        }
         // service worker は fetch の失敗を reject せず status 0 で返す。
         // 通常の HTTP エラーとして扱うと、一時的な通信障害がまったく再試行されない
         if (response.status === 0) {
@@ -314,14 +341,14 @@ export class ApiSession {
         }
         if (response.status === 429) {
           this.escalate();
-          // 待機時間は枯渇するときも記録する。記録せずに投げると、同じセッションに
-          // 積まれている後続のリクエストが Retry-After を無視して発行される
+          // この待機は「次の自分の再試行までどれだけ空けるか」というセッションローカルな
+          // ポリシー (Retry-After があればそれを優先、無ければ RETRY_BACKOFF_MS)。
+          // 別タブ・別セッションをまたいで共有される期限 (ApiSession.sharedBackoffUntil) は
+          // 上の response.backoffUntil の取り込みで既に更新済みで、これは service worker が
+          // 実際の Retry-After ヘッダから計算した値なので、ここで自前に計算し直さない。
           const waitMs =
             parseRetryAfter(response.retryAfter) ??
             RETRY_BACKOFF_MS[Math.min(rateLimitAttempts, RETRY_BACKOFF_MS.length - 1)];
-          // 複数のセッションが動いていると、後から返った短い期限が長い期限を
-          // 上書きしうるので、常に遠い方を採る
-          ApiSession.sharedBackoffUntil = Math.max(ApiSession.sharedBackoffUntil, Date.now() + waitMs);
           if (rateLimitAttempts >= RETRY_BACKOFF_MS.length) {
             throw new RateLimitExhaustedError(url);
           }
