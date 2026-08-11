@@ -66,14 +66,48 @@ describe('handleFetchApi / handleGetBackoffUntil', () => {
   });
 
   test('fetch が例外を投げても現在の backoffUntil を添えて status 0 を返す', async () => {
-    await store.record(Date.now() + 12_345);
+    // 経過済み (過去) の期限にしておく。未経過の期限だと発行前ゲートで弾かれ、
+    // ここで確かめたい「fetch 自体が例外を投げたときの catch」に到達できない
+    await store.record(Date.now() - 1_000);
     globalThis.fetch = (async () => {
       throw new Error('network down');
     }) as unknown as typeof fetch;
     const res = await handleFetchApi('https://api.fanbox.cc/x', store);
     expect(res.status).toBe(0);
+    expect(res.kind).toBeUndefined();
     expect(res.error).toContain('network down');
     expect(res.backoffUntil).toBe(await store.get());
+  });
+
+  test('既知の未経過期限があるときは fetch せずにゲート拒否を返す', async () => {
+    const backoffUntil = await store.record(Date.now() + 60_000);
+    let fetchCalled = false;
+    globalThis.fetch = (async () => {
+      fetchCalled = true;
+      return fakeResponse({ status: 200, body: '{"ok":true}' });
+    }) as unknown as typeof fetch;
+
+    const res = await handleFetchApi('https://api.fanbox.cc/x', store);
+
+    expect(fetchCalled).toBe(false);
+    expect(res.ok).toBe(false);
+    expect(res.kind).toBe('backoff');
+    expect(res.backoffUntil).toBe(backoffUntil);
+  });
+
+  test('期限が経過済みなら通常どおり fetch する', async () => {
+    await store.record(Date.now() - 1_000);
+    let fetchCalled = false;
+    globalThis.fetch = (async () => {
+      fetchCalled = true;
+      return fakeResponse({ status: 200, body: '{"ok":true}' });
+    }) as unknown as typeof fetch;
+
+    const res = await handleFetchApi('https://api.fanbox.cc/x', store);
+
+    expect(fetchCalled).toBe(true);
+    expect(res.kind).toBeUndefined();
+    expect(res.ok).toBe(true);
   });
 
   test('getBackoffUntil はそのときの記録をそのまま返す', async () => {

@@ -327,6 +327,44 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     await expect(api.fetchPostInfo('z', controller.signal)).rejects.toThrow();
   });
 
+  test('発行前の事前確認 (getBackoffUntil) が失敗しても収集は続行する (fail-open)', async () => {
+    // 最終判定は service worker 側 (handleFetchApi) のゲートが持つため、gate() の発行直前の
+    // 事前確認はベストエフォートでよい。メッセージ不達や storage エラーで失敗しても、
+    // それだけで収集全体を止めてはいけない
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: (message: { type: string; url: string }) => {
+          if (message.type === 'getBackoffUntil') return Promise.reject(new Error('getBackoffUntil failed'));
+          if (message.type !== 'fetchApi') return Promise.reject(new Error('unexpected message type'));
+          calls.push({ url: message.url });
+          const responder = responders.shift();
+          if (!responder) return Promise.reject(new Error(`unexpected fetch: ${message.url}`));
+          return Promise.resolve(responder());
+        },
+      },
+    };
+
+    responders.push(okPost);
+    const result = await api.fetchPostInfo('1');
+    expect(result).toEqual({ id: '1', type: 'image', isRestricted: false } as never);
+    expect(calls).toHaveLength(1);
+  });
+
+  test('中断中は事前確認の失敗を握りつぶさず、中断として伝播する', async () => {
+    // fail-open にするのは通常の (中断ではない) 失敗だけ。中断はそのまま伝播しないと、
+    // キャンセル操作が効かなくなる
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: () => Promise.reject(new Error('unreachable: 中断済みの signal では送信しないはず')),
+      },
+    };
+    const controller = new AbortController();
+    controller.abort();
+    await expect(api.fetchPostInfo('1', controller.signal)).rejects.toThrow(/Aborted/);
+  });
+
   test('429 以外のエラーは即時例外', async () => {
     responders.push(() => errorStatus(500));
     await expect(api.fetchPostInfo('w')).rejects.toThrow(/HTTP 500/);

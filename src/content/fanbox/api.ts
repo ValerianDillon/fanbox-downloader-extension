@@ -19,6 +19,13 @@ const ADAPTIVE_THROTTLE_MULTIPLIER = 1.5;
 const ADAPTIVE_THROTTLE_CAP_MS = 3_000;
 /** 通信失敗そのものに対する再試行回数 (429 の再試行枠とは別に数える) */
 const MAX_NETWORK_RETRY = 1;
+/**
+ * service worker 側の最終ゲートで拒否された (kind: 'backoff') ときの再試行回数の上限。
+ * 通信していないので通常は 429 の再試行枠を消費させたくないが、無限ループの安全弁として
+ * 429 の再試行枠とは別に上限を設ける。次の gate() は取り込み済みの最新の期限を見て
+ * 適切な時間だけ待ってから再試行するため、通常はここに達する前に解消するはずである。
+ */
+const MAX_GATE_REJECTIONS = 10;
 /** 引き上げた間隔を戻すのに必要な連続成功数 */
 const DECAY_SUCCESS_STREAK = 20;
 /** 引き上げた間隔を戻すのに必要な、直近のレート制限からの経過時間 */
@@ -92,6 +99,11 @@ type ApiFetchResponse = {
    * 受け取り側は欠けていれば無視する (Math.max に undefined を渡すと NaN で壊れるため)。
    */
   backoffUntil?: number;
+  /**
+   * service worker 側の最終ゲートで、fetch を発行せずに拒否されたことを示す。
+   * 'backoff' のときは status/retryAfter/body/error に意味はない (fetch していない)。
+   */
+  kind?: 'backoff';
 };
 
 /**
@@ -284,9 +296,20 @@ export class ApiSession {
       // 待ち終えた直後、実際にリクエストを発行する直前に service worker へ最新の期限を
       // 問い合わせる。別タブ (別の JS 実行環境) が待機中に期限を延長していても、
       // その延長は自分が次に fetchApi の応答を受け取るまでローカルの参照値に反映されない。
-      // ここで問い合わせておかないと、延長を知らないまま発行してしまう (Issue #16)。
+      // ここで問い合わせておかないと、延長を知らないまま発行してしまう。
       // メッセージ 1 往復のコストは fetch 本体に比べて無視できる。
-      await ApiSession.syncBackoffUntil(signal);
+      //
+      // ただしこれはあくまでベストエフォートの事前確認であり、最終判定は service worker 側の
+      // handleFetchApi のゲートが持つ (発行直前の問い合わせと実際の発行の間にも別タブの 429 が
+      // 割り込みうるため、TOCTOU を完全には塞げない)。そのため、ここでの問い合わせが失敗しても
+      // (メッセージ不達や storage エラーなど) 収集全体を止める理由にはならない。中断だけは
+      // そのまま伝播し、それ以外は警告ログを出してローカルに既知の値のまま続行する (fail-open)。
+      try {
+        await ApiSession.syncBackoffUntil(signal);
+      } catch (e) {
+        if (signal?.aborted) throw e;
+        console.warn('バックオフ期限の事前確認に失敗。ローカルの参照値のまま続行します:', e);
+      }
       if (ApiSession.sharedBackoffUntil <= deadline) break;
     }
     this.lastRequestAt = Date.now();
@@ -311,6 +334,9 @@ export class ApiSession {
       // 通信失敗の再試行と 429 の再試行は別に数える。混ぜると通信の失敗が
       // レート制限の試行枠を食い、429 に使える回数が減る
       let rateLimitAttempts = 0;
+      // service worker 側の最終ゲートで拒否された回数。通信していないので 429 の再試行枠とは
+      // 別に数える (無限ループの安全弁、MAX_GATE_REJECTIONS のコメント参照)
+      let gateRejections = 0;
       for (;;) {
         await this.gate(signal);
         if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -333,6 +359,18 @@ export class ApiSession {
         // ローカルな参照値より古いことがある
         if (typeof response.backoffUntil === 'number') {
           ApiSession.sharedBackoffUntil = Math.max(ApiSession.sharedBackoffUntil, response.backoffUntil);
+        }
+        if (response.kind === 'backoff') {
+          // service worker 側の最終ゲートで拒否された (fetch していない)。gate() の発行直前の
+          // 事前確認 (syncBackoffUntil) はベストエフォートなので、それが完了してからこの
+          // fetchApi メッセージが実際に処理されるまでの間に別タブの 429 が期限を延ばすと起こる
+          // (TOCTOU)。通信していないので通信失敗としては数えず、429 の再試行枠も消費しない。
+          // 上で取り込んだ最新の backoffUntil を、次の gate() が見て適切な時間だけ待つ
+          if (gateRejections >= MAX_GATE_REJECTIONS) {
+            throw new RateLimitExhaustedError(url);
+          }
+          gateRejections++;
+          continue;
         }
         // service worker は fetch の失敗を reject せず status 0 で返す。
         // 通常の HTTP エラーとして扱うと、一時的な通信障害がまったく再試行されない

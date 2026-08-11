@@ -22,6 +22,13 @@ export type ApiFetchResponse = {
   error?: string;
   /** 記録されている現在のバックオフ期限 (epoch ms)。content script 側のゲートが参照する */
   backoffUntil: number;
+  /**
+   * service worker 側の最終ゲートで、fetch を発行せずに拒否したことを示す。
+   * 'backoff' のときは fetch していないので status / retryAfter / body / error に意味はない。
+   * content script 側はこれを通信失敗として数えず、429 の再試行枠も消費しない
+   * (専用の上限だけを設けて無限ループを防ぐ)。
+   */
+  kind?: 'backoff';
 };
 
 /**
@@ -38,6 +45,25 @@ export type ApiFetchResponse = {
  */
 export async function handleFetchApi(url: string, store: BackoffStore = backoffStore): Promise<ApiFetchResponse> {
   try {
+    // fetch を発行する前に、既知の未経過期限がないか確認する (最終ゲート)。
+    //
+    // content script 側にも発行直前の事前確認 (ApiSession.syncBackoffUntil) があるが、
+    // それは「ローカルで待ってから来る」ための最適化にすぎず、その確認が終わってから
+    // この fetchApi メッセージが実際にここで処理されるまでの間にも、別タブの 429 が
+    // 割り込んで期限を延ばしうる (TOCTOU)。すべての fetchApi がここを通る以上、
+    // fetch を発行する権限を最終的に持つのはここであるべきなので、ここでもう一度確認する。
+    //
+    // この判定が保証するのは「既知の未経過期限があるときに fetch を開始しない」ことだけである。
+    // service worker はシングルスレッドで store の get()/record() 自体は直列化されているが、
+    // この if 判定と直後の fetch() 呼び出しの間には、別メッセージ (別タブの 429) の record が
+    // 割り込みうる (service worker は複数のメッセージを並行して処理する)。fetch を開始した後に
+    // 別タブの 429 が届くケースはサーバーの応答タイミングに起因する不可避なレースであり、
+    // ここでは扱わない (その 429 自体は通常どおり下の分岐で記録される)。
+    const knownBackoffUntil = await store.get();
+    if (Date.now() < knownBackoffUntil) {
+      return { ok: false, status: 0, retryAfter: null, backoffUntil: knownBackoffUntil, kind: 'backoff' };
+    }
+
     const r = await fetch(url, { credentials: 'include' });
     const retryAfter = r.headers.get('Retry-After');
     if (r.status === 429) {

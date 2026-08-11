@@ -95,6 +95,32 @@ describe('BackoffStore', () => {
     expect(gotten).toBe(until);
   });
 
+  test('storage への書き込みが失敗すると、キャッシュも古いままにする (SoT は storage という契約を守る)', async () => {
+    // 書き込み成功前にキャッシュを進めてしまうと、この worker はメモリ上「記録済み」と
+    // 答え続けるが、set() が失敗している以上 storage には残っていない。直後に service worker が
+    // 停止すれば記録ごと消えるうえ、記録できていないのに記録できたと嘘をつくことになる。
+    // biome-ignore lint/suspicious/noExplicitAny: chrome storage mock
+    (globalThis as any).chrome = {
+      storage: {
+        session: {
+          get: async (key: string) => (backing.has(key) ? { [key]: backing.get(key) } : {}),
+          set: async () => {
+            throw new Error('storage.session.set failed');
+          },
+        },
+      },
+    };
+
+    const store = new BackoffStore();
+    expect(await store.get()).toBe(0);
+
+    await expect(store.record(Date.now() + 60_000)).rejects.toThrow('storage.session.set failed');
+
+    // キャッシュも storage も書き込み前 (0) のまま
+    expect(await store.get()).toBe(0);
+    expect(backing.size).toBe(0);
+  });
+
   test('service worker 再起動相当: 新しいインスタンスでもメモリキャッシュではなく storage から復元する', async () => {
     const first = new BackoffStore();
     const until = Date.now() + 60_000;

@@ -64,8 +64,12 @@ export class BackoffStore {
     const current = await this.getLocked();
     const next = Math.max(current, candidateUntil);
     if (next !== current) {
-      this.cache = next;
+      // storage への書き込みが成功する前にキャッシュを進めない。先にキャッシュだけ進めると、
+      // set() が失敗したときにこのインスタンスは以後「記録済み」と誤答してしまう
+      // (SoT は storage という契約に反する) うえ、service worker が直後に停止すると
+      // 記録がどこにも残らない。
       await chrome.storage.session.set({ [STORAGE_KEY]: next });
+      this.cache = next;
     }
     return next;
   }
