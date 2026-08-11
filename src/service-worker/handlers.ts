@@ -14,6 +14,39 @@ import { BackoffStore } from './backoff-store';
  */
 const backoffStore = new BackoffStore();
 
+/**
+ * store.get() を安全化する。BackoffStore の get()/record() は chrome.storage.session を
+ * 叩くため失敗しうるが、期限を「知れなかった」ことが handleFetchApi / handleGetBackoffUntil
+ * 全体を失敗させる理由にはならない (呼び出し元の message ハンドラは必ず応答を返す契約を
+ * 守る必要がある。応答を返し損なうと sendResponse が呼ばれず、content script は
+ * 応答なしで待ち続けることになる)。失敗時は「未記録 (0)」に倒す。
+ */
+async function safeGet(store: BackoffStore): Promise<number> {
+  try {
+    return await store.get();
+  } catch (e) {
+    console.warn('バックオフ期限の取得に失敗。未記録 (0) として扱います:', e);
+    return 0;
+  }
+}
+
+/**
+ * store.record() を安全化する。永続化 (chrome.storage.session.set) が失敗しても、
+ * 候補値 (呼び出し元がローカルで計算した Date.now() + waitMs) をそのまま返す。
+ * 429 という事実と Retry-After は fetch から確実に得られているので、それを呼び出し元に
+ * 報告できないのは永続化の失敗であって fetch の失敗ではない。ここで例外を伝播させると、
+ * handleFetchApi の外側の catch が応答全体を「通信障害 (status: 0)」にすり替えてしまい、
+ * content script は既知の Retry-After を無視して短い間隔で再送してしまう。
+ */
+async function safeRecord(store: BackoffStore, candidateUntil: number): Promise<number> {
+  try {
+    return await store.record(candidateUntil);
+  } catch (e) {
+    console.warn('バックオフ期限の記録 (永続化) に失敗。ローカルで計算した候補値を返します:', e);
+    return candidateUntil;
+  }
+}
+
 export type ApiFetchResponse = {
   ok: boolean;
   status: number;
@@ -54,12 +87,13 @@ export async function handleFetchApi(url: string, store: BackoffStore = backoffS
     // fetch を発行する権限を最終的に持つのはここであるべきなので、ここでもう一度確認する。
     //
     // この判定が保証するのは「既知の未経過期限があるときに fetch を開始しない」ことだけである。
-    // service worker はシングルスレッドで store の get()/record() 自体は直列化されているが、
-    // この if 判定と直後の fetch() 呼び出しの間には、別メッセージ (別タブの 429) の record が
-    // 割り込みうる (service worker は複数のメッセージを並行して処理する)。fetch を開始した後に
-    // 別タブの 429 が届くケースはサーバーの応答タイミングに起因する不可避なレースであり、
-    // ここでは扱わない (その 429 自体は通常どおり下の分岐で記録される)。
-    const knownBackoffUntil = await store.get();
+    // この if 判定と直後の fetch() 呼び出しの間には await が無く、JS の run-to-completion により
+    // 他のメッセージの処理はこの間に割り込めない (別タブの 429 の record がここに挟まることはない)。
+    // 不可避なのは、この判定を通過して fetch を開始した後、既に開始済みの別の fetch (自分自身が
+    // 直後に受け取る 429 を含む) が判明するケースである。この fetch は既に発行済みで取り消せない
+    // ため、サーバーの応答タイミングに起因する不可避なレースとして扱う (その 429 自体は通常どおり
+    // 下の分岐で記録される)。
+    const knownBackoffUntil = await safeGet(store);
     if (Date.now() < knownBackoffUntil) {
       return { ok: false, status: 0, retryAfter: null, backoffUntil: knownBackoffUntil, kind: 'backoff' };
     }
@@ -71,21 +105,29 @@ export async function handleFetchApi(url: string, store: BackoffStore = backoffS
       // Retry-After が読めないときは新たな期限を主張しない (現在の記録をそのまま返す)。
       // 何秒待てばよいかの推測はサーバーの指示ではなく content script 側のポリシーなので、
       // ここで決め打ちにしない。
-      const backoffUntil = waitMs !== null ? await store.record(Date.now() + waitMs) : await store.get();
+      //
+      // record (永続化) には safeRecord を使う: 429 を受け取ったという事実と Retry-After は
+      // fetch から確実に得られているので、永続化の失敗をここで例外にすると、この関数の外側の
+      // catch が「通信障害 (status: 0)」にすり替えてしまい、content script は既知の
+      // Retry-After を無視して短い間隔で再送してしまう。
+      const backoffUntil = waitMs !== null ? await safeRecord(store, Date.now() + waitMs) : await safeGet(store);
       return { ok: false, status: 429, retryAfter, backoffUntil };
     }
-    const backoffUntil = await store.get();
+    const backoffUntil = await safeGet(store);
     if (!r.ok) {
       return { ok: false, status: r.status, retryAfter, backoffUntil };
     }
     const body = await r.text();
     return { ok: true, status: r.status, retryAfter, body, backoffUntil };
   } catch (e) {
-    return { ok: false, status: 0, retryAfter: null, error: String(e), backoffUntil: await store.get() };
+    // ここに到達するのは fetch() 自体の失敗 (実際の通信障害) のみ。safeGet/safeRecord は
+    // 例外を投げないので、store へのアクセス失敗がここに紛れ込んで「通信障害」を誤って
+    // 報告することはない。
+    return { ok: false, status: 0, retryAfter: null, error: String(e), backoffUntil: await safeGet(store) };
   }
 }
 
 /** 収集開始時など、まだ 1 度もリクエストしていない時点でバックオフ期限を知るための問い合わせ */
 export async function handleGetBackoffUntil(store: BackoffStore = backoffStore): Promise<{ backoffUntil: number }> {
-  return { backoffUntil: await store.get() };
+  return { backoffUntil: await safeGet(store) };
 }

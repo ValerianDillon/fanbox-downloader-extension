@@ -110,6 +110,72 @@ describe('handleFetchApi / handleGetBackoffUntil', () => {
     expect(res.ok).toBe(true);
   });
 
+  test('storage.session.set が失敗しても、429 と Retry-After 由来の候補期限をそのまま返す (通信障害にすり替えない)', async () => {
+    // 429 という事実と Retry-After は fetch から確実に得られている。永続化 (storage.session.set)
+    // が失敗しても、それを status: 0 (通信障害) にすり替えてしまうと、content script は
+    // 既知の Retry-After を無視して短い間隔で再送してしまう
+    // biome-ignore lint/suspicious/noExplicitAny: chrome storage mock
+    (globalThis as any).chrome = {
+      storage: {
+        session: {
+          get: async (key: string) => (backing.has(key) ? { [key]: backing.get(key) } : {}),
+          set: async () => {
+            throw new Error('storage.session.set failed');
+          },
+        },
+      },
+    };
+
+    const before = Date.now();
+    globalThis.fetch = (async () => fakeResponse({ status: 429, retryAfter: '30' })) as unknown as typeof fetch;
+    const res = await handleFetchApi('https://api.fanbox.cc/x', store);
+
+    expect(res.status).toBe(429);
+    expect(res.ok).toBe(false);
+    expect(res.error).toBeUndefined();
+    // ローカルで計算した候補期限 (Date.now() + waitMs) がそのまま返る
+    expect(res.backoffUntil).toBeGreaterThanOrEqual(before + 30_000);
+    // 永続化そのものは失敗しているので storage には残っていない
+    expect(backing.size).toBe(0);
+  });
+
+  test('storage.session.get が失敗しても、fetchApi / getBackoffUntil は必ず応答を返す (未応答にならない)', async () => {
+    // store.get()/record() が reject すると、外側の catch 内で再度呼ぶ store.get() も
+    // reject して handler 自体が never-resolve になりうる。呼び出し元の message ハンドラは
+    // 必ず応答を返す契約を守る必要がある (でないと content script は応答なしで待ち続ける)
+    // biome-ignore lint/suspicious/noExplicitAny: chrome storage mock
+    (globalThis as any).chrome = {
+      storage: {
+        session: {
+          get: async () => {
+            throw new Error('storage.session.get failed');
+          },
+          set: async (items: Record<string, unknown>) => {
+            for (const [key, value] of Object.entries(items)) backing.set(key, value);
+          },
+        },
+      },
+    };
+
+    globalThis.fetch = (async () => fakeResponse({ status: 200, body: '{"ok":true}' })) as unknown as typeof fetch;
+    const fetchRes = await handleFetchApi('https://api.fanbox.cc/x', store);
+    expect(fetchRes.ok).toBe(true);
+    expect(fetchRes.backoffUntil).toBe(0);
+
+    const getRes = await handleGetBackoffUntil(store);
+    expect(getRes).toEqual({ backoffUntil: 0 });
+
+    // fetch 自体が例外を投げる経路 (外側の catch) でも、その中の store.get() が
+    // 失敗して二重に落ちることはない
+    globalThis.fetch = (async () => {
+      throw new Error('network down');
+    }) as unknown as typeof fetch;
+    const networkFailRes = await handleFetchApi('https://api.fanbox.cc/x', store);
+    expect(networkFailRes.status).toBe(0);
+    expect(networkFailRes.error).toContain('network down');
+    expect(networkFailRes.backoffUntil).toBe(0);
+  });
+
   test('getBackoffUntil はそのときの記録をそのまま返す', async () => {
     await store.record(Date.now() + 99_999);
     const result = await handleGetBackoffUntil(store);

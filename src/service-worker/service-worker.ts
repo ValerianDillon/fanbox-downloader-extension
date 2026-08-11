@@ -16,6 +16,11 @@ chrome.runtime.onInstalled.addListener(() => {
  *
  * fetchApi / getBackoffUntil の実処理は ./handlers.ts に切り出している (chrome.* への配線と
  * ロジックを分け、後者をユニットテストから chrome のグローバルスタブなしに直接呼べるようにするため)。
+ *
+ * handleFetchApi / handleGetBackoffUntil は内部の store アクセス失敗を自ら吸収して必ず
+ * 応答オブジェクトを返す (total な関数) 設計にしているが、ここでも `.catch` で二重に防御する。
+ * どちらかが想定外に reject すると sendResponse が呼ばれず、content script は応答なしで
+ * 待ち続けてしまう (chrome.runtime.sendMessage はタイムアウトしない) ため。
  */
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'fetch') {
@@ -39,11 +44,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (message.type === 'fetchApi') {
-    handleFetchApi(message.url).then(sendResponse);
+    handleFetchApi(message.url)
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, status: 0, retryAfter: null, error: String(e), backoffUntil: 0 }));
     return true;
   }
   if (message.type === 'getBackoffUntil') {
-    handleGetBackoffUntil().then(sendResponse);
+    handleGetBackoffUntil()
+      .then(sendResponse)
+      .catch(() => sendResponse({ backoffUntil: 0 }));
     return true;
   }
 });
