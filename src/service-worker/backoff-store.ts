@@ -15,16 +15,20 @@ const STORAGE_KEY = 'fbdlBackoffUntil';
  * インスタンスをまたいでキャッシュは共有しない。service worker の再起動を再現したいときは、
  * 同じ chrome.storage.session を裏に持つ新しいインスタンスを作ればよい (キャッシュは
  * 空の状態から始まり、必ず storage から読み直す)。
+ *
+ * get() / record() はいずれも内部の直列化キューを経由する。record() は「現在値を読む →
+ * 遠い方を計算する → 書き込む」という read-modify-write なので、直列化しないと複数の 429 が
+ * ほぼ同時に届いたときに両方が同じ現在値を読み、後から書き込んだ方が先に書き込んだ方を
+ * (本来遠いはずの期限ごと) 上書きしてしまう。get() も同じキューに載せているのは、
+ * 直列化されていない get() が record() の書き込み途中の状態を素通りしてしまわないようにするため。
  */
 export class BackoffStore {
   private cache: number | undefined;
+  /** get() / record() を順番に処理するための待ち行列。ApiSession.serialize() と同じパターン */
+  private queue: Promise<unknown> = Promise.resolve();
 
   async get(): Promise<number> {
-    if (this.cache !== undefined) return this.cache;
-    const stored = await chrome.storage.session.get(STORAGE_KEY);
-    const value = stored[STORAGE_KEY];
-    this.cache = typeof value === 'number' ? value : 0;
-    return this.cache;
+    return this.enqueue(() => this.getLocked());
   }
 
   /**
@@ -34,7 +38,30 @@ export class BackoffStore {
    * 短い期限が、先に届いていた応答の長い期限を上書きしてしまいうるため。
    */
   async record(candidateUntil: number): Promise<number> {
-    const current = await this.get();
+    return this.enqueue(() => this.recordLocked(candidateUntil));
+  }
+
+  /** 直前の get() / record() が終わるまで待ってから実行する */
+  private enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(task, task);
+    // 失敗しても後続を止めない
+    this.queue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async getLocked(): Promise<number> {
+    if (this.cache !== undefined) return this.cache;
+    const stored = await chrome.storage.session.get(STORAGE_KEY);
+    const value = stored[STORAGE_KEY];
+    this.cache = typeof value === 'number' ? value : 0;
+    return this.cache;
+  }
+
+  private async recordLocked(candidateUntil: number): Promise<number> {
+    const current = await this.getLocked();
     const next = Math.max(current, candidateUntil);
     if (next !== current) {
       this.cache = next;

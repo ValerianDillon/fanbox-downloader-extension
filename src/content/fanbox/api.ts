@@ -180,10 +180,9 @@ export class ApiSession {
    * セッションごとに持つと、枯渇した直後に再実行したときに即座に発行してしまう。
    *
    * SoT は service worker 側 (chrome.storage.session、Issue #16) にあり、ここはその参照値
-   * (キャッシュ) にすぎない。別タブやリロードをまたぐとこの静的フィールド自体は 0 に戻るため、
-   * syncBackoffUntil() で service worker から取得して埋め直す必要がある。埋め直す前に
-   * 発行される最初のリクエストを守るため、収集の開始時に必ず 1 度呼ぶ (collector.ts)。
-   * 以降は fetchApi の応答に乗ってくる backoffUntil で継続的に更新される。
+   * (キャッシュ) にすぎない。別タブやリロードをまたぐとこの静的フィールド自体は 0 に戻るが、
+   * gate() が実際にリクエストを発行する直前に毎回 syncBackoffUntil() で埋め直すため
+   * (最初のリクエストも含む)、呼び出し側が明示的に事前取得する必要はない。
    */
   private static sharedBackoffUntil = 0;
 
@@ -195,10 +194,11 @@ export class ApiSession {
   /**
    * service worker に記録されている現在のバックオフ期限を取得し、ローカルの参照値に反映する。
    *
-   * 別タブや直前のリロードで service worker 側に記録が残っていても、この静的フィールドは
-   * content script の実行環境ごとに 0 から始まる。収集の最初のリクエストを発行する前に
-   * 一度だけ呼んでおかないと、未経過の Retry-After を無視して発行してしまう
-   * (Issue #16「別タブとリロードをまたぐと期限が消える」問題)。
+   * gate() が、待機を終えて実際にリクエストを発行する直前に毎回呼ぶ。別タブ (別の JS 実行環境)
+   * がこちらの待機中に期限を延長していても、その延長は自分が fetchApi の応答を受け取るまで
+   * ローカルの参照値に反映されないため、発行直前に毎回問い合わせて確認する
+   * (Issue #16「実行中タブ間で期限の延長が同期されない」問題)。同じ理由で、別タブやリロードを
+   * またいで残っている記録も、最初のリクエストの発行直前にここで取り込まれる。
    *
    * 応答が欠けている/型が違う場合は無視する (Math.max に undefined を渡すと NaN で壊れるため)。
    */
@@ -281,6 +281,12 @@ export class ApiSession {
       const now = Date.now();
       const wait = Math.max(deadline - now, this.lastRequestAt + this.interval - now, 0);
       if (wait > 0) await abortableSleep(wait, signal);
+      // 待ち終えた直後、実際にリクエストを発行する直前に service worker へ最新の期限を
+      // 問い合わせる。別タブ (別の JS 実行環境) が待機中に期限を延長していても、
+      // その延長は自分が次に fetchApi の応答を受け取るまでローカルの参照値に反映されない。
+      // ここで問い合わせておかないと、延長を知らないまま発行してしまう (Issue #16)。
+      // メッセージ 1 往復のコストは fetch 本体に比べて無視できる。
+      await ApiSession.syncBackoffUntil(signal);
       if (ApiSession.sharedBackoffUntil <= deadline) break;
     }
     this.lastRequestAt = Date.now();

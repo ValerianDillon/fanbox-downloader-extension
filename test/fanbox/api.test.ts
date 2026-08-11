@@ -127,6 +127,10 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     (globalThis as any).chrome = {
       runtime: {
         sendMessage: (message: { type: string; url: string }) => {
+          // gate() は発行の直前に毎回 getBackoffUntil を問い合わせる (Issue #16)。
+          // このテストでは別タブによる延長の有無は関心事ではないので常に未記録として返し、
+          // fetchApi の呼び出し回数を数える calls には含めない
+          if (message.type === 'getBackoffUntil') return Promise.resolve({ backoffUntil: 0 });
           if (message.type !== 'fetchApi') return Promise.reject(new Error('unexpected message type'));
           calls.push({ url: message.url });
           const responder = responders.shift();
