@@ -8,6 +8,16 @@ import { publishTestState, resetTestState, SHADOW_ROOT_MODE } from './test-hooks
 
 export type OverlayState = 'settings' | 'collecting' | 'downloading' | 'complete';
 
+/**
+ * ダウンロード中に「ここまでで終了」が押されて中断した場合の完了画面の文言。
+ *
+ * 全投稿を書き終えた直後 (最終の zip.close() の最中) に押された場合、ZIP は実際には
+ * 完全にできあがっている可能性がある。downloadZip の戻り値は void で処理済み件数を
+ * 呼び出し側から区別できないため (Issue #17 の「完了直前に押された場合の文言」参照)、
+ * 完了・部分保存のどちらであっても偽にならない断定しない表現にする。
+ */
+export const PARTIAL_DOWNLOAD_MESSAGE = 'ここまでの内容を保存して終了しました';
+
 export class OverlayController {
   private state: OverlayState = 'settings';
   private abortController: AbortController | null = null;
@@ -237,6 +247,21 @@ export class OverlayController {
     logArea.id = 'dl-log';
     logArea.readOnly = true;
     this.panelEl.appendChild(logArea);
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'btn-row';
+    const stopBtn = document.createElement('button');
+    stopBtn.className = 'btn-secondary';
+    stopBtn.textContent = 'ここまでで終了';
+    stopBtn.addEventListener('click', () => {
+      // 二重操作 (連打・非同期の停止処理中の再クリック) を防ぐため即座に無効化する。
+      // hidePanel() はここでは呼ばない: 全破棄ではなく、downloadZip が閉じた
+      // 部分保存の ZIP を活かして完了画面へ遷移させたいため (startCollecting 側で処理する)。
+      stopBtn.disabled = true;
+      this.abortController?.abort();
+    });
+    btnRow.appendChild(stopBtn);
+    this.panelEl.appendChild(btnRow);
   }
 
   private renderComplete(message: string) {
@@ -329,6 +354,18 @@ export class OverlayController {
       // 途中までの ZIP を「完了しました」と表示してしまう
       if (signal.aborted) {
         this.publishAbortedIfCurrent(signal);
+        if (signal !== this.abortController?.signal) {
+          // hidePanel() (パネルの再オープン等) が既に別経路で呼ばれ、UI は
+          // settings にリセット済み。ここでは何もしない。
+          return;
+        }
+        // ここまで残っているのは「ここまでで終了」ボタンによる中断のみ (収集中の
+        // キャンセルは renderCollecting() のボタンが hidePanel() を伴って
+        // 即座に全破棄するため、この分岐に到達する前に上の signal !== ... で弾かれる)。
+        // 全投稿を書き終えた直後に押された場合は ZIP が実際には完全な可能性もあるため、
+        // 完了・部分保存のどちらでも成り立つ文言にする。
+        this.setState('complete');
+        this.renderComplete(PARTIAL_DOWNLOAD_MESSAGE);
         return;
       }
 
@@ -350,15 +387,33 @@ export class OverlayController {
     } catch (e) {
       if (signal.aborted) {
         this.publishAbortedIfCurrent(signal);
-        return;
+        if (signal !== this.abortController?.signal) {
+          // hidePanel() が既に別経路で UI をリセット済み (収集中のキャンセル等)。
+          // ここでは何もしない。
+          return;
+        }
+        // 「ここまでで終了」による中断中に例外が発生したケース。downloadZip の契約上
+        // 中断は正常 return のはずだが、契約違反として素直にログを残しつつ、
+        // 「ダウンロード中」画面のまま固まらせないよう通常のエラー表示に合流させる
+        // (部分保存の保証はできないため「保存して終了しました」ではなく素直にエラーと伝える)。
+        console.error('ダウンロードエラー (中断中の契約違反):', e);
+      } else {
+        console.error('ダウンロードエラー:', e);
       }
-      console.error('ダウンロードエラー:', e);
       publishTestState({ error: '1' });
       this.setState('complete');
       this.renderComplete(`エラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       window.removeEventListener('beforeunload', beforeUnload);
-      this.abortController = null;
+      // 無条件に null化すると、旧実行が downloadAsZip (中断後の zip.close 含む) の
+      // 完了を待っている間にパネルが再オープンされ新しい実行が始まった場合、旧実行の
+      // finally が新実行の this.abortController を消してしまう競合が起きる。
+      // そうなると新実行では「ここまでで終了」も hidePanel() のキャンセルも
+      // abortController.abort() が発火せず効かなくなる。signal が現行の実行のもので
+      // あるときに限って null にすることで、旧実行は新実行の controller に触れない。
+      if (signal === this.abortController?.signal) {
+        this.abortController = null;
+      }
     }
   }
 }

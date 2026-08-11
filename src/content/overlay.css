@@ -93,6 +93,11 @@
   background: #616161;
 }
 
+.btn-secondary:disabled {
+  background: #aaa;
+  cursor: not-allowed;
+}
+
 .btn-row {
   display: flex;
   gap: 8px;

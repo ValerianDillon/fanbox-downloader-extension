@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { PARTIAL_DOWNLOAD_MESSAGE } from '../src/content/overlay';
 
 /**
  * OverlayController の状態遷移テスト
@@ -31,11 +32,18 @@ describe('Overlay 状態遷移', () => {
     expect(isValidTransition('collecting', 'settings')).toBe(true);
   });
 
-  test('downloading → complete は有効', () => {
+  // Issue #17: 通常の完了、および「ここまでで終了」ボタンによる中断のどちらも
+  // downloading → complete に着地する (中断側は startCollecting が downloadAsZip から
+  // 戻った後、signal が現行のものであるときに complete へ遷移する。詳細は下の
+  // describe ブロックを参照)
+  test('downloading → complete は有効 (通常完了・「ここまでで終了」による中断のどちらも)', () => {
     expect(isValidTransition('downloading', 'complete')).toBe(true);
   });
 
-  test('downloading → settings (キャンセル) は有効', () => {
+  // ダウンロード中の画面自体にはキャンセル/中止ボタンは無い (Issue #17: 「中止」は
+  // 用意しない)。この遷移はパネルの再オープン等で hidePanel() が呼ばれた場合の
+  // 全破棄経路であり、部分保存の ZIP を活かす「ここまでで終了」とは別物である。
+  test('downloading → settings (パネルを閉じる等による全破棄) は有効', () => {
     expect(isValidTransition('downloading', 'settings')).toBe(true);
   });
 
@@ -57,5 +65,25 @@ describe('Overlay 状態遷移', () => {
 
   test('complete → downloading は無効', () => {
     expect(isValidTransition('complete', 'downloading')).toBe(false);
+  });
+});
+
+describe('Issue #17: ダウンロード中の「ここまでで終了」', () => {
+  // 文言は仕様上「ここまでの内容を保存して終了しました」に確定している。
+  // 部分文字列検証だけでは表現の退行 (別の断定的な文言への変更) を検知できないため、
+  // 完全一致で固定する。
+  test('完了画面の文言が仕様どおりである', () => {
+    expect(PARTIAL_DOWNLOAD_MESSAGE).toBe('ここまでの内容を保存して終了しました');
+  });
+
+  // downloadZip は中断されても内部で signal を再確認しないまま最終の zip.close() に
+  // 入るため、全投稿を書き終えた直後に押された場合は ZIP が実際には完全な可能性がある。
+  // 「完了しました」「途中で終了しました」のようにどちらか一方を断定する表現にすると、
+  // このケースで嘘になりうる。そのためどちらでも成り立つ表現になっていることを保証する
+  // (この性質は上の完全一致テストからは読み取れないため、意図の記録として別テストにする)。
+  test('完了画面の文言は完了・部分保存のどちらも断定しない', () => {
+    expect(PARTIAL_DOWNLOAD_MESSAGE).not.toContain('完了');
+    expect(PARTIAL_DOWNLOAD_MESSAGE).not.toContain('失敗');
+    expect(PARTIAL_DOWNLOAD_MESSAGE).not.toContain('中断');
   });
 });
