@@ -405,7 +405,15 @@ export class OverlayController {
       this.renderComplete(`エラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       window.removeEventListener('beforeunload', beforeUnload);
-      this.abortController = null;
+      // 無条件に null化すると、旧実行が downloadAsZip (中断後の zip.close 含む) の
+      // 完了を待っている間にパネルが再オープンされ新しい実行が始まった場合、旧実行の
+      // finally が新実行の this.abortController を消してしまう競合が起きる。
+      // そうなると新実行では「ここまでで終了」も hidePanel() のキャンセルも
+      // abortController.abort() が発火せず効かなくなる。signal が現行の実行のもので
+      // あるときに限って null にすることで、旧実行は新実行の controller に触れない。
+      if (signal === this.abortController?.signal) {
+        this.abortController = null;
+      }
     }
   }
 }
