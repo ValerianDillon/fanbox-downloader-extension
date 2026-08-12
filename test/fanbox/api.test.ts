@@ -539,6 +539,36 @@ describe('レスポンスのアンラップ', () => {
     expect(await api.fetchTags('c')).toEqual([]);
   });
 
+  // プラン名・タグは表示の補助なので、通信/HTTP の失敗 (FetchApiError) も
+  // 形状不一致 (ApiShapeError) と同様に握りつぶして続行してよい
+  // (CLAUDE.md 「プラン名とタグは表示の補助なので握りつぶして続行し」の方針)
+  test('fetchPlans は FetchApiError (HTTP 失敗) も握りつぶして空配列を返す', async () => {
+    nextResponse = { ok: false, status: 500, retryAfter: null };
+    expect(await api.fetchPlans('c')).toEqual([]);
+  });
+
+  test('fetchTags は FetchApiError (HTTP 失敗) も握りつぶして空配列を返す', async () => {
+    nextResponse = { ok: false, status: 500, retryAfter: null };
+    expect(await api.fetchTags('c')).toEqual([]);
+  });
+
+  // FetchApiError / ApiShapeError / RateLimitExhaustedError のいずれでもない例外
+  // (validator や内部処理のバグ、あるいは互換性のない service worker が返す
+  // 破損したレスポンス形状など) までは握りつぶさず再送出する。ここでは
+  // sendMessage が応答オブジェクト自体を返さない (undefined) という壊れ方を模擬し、
+  // fetchJson 内部で TypeError が起きるようにして検証する
+  test('fetchPlans は想定外の例外 (typed error 以外) を握りつぶさず再送出する', async () => {
+    // biome-ignore lint/suspicious/noExplicitAny: 破損したレスポンス形状 (undefined) を模擬する
+    nextResponse = undefined as any;
+    await expect(api.fetchPlans('c')).rejects.toThrow(TypeError);
+  });
+
+  test('fetchTags は想定外の例外 (typed error 以外) を握りつぶさず再送出する', async () => {
+    // biome-ignore lint/suspicious/noExplicitAny: 破損したレスポンス形状 (undefined) を模擬する
+    nextResponse = undefined as any;
+    await expect(api.fetchTags('c')).rejects.toThrow(TypeError);
+  });
+
   test('fetchPaginatedPosts は body.pageUrls を返す', async () => {
     nextResponse = okJson({ body: { pageUrls: ['https://api.fanbox.cc/post.listCreator?creatorId=c'] } });
     expect(await api.fetchPaginatedPosts('c')).toEqual(['https://api.fanbox.cc/post.listCreator?creatorId=c']);

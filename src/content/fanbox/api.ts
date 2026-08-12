@@ -515,11 +515,20 @@ export class ApiSession {
       );
     } catch (e) {
       if (signal?.aborted || e instanceof RateLimitExhaustedError) throw e;
+      // プラン名は表示の補助なので、通信/HTTP の失敗 (FetchApiError) やレスポンス形状の
+      // 不一致 (ApiShapeError。JSON デコード失敗を含む) は握りつぶして続行する
+      // (CLAUDE.md 「形状が想定と違うとき、プラン名とタグは表示の補助なので握りつぶして
+      // 続行し、投稿一覧と投稿詳細は ApiShapeError で中断する」の方針)。
+      // それ以外の想定外の例外 (validator や内部処理のバグ等) まで飲み込むと、
+      // 他の経路 (collector.ts) で採用した陽性判定の方針と矛盾し、こちらのバグが
+      // 「プラン取得の失敗」として静かに握り潰されてしまうため再送出する。
+      if (!(e instanceof FetchApiError || e instanceof ApiShapeError)) throw e;
       console.error('プラン情報の取得に失敗:', e);
       return [];
     }
   }
 
+  /** タグ情報を取得する。失敗時の扱いは fetchPlans と同じ (JSDoc 参照) */
   async fetchTags(creatorId: string, signal?: AbortSignal): Promise<string[]> {
     const url = `https://api.fanbox.cc/tag.getFeatured?creatorId=${creatorId}`;
     try {
@@ -536,6 +545,8 @@ export class ApiSession {
       );
     } catch (e) {
       if (signal?.aborted || e instanceof RateLimitExhaustedError) throw e;
+      // fetchPlans と同じ理由・同じ方針 (JSDoc 参照)
+      if (!(e instanceof FetchApiError || e instanceof ApiShapeError)) throw e;
       console.error('タグ情報の取得に失敗:', e);
       return [];
     }
