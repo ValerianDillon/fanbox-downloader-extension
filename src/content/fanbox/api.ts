@@ -116,12 +116,30 @@ async function proxyFetchApi(url: string, signal?: AbortSignal): Promise<ApiFetc
 }
 
 /**
+ * fetchJson が投げるエラーの種別。'rate-limit' は RateLimitExhaustedError が、
+ * 'network' / 'http' は FetchApiError が持つ。呼び出し側 (collector.ts) はこの kind を見て、
+ * 「投稿単位の失敗として数えて続行してよい (network/http)」か「収集全体を止めるか
+ * (rate-limit は枯渇時点で別途 throw/打ち切り判定)」かを区別する。
+ *
+ * RateLimitExhaustedError と FetchApiError を 1 クラスに統合しなかったのは、
+ * RateLimitExhaustedError には「429 の再試行枠を使い切った」という固有の意味があり、
+ * collector.ts 側で instanceof による絞り込み (打ち切り判定・再試行上限の伝播) を
+ * 既に多用しているため。kind/status フィールドだけ両クラスに揃えることで、
+ * 構造的なアクセス (e.kind / e.status) はどちらの型でも統一しつつ、型の絞り込みは
+ * 既存の instanceof チェックのまま活かす。
+ */
+export type FetchErrorKind = 'rate-limit' | 'network' | 'http';
+
+/**
  * レート制限の再試行を使い切ったことを表すエラー。
  *
  * 通常の HTTP エラーと区別する必要がある。投稿単位の失敗に丸めると、
  * レート制限が続いている間、残りの投稿が 1 件ずつ順に失敗していく。
  */
 export class RateLimitExhaustedError extends Error {
+  readonly kind: FetchErrorKind = 'rate-limit';
+  readonly status = 429;
+
   constructor(url: string) {
     super(`レート制限の再試行上限に達した: ${url}`);
     this.name = 'RateLimitExhaustedError';
@@ -129,13 +147,49 @@ export class RateLimitExhaustedError extends Error {
 }
 
 /**
+ * fetchJson が投げる、通信そのものの失敗 (レート制限の枯渇や形状違反ではない) を表すエラー。
+ *
+ * kind: 'network' は service worker まで応答が届かなかった/届いても status 0 (fetch 自体の失敗)、
+ * 'http' は 200 以外の HTTP ステータスで応答があった場合 (429 は RateLimitExhaustedError 側で扱う
+ * ため含まない)。status は 'network' のとき常に 0。
+ *
+ * collector.ts はこの型かどうかで「API 通信に失敗した投稿」として投稿単位の失敗に数えてよいかを
+ * 判定する。instanceof による陽性判定にしているのは、想定外のバグ由来の例外まで
+ * ここに丸め込んで握りつぶさないようにするため (「ApiShapeError/RateLimitExhaustedError で
+ * なければ全部投稿単位の失敗」という否定形の判定は、新しく増えた例外パターンを
+ * 無条件に飲み込んでしまう)。
+ */
+export class FetchApiError extends Error {
+  readonly kind: Extract<FetchErrorKind, 'network' | 'http'>;
+  readonly status: number;
+
+  constructor(kind: Extract<FetchErrorKind, 'network' | 'http'>, status: number, message: string) {
+    super(message);
+    this.name = 'FetchApiError';
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+/**
  * API レスポンスの形状が想定と違うことを表すエラー。
  * 通信失敗や個別投稿の取得失敗 (収集を続行してよい) と区別するために専用の型にしている。
+ *
+ * fields には想定と違ったフィールドのパス (例: 'body.posts[]') を積む。詳細な理由をエラー
+ * メッセージだけでなく構造化データとしても持たせることで、ログや将来の表示先が
+ * 文字列パースに頼らず参照できるようにする。空配列 (デフォルト) は「配列そのものが
+ * 想定外だった」等、個々のフィールドに分解できない場合を表す。
  */
 export class ApiShapeError extends Error {
-  constructor(url: string) {
-    super(`API レスポンスの形状が想定外: ${url}`);
+  readonly url: string;
+  readonly fields: readonly string[];
+
+  constructor(url: string, fields: readonly string[] = []) {
+    const detail = fields.length > 0 ? ` (fields: ${fields.join(', ')})` : '';
+    super(`API レスポンスの形状が想定外: ${url}${detail}`);
     this.name = 'ApiShapeError';
+    this.url = url;
+    this.fields = fields;
   }
 }
 
@@ -143,13 +197,16 @@ export class ApiShapeError extends Error {
  * FANBOX API の配列レスポンスは `body` 直下ではなく `body.<キー>` に入る。
  * 形状が想定外なら空配列扱いにせず投げる: 空配列にフォールバックすると
  * 「0 件だった」と区別が付かず、API 変更が無言で通り抜けてしまうため。
+ *
+ * @param fieldPath ApiShapeError.fields に積む、この配列自体を指すフィールドパス
+ *   (例: 'body.posts')。要素の形状違反時は `${fieldPath}[]` として積む。
  */
-function unwrapArray<T>(value: unknown, url: string, isValidItem?: (item: unknown) => boolean): T[] {
+function unwrapArray<T>(value: unknown, url: string, fieldPath: string, isValidItem?: (item: unknown) => boolean): T[] {
   if (!Array.isArray(value)) {
-    throw new ApiShapeError(url);
+    throw new ApiShapeError(url, [fieldPath]);
   }
   if (isValidItem && !value.every(isValidItem)) {
-    throw new ApiShapeError(url);
+    throw new ApiShapeError(url, [`${fieldPath}[]`]);
   }
   return value as T[];
 }
@@ -346,7 +403,10 @@ export class ApiSession {
         } catch (e) {
           if (signal?.aborted) throw e;
           this.successStreak = 0;
-          if (networkAttempts >= MAX_NETWORK_RETRY) throw e;
+          if (networkAttempts >= MAX_NETWORK_RETRY) {
+            const detail = e instanceof Error ? ` (${e.message})` : '';
+            throw new FetchApiError('network', 0, `通信に失敗: ${url}${detail}`);
+          }
           networkAttempts++;
           console.warn(`ネットワーク失敗のためリトライ: ${url}`, e);
           await abortableSleep(NETWORK_RETRY_BACKOFF_MS, signal);
@@ -376,8 +436,9 @@ export class ApiSession {
         // 通常の HTTP エラーとして扱うと、一時的な通信障害がまったく再試行されない
         if (response.status === 0) {
           this.successStreak = 0;
-          const error = new Error(`通信に失敗: ${url}${response.error ? ` (${response.error})` : ''}`);
-          if (networkAttempts >= MAX_NETWORK_RETRY) throw error;
+          if (networkAttempts >= MAX_NETWORK_RETRY) {
+            throw new FetchApiError('network', 0, `通信に失敗: ${url}${response.error ? ` (${response.error})` : ''}`);
+          }
           networkAttempts++;
           console.warn(`ネットワーク失敗のためリトライ: ${url}`, response.error);
           await abortableSleep(NETWORK_RETRY_BACKOFF_MS, signal);
@@ -406,7 +467,11 @@ export class ApiSession {
         if (!response.ok || response.body === undefined) {
           // 連続成功が途切れたので減衰の判定をやり直す
           this.successStreak = 0;
-          throw new Error(`HTTP ${response.status}: ${url}${response.error ? ` (${response.error})` : ''}`);
+          throw new FetchApiError(
+            'http',
+            response.status,
+            `HTTP ${response.status}: ${url}${response.error ? ` (${response.error})` : ''}`,
+          );
         }
         let validated: R;
         try {
@@ -432,7 +497,7 @@ export class ApiSession {
     try {
       return await this.fetchJson<Plans, PlanInfo[]>(
         url,
-        (result) => unwrapArray<PlanInfo>(result?.body?.plans, url, isValidPlan),
+        (result) => unwrapArray<PlanInfo>(result?.body?.plans, url, 'body.plans', isValidPlan),
         signal,
       );
     } catch (e) {
@@ -451,6 +516,7 @@ export class ApiSession {
           unwrapArray<{ tag: string }>(
             result?.body?.featuredTags,
             url,
+            'body.featuredTags',
             (item) => typeof (item as { tag?: unknown } | null)?.tag === 'string',
           ).map((tag) => tag.tag),
         signal,
@@ -477,13 +543,15 @@ export class ApiSession {
       url,
       (result) => {
         const post = result?.body?.post;
-        if (
-          !post ||
-          typeof post.id !== 'string' ||
-          typeof post.type !== 'string' ||
-          typeof post.isRestricted !== 'boolean'
-        ) {
-          throw new ApiShapeError(url);
+        if (!post) {
+          throw new ApiShapeError(url, ['body.post']);
+        }
+        const fields: string[] = [];
+        if (typeof post.id !== 'string') fields.push('body.post.id');
+        if (typeof post.type !== 'string') fields.push('body.post.type');
+        if (typeof post.isRestricted !== 'boolean') fields.push('body.post.isRestricted');
+        if (fields.length > 0) {
+          throw new ApiShapeError(url, fields);
         }
         return post;
       },
@@ -495,7 +563,7 @@ export class ApiSession {
     const url = `https://api.fanbox.cc/post.paginateCreator?creatorId=${creatorId}`;
     return this.fetchJson<PaginatedPosts, string[]>(
       url,
-      (result) => unwrapArray<string>(result?.body?.pageUrls, url, (item) => typeof item === 'string'),
+      (result) => unwrapArray<string>(result?.body?.pageUrls, url, 'body.pageUrls', (item) => typeof item === 'string'),
       signal,
     );
   }
@@ -503,7 +571,7 @@ export class ApiSession {
   async fetchPostList(url: string, signal?: AbortSignal): Promise<PostListItem[]> {
     return this.fetchJson<PostList, PostListItem[]>(
       url,
-      (result) => unwrapArray<PostListItem>(result?.body?.posts, url, isValidPostListItem),
+      (result) => unwrapArray<PostListItem>(result?.body?.posts, url, 'body.posts', isValidPostListItem),
       signal,
     );
   }

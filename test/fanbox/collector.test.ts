@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { ApiSession } from '../../src/content/fanbox/api';
-import { collect } from '../../src/content/fanbox/collector';
+import { collect, PostBodyInvalidError } from '../../src/content/fanbox/collector';
 
 const CREATOR_ID = 'testcreator';
 const LIST_PAGE_URL = `https://api.fanbox.cc/post.listCreator?creatorId=${CREATOR_ID}&cursor=1`;
@@ -83,7 +83,10 @@ describe('collect', () => {
     mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
 
     const result = await collectCreator();
-    expect(result.failedPostCount).toBe(0);
+    expect(result.addedPostCount).toBe(1);
+    expect(result.postFailures.unavailable).toBe(0);
+    expect(result.postFailures.unsupported).toBe(0);
+    expect(result.postFailures.apiFailed).toBe(0);
     expect(result.failedPageCount).toBe(0);
     expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(1);
   });
@@ -119,13 +122,16 @@ describe('collect', () => {
     await expect(collectCreator()).rejects.toThrow(/形状が想定外/);
   });
 
-  test('閲覧できない投稿も欠落するので失敗件数に数える', async () => {
+  test('閲覧できない投稿も欠落するので unavailable (restricted) に数える', async () => {
     // 一覧が全件 isRestricted になったとき、空の ZIP を失敗 0 件で完了させないため
     const restricted = { ...POST_STUB, isRestricted: true };
     mockApi({ ...BASE_RESPONSES, [LIST_PAGE_URL]: { body: { posts: [restricted] } } });
 
     const result = await collectCreator();
-    expect(result.failedPostCount).toBe(1);
+    expect(result.addedPostCount).toBe(0);
+    expect(result.postFailures.unavailable).toBe(1);
+    expect(result.postFailures.unavailableRestricted).toBe(1);
+    expect(result.postFailures.unavailableMissingBody).toBe(0);
     expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(0);
   });
 
@@ -140,7 +146,7 @@ describe('collect', () => {
       () => {},
       new AbortController().signal,
     );
-    expect(result.failedPostCount).toBe(0);
+    expect(result.postFailures.unavailable).toBe(0);
   });
 
   test('投稿を集める前の枯渇は打ち切りではなくエラーにする', async () => {
@@ -207,6 +213,7 @@ describe('collect', () => {
     const result = await collectCreator();
     expect(result.stoppedReason).toBe('rate-limit-exhausted');
     expect(infoCalls).toBeGreaterThan(0);
+    expect(result.addedPostCount).toBe(1);
     expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(1);
   });
 
@@ -216,7 +223,10 @@ describe('collect', () => {
 
     const result = await collectCreator();
     expect(result.failedPageCount).toBe(1);
-    expect(result.failedPostCount).toBe(0);
+    expect(result.addedPostCount).toBe(0);
+    expect(result.postFailures.unavailable).toBe(0);
+    expect(result.postFailures.unsupported).toBe(0);
+    expect(result.postFailures.apiFailed).toBe(0);
   });
 
   test('isIgnoreFree で除外した無料投稿は失敗に数えない', async () => {
@@ -229,32 +239,60 @@ describe('collect', () => {
       () => {},
       new AbortController().signal,
     );
-    expect(result.failedPostCount).toBe(0);
+    expect(result.addedPostCount).toBe(0);
+    expect(result.postFailures.unavailable).toBe(0);
     expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(0);
   });
 
-  test('本文のない投稿は無言で消さず失敗件数に数える', async () => {
+  test('本文のない投稿は無言で消さず unavailable (missing-body) に数える', async () => {
     // 形状としては妥当だが body だけが無いケース (支援額不足、または本文の在り処の変更)
     const { body, ...withoutBody } = POST_FULL;
     mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: withoutBody } } });
 
     const result = await collectCreator();
-    expect(result.failedPostCount).toBe(1);
+    expect(result.addedPostCount).toBe(0);
+    expect(result.postFailures.unavailable).toBe(1);
+    expect(result.postFailures.unavailableRestricted).toBe(0);
+    expect(result.postFailures.unavailableMissingBody).toBe(1);
     expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(0);
   });
 
-  test('投稿詳細のラッパーは正しくても中身が想定外なら中断する', async () => {
-    // body.post は在るが type / body を失っているケース (空の ZIP を成功扱いにしない)
+  test('投稿詳細のラッパーは正しくても中身 (id/type/isRestricted) が想定外なら API 層で中断する', async () => {
+    // body.post は在るが type / isRestricted を失っているケース (api.ts の形状検証で弾かれる)
     mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: { id: '1001' } } } });
 
     await expect(collectCreator()).rejects.toThrow(/形状が想定外/);
   });
 
-  test('投稿詳細が通常の HTTP 失敗なら収集を続行して失敗 1 件と数える', async () => {
+  test('既知の投稿タイプなのに本文の必須フィールドが欠けていれば invalid として中断する (download-helper v4.5.0)', async () => {
+    // api.ts の形状検証 (id/type/isRestricted) は通るが、addByPostInfo が実際に読む
+    // body.images が欠けているケース。仕様変更に追随できていない構造的な不一致として扱う
+    const { body, ...rest } = POST_FULL;
+    const invalidBody = { ...rest, body: { text: 'x' } };
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: invalidBody } } });
+
+    await expect(collectCreator()).rejects.toThrow(PostBodyInvalidError);
+    await expect(collectCreator()).rejects.toThrow(/投稿データの形式が想定外/);
+  });
+
+  test('未知の投稿タイプは中断せず unsupported に数える (download-helper v4.5.0)', async () => {
+    const unknownTypePost = { ...POST_FULL, type: 'poll', body: {} };
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: unknownTypePost } } });
+
+    const result = await collectCreator();
+    expect(result.addedPostCount).toBe(0);
+    expect(result.postFailures.unsupported).toBe(1);
+    expect(result.postFailures.unavailable).toBe(0);
+    expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(0);
+  });
+
+  test('投稿詳細が通常の HTTP 失敗なら収集を続行して apiFailed 1 件と数える', async () => {
     mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: () => ({ ok: false, status: 500, retryAfter: null }) });
 
     const result = await collectCreator();
-    expect(result.failedPostCount).toBe(1);
+    expect(result.addedPostCount).toBe(0);
+    expect(result.postFailures.apiFailed).toBe(1);
+    expect(result.postFailures.unavailable).toBe(0);
     expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(0);
   });
 
@@ -269,7 +307,8 @@ describe('collect', () => {
     });
 
     const result = await collectCreator(controller.signal);
-    expect(result.failedPostCount).toBe(0);
+    expect(result.addedPostCount).toBe(0);
+    expect(result.postFailures.apiFailed).toBe(0);
     expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(0);
   });
 
@@ -280,10 +319,19 @@ describe('collect', () => {
     await expect(collectSinglePost()).rejects.toThrow(/形状が想定外/);
   });
 
-  test('単一投稿モードで通常の HTTP 失敗なら失敗 1 件として完了する', async () => {
+  test('単一投稿モードで本文が invalid なら中断する', async () => {
+    const { body, ...rest } = POST_FULL;
+    const invalidBody = { ...rest, body: { text: 'x' } };
+    mockApi({ [POST_INFO_URL]: { body: { post: invalidBody } } });
+
+    await expect(collectSinglePost()).rejects.toThrow(PostBodyInvalidError);
+  });
+
+  test('単一投稿モードで通常の HTTP 失敗なら apiFailed 1 件として完了する', async () => {
     mockApi({ [POST_INFO_URL]: () => ({ ok: false, status: 500, retryAfter: null }) });
 
     const result = await collectSinglePost();
-    expect(result.failedPostCount).toBe(1);
+    expect(result.addedPostCount).toBe(0);
+    expect(result.postFailures.apiFailed).toBe(1);
   });
 });

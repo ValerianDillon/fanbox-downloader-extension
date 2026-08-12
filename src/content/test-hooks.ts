@@ -68,7 +68,11 @@ export function resetTestState(): void {
     const keys = [
       'error',
       'aborted',
-      'failed-post-count',
+      'unsupported-response',
+      'added-post-count',
+      'unavailable-post-count',
+      'unsupported-post-count',
+      'api-failed-post-count',
       'failed-page-count',
       'stopped-reason',
       'failed-file-count',

@@ -120,7 +120,11 @@ type TestState = {
   zipDone: string | null;
   error: string | null;
   aborted: string | null;
-  failedPostCount: string | null;
+  unsupportedResponse: string | null;
+  addedPostCount: string | null;
+  unavailablePostCount: string | null;
+  unsupportedPostCount: string | null;
+  apiFailedPostCount: string | null;
   failedPageCount: string | null;
   failedFileCount: string | null;
   fetchedUrls: string | null;
@@ -134,7 +138,11 @@ function readTestState(): TestState {
     zipDone: el.getAttribute('data-fbdl-zip-done'),
     error: el.getAttribute('data-fbdl-error'),
     aborted: el.getAttribute('data-fbdl-aborted'),
-    failedPostCount: el.getAttribute('data-fbdl-failed-post-count'),
+    unsupportedResponse: el.getAttribute('data-fbdl-unsupported-response'),
+    addedPostCount: el.getAttribute('data-fbdl-added-post-count'),
+    unavailablePostCount: el.getAttribute('data-fbdl-unavailable-post-count'),
+    unsupportedPostCount: el.getAttribute('data-fbdl-unsupported-post-count'),
+    apiFailedPostCount: el.getAttribute('data-fbdl-api-failed-post-count'),
     failedPageCount: el.getAttribute('data-fbdl-failed-page-count'),
     failedFileCount: el.getAttribute('data-fbdl-failed-file-count'),
     fetchedUrls: el.getAttribute('data-fbdl-fetched-urls'),
@@ -243,7 +251,11 @@ test('FANBOX creator ページ: 収集から ZIP 生成まで完走する', asyn
 
     expect(state.error, 'startCollecting でエラーが発生した').toBeNull();
     expect(state.aborted, 'ダウンロードが中断された').toBeNull();
-    expect(state.failedPostCount).toBe('0');
+    expect(state.unsupportedResponse, '未対応のレスポンス形式として中断された').toBeNull();
+    expect(state.addedPostCount).toBe('2');
+    expect(state.unavailablePostCount).toBe('0');
+    expect(state.unsupportedPostCount).toBe('0');
+    expect(state.apiFailedPostCount).toBe('0');
     expect(state.failedPageCount).toBe('0');
     expect(state.failedFileCount).toBe('0');
 
