@@ -473,11 +473,24 @@ export class ApiSession {
             `HTTP ${response.status}: ${url}${response.error ? ` (${response.error})` : ''}`,
           );
         }
+        // JSON デコード自体の失敗 (SyntaxError) と、デコードできた後の形状違反 (validate が
+        // 投げる ApiShapeError) を分けて扱う。前者をそのまま SyntaxError として投げると、
+        // 呼び出し側 (collector.ts / overlay.ts) の `instanceof ApiShapeError` 判定を
+        // すり抜け、「安全に取り込めない仕様変更」として中断せず投稿単位の失敗
+        // (もしくは想定外の例外として無条件伝播) に丸まってしまう。壊れた JSON も
+        // 「レスポンス形状が想定外」の一種なので ApiShapeError に変換する。
+        let parsed: T;
+        try {
+          parsed = JSON.parse(response.body) as T;
+        } catch {
+          this.successStreak = 0;
+          throw new ApiShapeError(url, ['json']);
+        }
         let validated: R;
         try {
-          validated = validate(JSON.parse(response.body) as T);
+          validated = validate(parsed);
         } catch (e) {
-          // 壊れた JSON も形状違いも成功ではない
+          // 形状違反 (validate 内で投げる ApiShapeError 等) も成功ではない
           this.successStreak = 0;
           throw e;
         }

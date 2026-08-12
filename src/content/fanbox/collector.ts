@@ -1,5 +1,5 @@
 import type { DownloadObject } from 'download-helper/download-helper';
-import { type AddPostResult, addByPostInfo, DownloadManage } from 'download-helper/fanbox-collector';
+import { type AddPostResult, addByPostInfo, DownloadManage, type PostListItem } from 'download-helper/fanbox-collector';
 import { ApiSession, ApiShapeError, DEFAULT_API_RATE_LIMIT_MS, FetchApiError, RateLimitExhaustedError } from './api';
 
 export type CollectorSettings = {
@@ -232,12 +232,48 @@ async function getItemsByCreator(
     if (signal.aborted) return counts();
     if (!downloadManage.isLimitValid()) break;
     console.log(`${i + 1}回目`);
+
+    // try は一覧ページ 1 回分の取得だけを囲む。以前は投稿ループ全体 (addByPostInfo や
+    // onProgress 呼び出しを含む) までこの try に入っており、そこで発生した想定外の例外
+    // (ライブラリのバグ、呼び出し元の onProgress のバグ等) まで「このページの一覧取得に
+    // 失敗した」に丸めて failedPageCount++ に吸収し、収集を継続してしまっていた。
+    // 一覧取得の失敗だけをここで捕まえ、それ以外は下の投稿ループ側の try (または
+    // 未捕捉のまま) に委ねる。
+    let postList: PostListItem[];
     try {
-      const postList = await api.fetchPostList(urls[i], signal);
-      if (i === 0) {
-        totalEstimate = urls.length * postList.length;
+      postList = await api.fetchPostList(urls[i], signal);
+    } catch (e) {
+      if (signal.aborted) return counts();
+      // 形状の不一致は「このページだけ落ちた」ではなく API 仕様変更なので、
+      // 失敗件数に丸めず中断する。丸めると投稿ゼロの ZIP を「完了 (1件失敗)」として
+      // 出してしまい、ユーザーが取得漏れに気付けない
+      if (e instanceof ApiShapeError) throw e;
+      // 枯渇したらそこで打ち切るが、集計は返す。throw すると、それまでに
+      // 数えた件数が呼び出し側に伝わらず、部分保存の可否も判断できない
+      if (e instanceof RateLimitExhaustedError) {
+        return { ...counts(), stoppedBy: e };
       }
-      console.log(`投稿の数:${postList.length}`);
+      // FetchApiError (通信/HTTP の失敗) だけをページ単位の失敗として数える。
+      // それ以外の想定外の例外を握りつぶすと、こちらのバグが「一覧ページの取得に
+      // 失敗した」として静かに握り潰され、部分 ZIP がそのまま保存されてしまう
+      if (!(e instanceof FetchApiError)) throw e;
+      console.error(`${i + 1}回目の投稿リスト取得に失敗:`, e);
+      failedPageCount++;
+      continue;
+    }
+
+    if (i === 0) {
+      totalEstimate = urls.length * postList.length;
+    }
+    console.log(`投稿の数:${postList.length}`);
+
+    // この try は投稿ループの中で RateLimitExhaustedError が起きた場合に限り、それまでの
+    // 集計 (counts()) を失わずに打ち切り扱いへ変換するためのものである。それ以外
+    // (ApiShapeError/PostBodyInvalidError、および想定外の例外) はここで丸めず、
+    // catch の中で明示的に再送出して未捕捉のまま呼び出し元へ伝播させる。
+    // 投稿単位の失敗 (FetchApiError) は下の内側の try で個別に処理して継続するので、
+    // ここまで上がってくることはない。
+    try {
       for (const post of postList) {
         if (signal.aborted) return counts();
         if (!downloadManage.isLimitValid()) break;
@@ -261,11 +297,12 @@ async function getItemsByCreator(
           if (signal.aborted) return counts();
           // レート制限の枯渇・形状/本文の不一致を投稿単位の失敗に丸めると、制限が続いている間
           // ずっと残りの投稿が 1 件ずつ順に失敗していく (レート制限)、または仕様変更を
-          // 検知できないまま収集が続いてしまう (形状/本文の不一致)
+          // 検知できないまま収集が続いてしまう (形状/本文の不一致)。ここで throw したものは
+          // すぐ外側の try の catch (このブロックの外) が受け止める。
           if (e instanceof ApiShapeError || e instanceof PostBodyInvalidError || e instanceof RateLimitExhaustedError) {
             throw e;
           }
-          // FetchApiError だけを投稿単位の失敗として数える (理由は上の postId 分岐と同じ)
+          // FetchApiError だけを投稿単位の失敗として数える (理由は上のページ単位の分岐と同じ)
           if (!(e instanceof FetchApiError)) throw e;
           console.error(`投稿情報の取得に失敗 (postId: ${post.id}):`, e);
           postFailures.apiFailed++;
@@ -275,22 +312,15 @@ async function getItemsByCreator(
       }
     } catch (e) {
       if (signal.aborted) return counts();
-      // 形状/本文の不一致は「このページだけ落ちた」ではなく API 仕様変更なので、
-      // 失敗件数に丸めず中断する。丸めると投稿ゼロの ZIP を「完了 (1件失敗)」として
-      // 出してしまい、ユーザーが取得漏れに気付けない
-      if (e instanceof ApiShapeError || e instanceof PostBodyInvalidError) throw e;
-      // 枯渇したらそこで打ち切るが、集計は返す。throw すると、それまでに
+      // 枯渇したらそこで打ち切るが、集計は返す。素通しすると、それまでに
       // 数えた件数が呼び出し側に伝わらず、部分保存の可否も判断できない
       if (e instanceof RateLimitExhaustedError) {
         return { ...counts(), stoppedBy: e };
       }
-      // 1 ページには複数の投稿が載るため、欠落数は不明。投稿 1 件の失敗として
-      // 数えると実際の欠落を過少報告するので、ページ単位で別に数える。
-      // (この階層はページ単位の失敗として一括りにしており、FetchApiError かどうかの
-      // 判定はしない。ページ取得の失敗は post.info 取得ほど頻発しないため、ここまで
-      // 厳密に「想定外のバグを再送出する」構造にする必要性が薄いと判断した)
-      console.error(`${i + 1}回目の投稿リスト取得に失敗:`, e);
-      failedPageCount++;
+      // ApiShapeError/PostBodyInvalidError (安全に取り込めない仕様変更) と、想定外の例外
+      // (onProgress のバグ、addByPostInfo の未検証例外など) はどちらも「一覧ページの取得に
+      // 失敗した」わけではないので、failedPageCount に丸めず素通しする
+      throw e;
     }
   }
   return counts();

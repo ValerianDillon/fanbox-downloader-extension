@@ -23,7 +23,13 @@ export const PARTIAL_DOWNLOAD_MESSAGE = 'ここまでの内容を保存して終
 /** 失敗ゼロ・非中断の完了画面の見出し */
 export const COMPLETE_HEADLINE = 'ダウンロードが完了しました';
 
-/** ZIP フェーズでのファイル欠落 (カバー画像含む) があった、非中断の完了画面の見出し (Issue #18 第 1 段階) */
+/**
+ * 収集フェーズ (postFailures / failedPageCount) または ZIP フェーズ (failedFileCount) の
+ * いずれかに欠落があった、非中断の完了画面の見出し (Issue #18 第 1 段階。Issue #14 で
+ * 条件を ZIP フェーズのファイル欠落のみから収集フェーズの欠落も含める形に拡張した —
+ * 拡張前は収集フェーズの欠落だけがあっても見出しが COMPLETE_HEADLINE のままで、
+ * 本文に併記される欠落の詳細行と矛盾していた)。
+ */
 export const PARTIAL_FILE_FAILURE_HEADLINE = '一部取得できませんでした';
 
 /** 収集フェーズがレート制限で打ち切られた場合の完了画面の見出し */
@@ -123,7 +129,9 @@ function buildFailureLines(params: CompleteMessageParams): string[] {
  *    aborted かどうかに関わらず最優先 (非中断時と同じ見出し)。ZIP フェーズも中断していた場合は、
  *    その事実 (PARTIAL_DOWNLOAD_MESSAGE) を本文で併記する
  * 3. 単純な中断 (収集フェーズは打ち切りなく完了、ZIP フェーズのみ「ここまでで終了」): PARTIAL_DOWNLOAD_MESSAGE
- * 4. ZIP フェーズのファイル欠落のみ: PARTIAL_FILE_FAILURE_HEADLINE
+ * 4. 収集フェーズ (postFailures/failedPageCount) または ZIP フェーズ (failedFileCount) の
+ *    いずれかに欠落があれば: PARTIAL_FILE_FAILURE_HEADLINE (buildFailureLines が 1 行でも
+ *    出力される場合と同値。本文の詳細行と見出しが矛盾しないようにする)
  * 5. 何も無ければ COMPLETE_HEADLINE
  *
  * 「未対応のレスポンス形式のため中断しました」(UNSUPPORTED_RESPONSE_HEADLINE) はここには
@@ -144,7 +152,11 @@ export function buildCompleteMessage(params: CompleteMessageParams): string {
   if (params.aborted) {
     return `${PARTIAL_DOWNLOAD_MESSAGE}${failedSuffix}`;
   }
-  const headline = params.failedFileCount > 0 ? PARTIAL_FILE_FAILURE_HEADLINE : COMPLETE_HEADLINE;
+  // 収集フェーズ・ZIP フェーズのいずれかに欠落があれば PARTIAL_FILE_FAILURE_HEADLINE にする。
+  // failureLines は buildFailureLines が同じ 5 分類 (unavailable/unsupported/apiFailed/
+  // failedPageCount/failedFileCount) を見て組み立てるため、判定をそこに合わせておくことで
+  // 「本文には欠落の行があるのに見出しは完了扱い」という矛盾を防ぐ
+  const headline = failureLines.length > 0 ? PARTIAL_FILE_FAILURE_HEADLINE : COMPLETE_HEADLINE;
   return `${headline}${failedSuffix}`;
 }
 

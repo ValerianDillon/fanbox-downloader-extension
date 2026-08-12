@@ -153,26 +153,37 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
     expect(buildCompleteMessage(base)).toBe(COMPLETE_HEADLINE);
   });
 
-  test('本文を利用できなかった投稿のみ: 見出しは変えず、専用の行を併記する', () => {
+  // Issue #14: 収集フェーズの欠落 (postFailures/failedPageCount) だけがあっても、
+  // ZIP フェーズの欠落 (failedFileCount) と同様に見出しを PARTIAL_FILE_FAILURE_HEADLINE に
+  // 変える。以前は failedFileCount のみを見ていたため、本文に欠落の行があるのに
+  // 見出しが「完了しました」のままになる矛盾があった。
+
+  test('本文を利用できなかった投稿のみ: 見出しが一部取得できませんでしたに変わる', () => {
     const message = buildCompleteMessage({ ...base, postFailures: emptyPostFailures({ unavailable: 2 }) });
     expect(message).toBe(
-      `${COMPLETE_HEADLINE}\n本文を利用できなかった投稿: 2 件 (閲覧権限または支援プランの範囲外など)`,
+      `${PARTIAL_FILE_FAILURE_HEADLINE}\n本文を利用できなかった投稿: 2 件 (閲覧権限または支援プランの範囲外など)`,
     );
   });
 
-  test('未対応の本文形式 (unsupported) のみ: 専用の行を併記する', () => {
+  test('未対応の本文形式 (unsupported) のみ: 見出しが一部取得できませんでしたに変わる', () => {
     const message = buildCompleteMessage({ ...base, postFailures: emptyPostFailures({ unsupported: 3 }) });
-    expect(message).toBe(`${COMPLETE_HEADLINE}\n未対応の本文形式: 3 件 (拡張機能の更新が必要な可能性があります)`);
+    expect(message).toBe(
+      `${PARTIAL_FILE_FAILURE_HEADLINE}\n未対応の本文形式: 3 件 (拡張機能の更新が必要な可能性があります)`,
+    );
   });
 
-  test('API 通信に失敗した投稿のみ: 専用の行を併記する', () => {
+  test('API 通信に失敗した投稿のみ: 見出しが一部取得できませんでしたに変わる', () => {
     const message = buildCompleteMessage({ ...base, postFailures: emptyPostFailures({ apiFailed: 4 }) });
-    expect(message).toBe(`${COMPLETE_HEADLINE}\nAPI 通信に失敗した投稿: 4 件 (時間を置いて再試行してください)`);
+    expect(message).toBe(
+      `${PARTIAL_FILE_FAILURE_HEADLINE}\nAPI 通信に失敗した投稿: 4 件 (時間を置いて再試行してください)`,
+    );
   });
 
-  test('取得できなかった一覧ページのみ: 専用の行を併記する', () => {
+  test('取得できなかった一覧ページのみ: 見出しが一部取得できませんでしたに変わる', () => {
     const message = buildCompleteMessage({ ...base, failedPageCount: 5 });
-    expect(message).toBe(`${COMPLETE_HEADLINE}\n取得できなかった一覧ページ: 5 ページ (欠落した投稿数は不明)`);
+    expect(message).toBe(
+      `${PARTIAL_FILE_FAILURE_HEADLINE}\n取得できなかった一覧ページ: 5 ページ (欠落した投稿数は不明)`,
+    );
   });
 
   test('ZIP フェーズのファイル欠落 (カバー画像含む) のみ: 見出しが一部取得できませんでしたに変わる', () => {

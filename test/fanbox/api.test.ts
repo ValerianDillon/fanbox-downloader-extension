@@ -647,6 +647,15 @@ describe('Issue #14: ApiShapeError の fields (想定と違ったフィールド
     (globalThis as any).chrome = origChrome;
   });
 
+  test('JSON として読めないレスポンス (SyntaxError) は ApiShapeError (fields: ["json"]) になる', async () => {
+    // JSON.parse の SyntaxError をそのまま投げると instanceof ApiShapeError 判定を
+    // すり抜け、「未対応のレスポンス形式のため中断しました」に乗らない
+    nextResponse = { ok: true, status: 200, retryAfter: null, body: '{ broken' };
+    const error = await api.fetchPostInfo('1').catch((e) => e);
+    expect(error).toBeInstanceOf(ApiShapeError);
+    expect(error.fields).toEqual(['json']);
+  });
+
   test('body.post 自体が無ければ fields は ["body.post"]', async () => {
     nextResponse = okJson({ body: {} });
     const error = await api.fetchPostInfo('1').catch((e) => e);

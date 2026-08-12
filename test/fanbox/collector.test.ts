@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { ApiSession } from '../../src/content/fanbox/api';
-import { collect, PostBodyInvalidError } from '../../src/content/fanbox/collector';
+import { collect, PostBodyInvalidError, type ProgressCallback } from '../../src/content/fanbox/collector';
 
 const CREATOR_ID = 'testcreator';
 const LIST_PAGE_URL = `https://api.fanbox.cc/post.listCreator?creatorId=${CREATOR_ID}&cursor=1`;
@@ -101,6 +101,18 @@ describe('collect', () => {
   test('投稿詳細の形状が想定外なら失敗件数に丸めず中断する', async () => {
     // 旧形状 (body 直下が投稿) が返ってきたケース
     mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: POST_FULL } });
+
+    await expect(collectCreator()).rejects.toThrow(/形状が想定外/);
+  });
+
+  test('投稿詳細が JSON として読めない (壊れた本文) なら失敗件数に丸めず中断する', async () => {
+    // JSON.parse の SyntaxError が ApiShapeError に変換されず素通しされると、
+    // 「未対応のレスポンス形式のため中断しました」の経路に乗らず、想定外の例外として
+    // 収集全体が (理由不明のまま) 落ちるだけになってしまう
+    mockApi({
+      ...BASE_RESPONSES,
+      [POST_INFO_URL]: () => ({ ok: true, status: 200, retryAfter: null, body: '{ broken' }),
+    });
 
     await expect(collectCreator()).rejects.toThrow(/形状が想定外/);
   });
@@ -227,6 +239,22 @@ describe('collect', () => {
     expect(result.postFailures.unavailable).toBe(0);
     expect(result.postFailures.unsupported).toBe(0);
     expect(result.postFailures.apiFailed).toBe(0);
+  });
+
+  test('投稿処理中の想定外の例外 (onProgress のバグ等) は一覧ページの失敗に丸めず伝播する', async () => {
+    // 一覧ページの取得自体は成功しているのに、投稿ループ内 (ここでは呼び出し元の
+    // onProgress) で起きた想定外の例外まで「このページの一覧取得に失敗した」に丸めると、
+    // こちらのバグが静かに failedPageCount++ に吸収され、部分 ZIP がそのまま
+    // 保存されてしまう (addByPostInfo の未検証例外でも同じ経路を通る)
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+    const boom = new Error('onProgress boom');
+    const throwingProgress: ProgressCallback = () => {
+      throw boom;
+    };
+
+    await expect(collect(CREATOR_ID, undefined, SETTINGS, throwingProgress, new AbortController().signal)).rejects.toBe(
+      boom,
+    );
   });
 
   test('isIgnoreFree で除外した無料投稿は失敗に数えない', async () => {
