@@ -112,28 +112,24 @@ export function createTestSaveHandle(): FileSystemFileHandle {
 
 /**
  * downloadZip に渡す fetchFile を observability 用にラップする。
- * - 要求した URL を data-fbdl-fetched-urls (JSON 配列文字列) に累積 publish
- * - null 返却 (取得失敗) の回数を data-fbdl-failed-file-count に累積 publish (0 件でも publish する)
+ * 要求した URL を data-fbdl-fetched-urls (JSON 配列文字列) に累積 publish する。
  * 本番ビルドでは何も変更せず fetchFile をそのまま返す。
+ *
+ * 失敗件数 (data-fbdl-failed-file-count) はここでは数えない。Issue #18 以降、対象単位の
+ * 最終失敗は download-helper (v4.4.0 以降) の DownloadZipResult.failedFileCount が
+ * カバー画像を含めて正しく集計する (中断由来は含まない) ため、呼び出し元 (overlay.ts) が
+ * downloadAsZip の戻り値からそれを publish する。ここで独自に null 返却を数えると、
+ * 中断由来の null も含めてしまい二重集計になる (Issue #18 のコメント参照)。
  */
 export function wrapFetchFileForTest(
-  fetchFile: (url: string, name: string) => Promise<Blob | null>,
-): (url: string, name: string) => Promise<Blob | null> {
+  fetchFile: (url: string, name: string, context: { kind: 'cover' | 'file' }) => Promise<Blob | null>,
+): (url: string, name: string, context: { kind: 'cover' | 'file' }) => Promise<Blob | null> {
   if (IS_TEST_BUILD) {
     const fetchedUrls: string[] = [];
-    let failedCount = 0;
-    // 一件も失敗しなかった場合でも観測点として '0' を publish しておく
-    // (属性が存在しないことと「失敗 0 件」を区別できるようにする)
-    publishTestState({ 'failed-file-count': '0' });
-    return async (url: string, name: string) => {
+    return async (url: string, name: string, context: { kind: 'cover' | 'file' }) => {
       fetchedUrls.push(url);
       publishTestState({ 'fetched-urls': JSON.stringify(fetchedUrls) });
-      const blob = await fetchFile(url, name);
-      if (!blob) {
-        failedCount++;
-        publishTestState({ 'failed-file-count': String(failedCount) });
-      }
-      return blob;
+      return fetchFile(url, name, context);
     };
   }
   return fetchFile;

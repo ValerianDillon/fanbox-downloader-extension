@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { BackoffStore } from '../../src/service-worker/backoff-store';
-import { handleFetchApi, handleGetBackoffUntil } from '../../src/service-worker/handlers';
+import { handleFetchApi, handleFetchMedia, handleGetBackoffUntil } from '../../src/service-worker/handlers';
 import { createFakeSessionStorage } from './fake-storage';
 
 /**
@@ -190,5 +190,95 @@ describe('handleFetchApi / handleGetBackoffUntil', () => {
     const res = await handleFetchApi('https://api.fanbox.cc/x', store);
     expect(res.status).toBe(429);
     expect(backing.get('fbdlBackoffUntil')).toBe(res.backoffUntil);
+  });
+});
+
+/**
+ * Issue #18 第 1 段階: `type: 'fetch'` (メディア取得プロキシ) でも HTTP ステータスと
+ * Retry-After を失わないことのテスト。handleFetchApi と異なり BackoffStore を参照しないため
+ * (第 2 段階のスコープ。制限枠が api.fanbox.cc と共通かどうか未確認のため)、
+ * ここでは fetch() のフェイクだけで完結する。
+ */
+describe('handleFetchMedia', () => {
+  const origFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = origFetch;
+  });
+
+  /** arrayBuffer() を持つ、メディア取得向けの fetch() フェイク応答 */
+  function fakeMediaResponse(init: { status: number; retryAfter?: string | null; bodyBytes?: Uint8Array }): Response {
+    const headers = new Headers();
+    if (init.retryAfter) headers.set('Retry-After', init.retryAfter);
+    const bytes = init.bodyBytes ?? new Uint8Array();
+    return {
+      status: init.status,
+      ok: init.status >= 200 && init.status < 300,
+      headers,
+      arrayBuffer: async () => bytes.buffer,
+    } as Response;
+  }
+
+  test('200 は ok:true でステータスと base64 化したボディを返す', async () => {
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    globalThis.fetch = (async () => fakeMediaResponse({ status: 200, bodyBytes: bytes })) as unknown as typeof fetch;
+    const res = await handleFetchMedia('https://downloads.fanbox.cc/f');
+    expect(res.ok).toBe(true);
+    expect(res.status).toBe(200);
+    expect(res.retryAfter).toBeNull();
+    expect(res.data).toBeDefined();
+    const decoded = new Uint8Array(
+      atob(res.data ?? '')
+        .split('')
+        .map((c) => c.charCodeAt(0)),
+    );
+    expect([...decoded]).toEqual([...bytes]);
+  });
+
+  test('429 は ok:false, status:429, Retry-After を保持して返す (現状は if (!r.ok) return null で潰れていた)', async () => {
+    globalThis.fetch = (async () => fakeMediaResponse({ status: 429, retryAfter: '30' })) as unknown as typeof fetch;
+    const res = await handleFetchMedia('https://downloads.fanbox.cc/f');
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(429);
+    expect(res.retryAfter).toBe('30');
+    expect(res.data).toBeUndefined();
+  });
+
+  test('404 等の他の HTTP エラーもステータスを保持する (429 だけを特別扱いしない)', async () => {
+    globalThis.fetch = (async () => fakeMediaResponse({ status: 404 })) as unknown as typeof fetch;
+    const res = await handleFetchMedia('https://downloads.fanbox.cc/f');
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(404);
+    expect(res.retryAfter).toBeNull();
+  });
+
+  test('fetch が例外を投げたら通信失敗として status:0 (fetchApi と揃える)', async () => {
+    globalThis.fetch = (async () => {
+      throw new Error('network down');
+    }) as unknown as typeof fetch;
+    const res = await handleFetchMedia('https://downloads.fanbox.cc/f');
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(0);
+    expect(res.retryAfter).toBeNull();
+    expect(res.error).toContain('network down');
+  });
+
+  test('本文読み込み (r.arrayBuffer()) が失敗しても、観測済みの status/retryAfter は status:0 にすり替えない', async () => {
+    // HTTP 応答自体は 200 で受け取れている (未到達の通信失敗ではない) ので、
+    // status: 0 は「fetch() 自体が届かなかった」ことを意味しなくなり、観測結果と矛盾する
+    globalThis.fetch = (async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'Retry-After': '7' }),
+      arrayBuffer: async () => {
+        throw new Error('body read failed');
+      },
+    })) as unknown as typeof fetch;
+    const res = await handleFetchMedia('https://downloads.fanbox.cc/f');
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(200);
+    expect(res.retryAfter).toBe('7');
+    expect(res.data).toBeUndefined();
+    expect(res.error).toContain('body read failed');
   });
 });

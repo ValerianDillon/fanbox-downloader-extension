@@ -1,3 +1,4 @@
+import { uint8ArrayToBase64 } from '../base64';
 import { parseRetryAfter } from '../retry-after';
 import { BackoffStore } from './backoff-store';
 
@@ -132,4 +133,54 @@ export async function handleFetchApi(url: string, store: BackoffStore = backoffS
 /** 収集開始時など、まだ 1 度もリクエストしていない時点でバックオフ期限を知るための問い合わせ */
 export async function handleGetBackoffUntil(store: BackoffStore = backoffStore): Promise<{ backoffUntil: number }> {
   return { backoffUntil: await safeGet(store) };
+}
+
+export type MediaFetchResponse = {
+  ok: boolean;
+  /** HTTP ステータス。fetch() 自体が例外を投げた通信失敗は fetchApi (ApiFetchResponse) と揃えて 0 で表現する */
+  status: number;
+  retryAfter: string | null;
+  /** base64 エンコードされたレスポンスボディ。ok のときのみ存在する */
+  data?: string;
+  error?: string;
+};
+
+/**
+ * downloads.fanbox.cc / *.pximg.net などメディア取得 (`type: 'fetch'`) の fetch プロキシ本体。
+ *
+ * Issue #18 第 1 段階のスコープは「ステータスと Retry-After を失わずに観測できるようにする」ことであり、
+ * fetchApi (handleFetchApi) のような 429 発行前ゲート・バックオフ記録は行わない。取得先ホストが
+ * api.fanbox.cc と異なり、制限枠が共通か別かも未確認のため、ここで BackoffStore は参照しない
+ * (第 2 段階のスコープ。Issue #18 の「関連」節参照)。
+ *
+ * 呼び出し側 (content script の downloader.ts) が試行単位の記録・対象単位の失敗集計を行う。
+ * ここでは 1 回の fetch 試行の結果をそのまま返すだけに留める。
+ *
+ * fetch() 自体の失敗 (status: 0、実際の通信障害) と、応答は受け取れたが本文の読み込み
+ * (r.arrayBuffer()) や base64 変換 (uint8ArrayToBase64) が失敗するケースを区別するため、
+ * 「HTTP 応答の観測 (status/retryAfter の確定)」と「本文の読み込み・変換」を別の try で囲む。
+ * 後者は既に status/retryAfter を観測できているので、失敗時もそれらを status: 0 に
+ * すり替えず、観測済みの値のまま ok: false + error で返す。
+ */
+export async function handleFetchMedia(url: string): Promise<MediaFetchResponse> {
+  let r: Response;
+  try {
+    r = await fetch(url, { credentials: 'include' });
+  } catch (e) {
+    // ここに到達するのは fetch() 自体の失敗 (実際の通信障害) のみ
+    return { ok: false, status: 0, retryAfter: null, error: String(e) };
+  }
+  const retryAfter = r.headers.get('Retry-After');
+  if (!r.ok) {
+    return { ok: false, status: r.status, retryAfter };
+  }
+  try {
+    // ArrayBuffer → base64 (messaging 経由で転送するため)
+    const buf = await r.arrayBuffer();
+    return { ok: true, status: r.status, retryAfter, data: uint8ArrayToBase64(new Uint8Array(buf)) };
+  } catch (e) {
+    // 本文の読み込み・変換の失敗。HTTP 応答自体は観測できている (status は 2xx) ので、
+    // status: 0 (通信失敗) にすり替えず、観測済みの status/retryAfter を維持したまま返す
+    return { ok: false, status: r.status, retryAfter, error: String(e) };
+  }
 }

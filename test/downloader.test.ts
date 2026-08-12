@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import type { DownloadProgress, FileSystemFileHandle } from '../src/content/downloader';
-import { downloadAsZip } from '../src/content/downloader';
+import type { DownloadProgress, FileSystemFileHandle, MediaFetchAttempt } from '../src/content/downloader';
+import { downloadAsZip, fetchWithRetry } from '../src/content/downloader';
 
 // ZipWriter が書き込む先のモック。write() で渡る Uint8Array を蓄積する。
 class MockWritableStream {
@@ -271,14 +271,15 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
     (globalThis as any).chrome = origChrome;
   });
 
-  test('cover と file の LFH の UT extra Mtime が publishedDatetime と一致', async () => {
+  test('cover と file の LFH の UT extra Mtime が publishedDatetime と一致し、戻り値 (zip/attempts) も正しく埋まる', async () => {
     const data = btoa(String.fromCharCode(0x89, 0x50, 0x4e, 0x47));
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = {
       runtime: {
         sendMessage: async (message: { type: string; url: string }) => {
           if (message.type !== 'fetch') throw new Error(`unexpected message type: ${message.type}`);
-          return { ok: true, data };
+          // 新応答形状 (status/retryAfter を含む) を模す
+          return { ok: true, status: 200, retryAfter: null, data };
         },
       },
     };
@@ -305,11 +306,250 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
       ],
     });
     const { handle, mock } = makeHandle();
-    await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
+    const { zip, attempts } = await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
 
     const entries = parseLocalEntries(mock.toBuffer());
     for (const path of ['u/p/cover.png', 'u/p/f.bin']) {
       expect(entryByName(entries, path).utMtime).toBe(expectedUnix);
     }
+
+    // 対象単位の集計 (DownloadZipResult): カバー + ファイルの 2 件とも成功
+    expect(zip.failedFileCount).toBe(0);
+    expect(zip.writtenFileCount).toBe(2);
+    expect(zip.completedPostCount).toBe(1);
+    expect(zip.totalPostCount).toBe(1);
+    expect(zip.aborted).toBe(false);
+
+    // 試行単位の記録: cover 用・file 用それぞれ 1 回ずつ、応答のステータス/Retry-After が反映されている
+    expect(attempts.length).toBe(2);
+    expect(attempts.every((a) => a.status === 200 && a.retryAfter === null && a.host === 'example.test')).toBe(true);
+    // context.kind (download-helper から渡される取得対象の種別) が正しく attempts に伝わっている
+    expect(attempts.map((a) => a.kind).sort()).toEqual(['cover', 'file']);
+  });
+
+  test('取得に 2 回とも失敗 (429) すると zip.failedFileCount に反映され、attempts にも 2 回分の 429 が残る', async () => {
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async (message: { type: string; url: string }) => {
+          if (message.type !== 'fetch') throw new Error(`unexpected message type: ${message.type}`);
+          return { ok: false, status: 429, retryAfter: '3' };
+        },
+      },
+    };
+    const origSetTimeout = globalThis.setTimeout;
+    // fetchWithRetry の再試行間の 1 秒待機を仮想時間で進める
+    globalThis.setTimeout = ((handler: TimerHandler) =>
+      origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
+
+    try {
+      const json = JSON.stringify({
+        id: 'u',
+        url: '#main',
+        tags: [],
+        postCount: 1,
+        fileCount: 1,
+        posts: [
+          {
+            originalName: 'p',
+            encodedName: 'p',
+            informationText: '{}',
+            htmlText: '<p></p>',
+            files: [{ url: 'https://example.test/f', originalName: 'f.bin', encodedName: 'f.bin' }],
+            tags: [],
+          },
+        ],
+      });
+      const { handle } = makeHandle();
+      const { zip, attempts } = await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
+
+      expect(zip.failedFileCount).toBe(1);
+      expect(zip.writtenFileCount).toBe(0);
+      expect(zip.aborted).toBe(false);
+
+      // 1 対象最大 2 試行なので、429 が 2 回とも記録に残る
+      expect(attempts.length).toBe(2);
+      expect(attempts.every((a) => a.status === 429 && a.retryAfter === '3' && a.kind === 'file')).toBe(true);
+    } finally {
+      globalThis.setTimeout = origSetTimeout;
+    }
+  });
+});
+
+/**
+ * Issue #18 第 1 段階: fetchWithRetry の試行単位の観測記録のテスト。
+ * downloadAsZip 経由の JSON 往復を挟まず、fetchWithRetry を直接呼んで検証する
+ * (test/service-worker/handlers.test.ts が handleFetchApi を直接呼ぶのと同じ理由)。
+ */
+describe('fetchWithRetry の試行記録 (Issue #18)', () => {
+  // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+  const origChrome = (globalThis as any).chrome;
+  const origSetTimeout = globalThis.setTimeout;
+  const origConsoleInfo = console.info;
+
+  afterEach(() => {
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = origChrome;
+    globalThis.setTimeout = origSetTimeout;
+    console.info = origConsoleInfo;
+  });
+
+  test('初回 429 → 再試行 200 で成功しても、初回の 429 が試行記録に残る', async () => {
+    // fetchWithRetry の再試行間には 1 秒の固定待機 (utils.sleep) があるため、
+    // setTimeout を即時実行に置換して仮想時間で進める (test/fanbox/api.test.ts と同じ手法)
+    globalThis.setTimeout = ((handler: TimerHandler) =>
+      origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
+
+    let calls = 0;
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async (message: { type: string; url: string }) => {
+          calls++;
+          if (message.type !== 'fetch') throw new Error(`unexpected message type: ${message.type}`);
+          if (calls === 1) return { ok: false, status: 429, retryAfter: '3' };
+          return { ok: true, status: 200, retryAfter: null, data: btoa('ok') };
+        },
+      },
+    };
+    const loggedAttempts: unknown[] = [];
+    console.info = ((...args: unknown[]) => loggedAttempts.push(args[0])) as typeof console.info;
+
+    const attempts: MediaFetchAttempt[] = [];
+    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, undefined, 'file', attempts);
+
+    expect(blob).not.toBeNull();
+    expect(calls).toBe(2);
+    // 対象単位では最終的に成功しているが、試行記録には初回の 429 も残る
+    expect(attempts.map((a) => a.status)).toEqual([429, 200]);
+    expect(attempts[0].kind).toBe('file');
+    expect(attempts[0].host).toBe('downloads.fanbox.cc');
+    expect(attempts[0].retryAfter).toBe('3');
+    expect(attempts[1].retryAfter).toBeNull();
+    // 試行ごとに console.info へ単一オブジェクトとして構造化ログを出す
+    expect(loggedAttempts).toEqual(attempts);
+  });
+
+  test('通信失敗 (service worker が status:0 を返す) は 2 回とも status 0 で記録され、最終的に blob は null', async () => {
+    globalThis.setTimeout = ((handler: TimerHandler) =>
+      origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
+
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async () => ({ ok: false, status: 0, retryAfter: null, error: 'network down' }),
+      },
+    };
+
+    const attempts: MediaFetchAttempt[] = [];
+    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, undefined, 'cover', attempts);
+
+    expect(blob).toBeNull();
+    expect(attempts.length).toBe(2);
+    expect(attempts.every((a) => a.status === 0)).toBe(true);
+    expect(attempts.every((a) => a.kind === 'cover')).toBe(true);
+  });
+
+  test('中断による打ち切りは失敗として記録されない (1 回目の応答後に中断すると 2 回目は試行されない)', async () => {
+    let calls = 0;
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async () => {
+          calls++;
+          return { ok: false, status: 429, retryAfter: '3' };
+        },
+      },
+    };
+
+    const controller = new AbortController();
+    const attempts: MediaFetchAttempt[] = [];
+    // 1 回目の試行が観測された直後 (attempts.push の瞬間) に中断させることで、
+    // 「応答を受け取れた試行は記録されるが、中断により見送られた 2 回目は記録されない」を
+    // タイミング競合なしに検証する
+    const originalPush = attempts.push.bind(attempts);
+    attempts.push = ((...items: MediaFetchAttempt[]) => {
+      const result = originalPush(...items);
+      controller.abort();
+      return result;
+    }) as typeof attempts.push;
+
+    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, controller.signal, 'file', attempts);
+
+    expect(blob).toBeNull();
+    expect(calls).toBe(1);
+    expect(attempts.length).toBe(1);
+    expect(attempts[0].status).toBe(429);
+  });
+
+  test('呼び出し前から中断済みなら 1 回も試行せず、記録も残らない', async () => {
+    let calls = 0;
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async () => {
+          calls++;
+          return { ok: true, status: 200, retryAfter: null, data: btoa('ok') };
+        },
+      },
+    };
+    const controller = new AbortController();
+    controller.abort();
+    const attempts: MediaFetchAttempt[] = [];
+
+    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, controller.signal, 'file', attempts);
+
+    expect(blob).toBeNull();
+    expect(calls).toBe(0);
+    expect(attempts.length).toBe(0);
+  });
+
+  test('旧応答形状 { ok, data } (status/retryAfter 欠損) を受けても attempts は正規化される (status:0, retryAfter:null)', async () => {
+    // 拡張の更新中は世代の異なる content script / service worker が併存しうるため、
+    // 旧形状の応答 (status/retryAfter を持たない) を受け取ってもクラッシュせず、
+    // MediaFetchAttempt の契約 (status 欠損は 0、retryAfter は null) を守ることを確認する
+    globalThis.setTimeout = ((handler: TimerHandler) =>
+      origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
+
+    let calls = 0;
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async () => {
+          calls++;
+          // 旧形状: 失敗時は ok:false のみ (data すら無い)、成功時は ok:true + data のみ
+          if (calls === 1) return { ok: false };
+          return { ok: true, data: btoa('ok') };
+        },
+      },
+    };
+
+    const attempts: MediaFetchAttempt[] = [];
+    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, undefined, 'file', attempts);
+
+    expect(blob).not.toBeNull();
+    expect(calls).toBe(2);
+    expect(attempts.length).toBe(2);
+    expect(attempts.every((a) => a.status === 0)).toBe(true);
+    expect(attempts.every((a) => a.retryAfter === null)).toBe(true);
+  });
+
+  test('0 バイトのファイル (data が空文字列) は失敗ではなく空の Blob として成功する', async () => {
+    // HTTP 2xx で本文 0 バイトのファイルは data: '' (有効な空 base64) として届く。
+    // data の欠損判定を truthiness で行うと、この正常な空ファイルを失敗扱いして
+    // failedFileCount に誤計上してしまうため、型 (string かどうか) で判定する
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async () => ({ ok: true, status: 200, retryAfter: null, data: '' }),
+      },
+    };
+
+    const attempts: MediaFetchAttempt[] = [];
+    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, undefined, 'file', attempts);
+
+    expect(blob).not.toBeNull();
+    expect(blob?.size).toBe(0);
+    expect(attempts.map((a) => a.status)).toEqual([200]);
   });
 });
