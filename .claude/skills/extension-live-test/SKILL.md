@@ -66,11 +66,43 @@ FANBOX のログインには CAPTCHA があるため自動化しない。ユー�
 
 ### agent のシェルから headed 起動に失敗する場合
 
-agent の実行シェルには WSLg の X 認証が引き継がれないことがあり、`DISPLAY` が設定されていても `Missing X server or $DISPLAY` で headed 起動に失敗する (`XAUTHORITY` 未設定、または WSLg の X サーバ自体が無応答)。この失敗は環境要因であり、スクリプトや拡張の不具合ではない。
+agent の実行シェルから headed 起動できる場合もある (`XAUTHORITY` 未設定でも `timeout 5 xset q` が応答すれば起動できた実績がある)。まず 1 回試すこと。
+
+一方、agent の実行シェルには WSLg の X 認証が引き継がれないことがあり、`DISPLAY` が設定されていても `Missing X server or $DISPLAY` で headed 起動に失敗する (`XAUTHORITY` 未設定、または WSLg の X サーバ自体が無応答)。この失敗は環境要因であり、スクリプトや拡張の不具合ではない。
 
 - 同じ起動を繰り返さない。1 回失敗したら切り分け (`timeout 5 xset q` の応答有無) をして止める
 - ユーザに、**agent のシェルではなくユーザ自身のターミナル**で `bun scripts/live-browser.ts --headed` を実行して手順 2〜3 (ログイン → Ctrl+C) を行うよう依頼する。プロファイルは同じ場所を使うため、完了後は agent 側から headless で Cookie を利用できる
 - ユーザのターミナルでもウィンドウが出ない場合は WSLg 自体の不調の可能性がある (`wsl --shutdown` からの再起動をユーザに提案する。agent のセッションも道連れになるため、実行前に作業を push しておく)
+
+## headless はボット判定で偽の失敗を出す (headed との使い分け)
+
+headless Chromium は UA が `HeadlessChrome/...` になり、Cloudflare のボット判定を受ける。実測では、同じアカウント・同じ拡張で次の差が出た。
+
+| | headless | headed |
+| --- | --- | --- |
+| UA | `HeadlessChrome/149.0.0.0` | `Chrome/149.0.0.0` |
+| 収集 216 件中の `post.info` 失敗 | 34 件 | 0 件 |
+
+つまり **headless で観測した「API 通信に失敗した投稿」は拡張の不具合ではなくボット判定である可能性が高い**。失敗率や通信エラーを評価したいときは headed で確認する。UI の遷移や状態管理の確認だけなら headless で足りる。
+
+## 実 API のレスポンス形状を観測する (service worker 経由)
+
+`api.fanbox.cc/post.info` はページ origin (`www.fanbox.cc`) からの fetch では CORS で読めない (`Access-Control-Allow-Origin` を返さない。拡張の有無に依存しない FANBOX 側の挙動で、拡張を読み込まないブラウザでも同じ)。`post.listCreator` や `plan.listSupporting` は読めるので、エンドポイントによって異なる。
+
+生のレスポンス形状を観測したいときは、host_permissions を持つ拡張の service worker コンテキストで evaluate する。CDP の service worker ターゲットに WebSocket で直接つないで `Runtime.evaluate` を送るのが確実である (`playwright.connectOverCDP` は chrome-devtools MCP が同じ endpoint を掴んでいると接続がタイムアウトすることがある)。
+
+```
+curl -s http://127.0.0.1:9222/json/list   # "type": "service_worker" の webSocketDebuggerUrl を得る
+```
+
+得た URL に WebSocket で接続し、`{"id":1,"method":"Runtime.evaluate","params":{"expression":"(async()=>{...})()","awaitPromise":true,"returnByValue":true}}` を送る。
+
+## 生成した ZIP を実データで検証する
+
+テストビルドは `showSaveFilePicker` を stub し、生成した ZIP を base64 で `data-fbdl-zip-b64` に publish する。実データの ZIP を検証したいときはこれを取り出す。
+
+- 数十 MB になるため、`evaluate_script` の戻り値としてインラインで受け取らないこと。chrome-devtools MCP の `filePath` パラメータでファイルに保存してから base64 デコードする
+- デコード後は `unzip -l` (ディレクトリエントリと日時) / `unzip -t` (整合性) / 展開して `date -r` (展開後の mtime) で検証できる
 
 ## フォールバック: Windows 側にウィンドウを出さず headed 実行する (未整備)
 
