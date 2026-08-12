@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { PARTIAL_DOWNLOAD_MESSAGE } from '../src/content/overlay';
+import {
+  buildCompleteMessage,
+  COMPLETE_HEADLINE,
+  type CompleteMessageParams,
+  PARTIAL_DOWNLOAD_MESSAGE,
+  PARTIAL_FILE_FAILURE_HEADLINE,
+  RATE_LIMIT_EXHAUSTED_HEADLINE,
+} from '../src/content/overlay';
 
 /**
  * OverlayController の状態遷移テスト
@@ -85,5 +92,95 @@ describe('Issue #17: ダウンロード中の「ここまでで終了」', () =>
     expect(PARTIAL_DOWNLOAD_MESSAGE).not.toContain('完了');
     expect(PARTIAL_DOWNLOAD_MESSAGE).not.toContain('失敗');
     expect(PARTIAL_DOWNLOAD_MESSAGE).not.toContain('中断');
+  });
+});
+
+/**
+ * Issue #18 第 1 段階: 完了画面の分岐 (buildCompleteMessage) のテスト。
+ * DOM や collect()/downloadAsZip() を経由せず、失敗件数の組み合わせを直接入力して
+ * 完了画面の文言を検証する (buildCompleteMessage は overlay.ts から切り出した純粋関数)。
+ * 見出し文言は exports の完全一致で固定し、退行 (表現の変更) を検知できるようにする。
+ */
+describe('Issue #18: 完了画面の分岐 (buildCompleteMessage)', () => {
+  test('見出し文言が仕様どおりである (完全一致)', () => {
+    expect(COMPLETE_HEADLINE).toBe('ダウンロードが完了しました');
+    expect(PARTIAL_FILE_FAILURE_HEADLINE).toBe('一部取得できませんでした');
+    expect(RATE_LIMIT_EXHAUSTED_HEADLINE).toBe('レート制限のため途中で打ち切りました (取得できた分のみ保存しています)');
+  });
+
+  const base: CompleteMessageParams = {
+    aborted: false,
+    failedPostCount: 0,
+    failedPageCount: 0,
+    failedFileCount: 0,
+  };
+
+  test('失敗ゼロ・非中断は COMPLETE_HEADLINE のみ (従来どおり)', () => {
+    expect(buildCompleteMessage(base)).toBe(COMPLETE_HEADLINE);
+  });
+
+  test('収集フェーズの投稿単位の失敗のみ: 見出しは変えず、件数を併記する (従来どおり)', () => {
+    const message = buildCompleteMessage({ ...base, failedPostCount: 2 });
+    expect(message).toBe(
+      `${COMPLETE_HEADLINE}\n2 件の投稿の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`,
+    );
+  });
+
+  test('ZIP フェーズのファイル欠落 (カバー画像含む) のみ: 見出しが一部取得できませんでしたに変わる', () => {
+    const message = buildCompleteMessage({ ...base, failedFileCount: 3 });
+    expect(message).toBe(
+      `${PARTIAL_FILE_FAILURE_HEADLINE}\n3 件のファイル (カバー画像含む)の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`,
+    );
+  });
+
+  test('収集フェーズ (投稿・ページ) と ZIP フェーズの失敗が全部そろうと 1 つの文言に合流する', () => {
+    const message = buildCompleteMessage({
+      aborted: false,
+      failedPostCount: 1,
+      failedPageCount: 2,
+      failedFileCount: 3,
+    });
+    expect(message).toBe(
+      `${PARTIAL_FILE_FAILURE_HEADLINE}\n` +
+        '1 件の投稿 と 2 ページ分の投稿一覧 (投稿数は不明) と 3 件のファイル (カバー画像含む)' +
+        'の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)',
+    );
+  });
+
+  test('レート制限による打ち切りが最優先 (ZIP フェーズの失敗が 0 でも見出しは打ち切り扱い)', () => {
+    const message = buildCompleteMessage({ ...base, stoppedReason: 'rate-limit-exhausted' });
+    expect(message).toBe(RATE_LIMIT_EXHAUSTED_HEADLINE);
+  });
+
+  test('レート制限による打ち切りと ZIP フェーズの失敗が両方あっても見出しは打ち切りが勝ち、件数は併記する', () => {
+    const message = buildCompleteMessage({ ...base, failedFileCount: 5, stoppedReason: 'rate-limit-exhausted' });
+    expect(message).toBe(
+      `${RATE_LIMIT_EXHAUSTED_HEADLINE}\n5 件のファイル (カバー画像含む)の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`,
+    );
+  });
+
+  test('中断 (「ここまでで終了」) かつ失敗ゼロは PARTIAL_DOWNLOAD_MESSAGE のみ (断定しない文言を維持)', () => {
+    expect(buildCompleteMessage({ ...base, aborted: true })).toBe(PARTIAL_DOWNLOAD_MESSAGE);
+  });
+
+  test('中断かつ ZIP フェーズの失敗がある場合、PARTIAL_DOWNLOAD_MESSAGE を維持しつつ件数を併記する', () => {
+    const message = buildCompleteMessage({ ...base, aborted: true, failedFileCount: 4 });
+    expect(message).toBe(`${PARTIAL_DOWNLOAD_MESSAGE}\n4 件のファイル (カバー画像含む)の取得に失敗しました`);
+    // 中断時の併記は「支援プランの範囲外か、FANBOX のレート制限の可能性があります」の
+    // 断定的な理由付けを含めない (中断は取得失敗ではなくユーザ操作によるものであるため)
+    expect(message).not.toContain('レート制限の可能性');
+  });
+
+  test('中断時は収集フェーズの失敗件数 (failedPostCount/failedPageCount) を見ない (中断前に収集は完了済みのため無関係)', () => {
+    // startCollecting の実装上、この分岐に来るのは downloadAsZip の中断のみで、
+    // 収集フェーズはその前に正常終了しているが、万一 failedPostCount 等が非ゼロで
+    // 渡されても PARTIAL_DOWNLOAD_MESSAGE の文言を汚さないことを確認する
+    const message = buildCompleteMessage({
+      aborted: true,
+      failedPostCount: 9,
+      failedPageCount: 9,
+      failedFileCount: 0,
+    });
+    expect(message).toBe(PARTIAL_DOWNLOAD_MESSAGE);
   });
 });

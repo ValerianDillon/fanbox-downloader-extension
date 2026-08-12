@@ -12,11 +12,76 @@ export type OverlayState = 'settings' | 'collecting' | 'downloading' | 'complete
  * ダウンロード中に「ここまでで終了」が押されて中断した場合の完了画面の文言。
  *
  * 全投稿を書き終えた直後 (最終の zip.close() の最中) に押された場合、ZIP は実際には
- * 完全にできあがっている可能性がある。downloadZip の戻り値は void で処理済み件数を
- * 呼び出し側から区別できないため (Issue #17 の「完了直前に押された場合の文言」参照)、
- * 完了・部分保存のどちらであっても偽にならない断定しない表現にする。
+ * 完全にできあがっている可能性がある。download-helper v4.4.0 の DownloadZipResult.aborted も
+ * 同じ境界 (zip.close() 実行中の中断) では反映されない仕様のため (Issue #17 の「完了直前に
+ * 押された場合の文言」参照、DownloadZipResult のコメントも参照)、ここでは引き続き
+ * content script 側の AbortSignal (signal.aborted) を見て判定し、完了・部分保存の
+ * どちらであっても偽にならない断定しない表現にする。
  */
 export const PARTIAL_DOWNLOAD_MESSAGE = 'ここまでの内容を保存して終了しました';
+
+/** 失敗ゼロ・非中断の完了画面の見出し */
+export const COMPLETE_HEADLINE = 'ダウンロードが完了しました';
+
+/** ZIP フェーズでのファイル欠落 (カバー画像含む) があった、非中断の完了画面の見出し (Issue #18 第 1 段階) */
+export const PARTIAL_FILE_FAILURE_HEADLINE = '一部取得できませんでした';
+
+/** 収集フェーズがレート制限で打ち切られた場合の完了画面の見出し */
+export const RATE_LIMIT_EXHAUSTED_HEADLINE = 'レート制限のため途中で打ち切りました (取得できた分のみ保存しています)';
+
+export type CompleteMessageParams = {
+  /** 「ここまでで終了」による中断か (content script 側の AbortSignal 由来) */
+  aborted: boolean;
+  /** 収集フェーズで取得に失敗した投稿数 (投稿単位) */
+  failedPostCount: number;
+  /** 収集フェーズで取得に失敗した投稿一覧ページ数 (欠落した投稿数は不明) */
+  failedPageCount: number;
+  /** ZIP フェーズでの対象単位の最終失敗数。カバー画像含み、中断由来は含まない (DownloadZipResult.failedFileCount) */
+  failedFileCount: number;
+  /** 収集フェーズがレート制限で打ち切られた場合に 'rate-limit-exhausted' */
+  stoppedReason?: 'rate-limit-exhausted';
+};
+
+/**
+ * 完了画面に表示するメッセージを組み立てる (Issue #18 第 1 段階)。
+ *
+ * OverlayController.startCollecting から呼ばれる純粋関数として切り出している。DOM や
+ * collect()/downloadAsZip() の実行を伴わずに、失敗件数の組み合わせごとの分岐をそのまま
+ * ユニットテストできるようにするため。
+ *
+ * 優先順位: 中断 (PARTIAL_DOWNLOAD_MESSAGE、失敗があれば併記) > 収集フェーズの打ち切り
+ * (RATE_LIMIT_EXHAUSTED_HEADLINE) > ZIP フェーズのファイル欠落 (PARTIAL_FILE_FAILURE_HEADLINE)
+ * > 完全な成功 (COMPLETE_HEADLINE)。収集フェーズの失敗 (failedPostCount/failedPageCount) と
+ * ZIP フェーズの失敗 (failedFileCount) は同じ文言構成 (failedSuffix) に合流させ、矛盾する
+ * 表示にならないようにする。
+ */
+export function buildCompleteMessage(params: CompleteMessageParams): string {
+  if (params.aborted) {
+    const fileFailureNote =
+      params.failedFileCount > 0 ? `\n${params.failedFileCount} 件のファイル (カバー画像含む)の取得に失敗しました` : '';
+    return `${PARTIAL_DOWNLOAD_MESSAGE}${fileFailureNote}`;
+  }
+
+  // ページ単位の失敗は欠落した投稿数が分からないため、投稿単位の件数とは足し合わせない。
+  // ZIP フェーズのファイル欠落 (カバー画像含む) も同じ文言構成に合流させる
+  const failures = [
+    params.failedPostCount > 0 ? `${params.failedPostCount} 件の投稿` : '',
+    params.failedPageCount > 0 ? `${params.failedPageCount} ページ分の投稿一覧 (投稿数は不明)` : '',
+    params.failedFileCount > 0 ? `${params.failedFileCount} 件のファイル (カバー画像含む)` : '',
+  ].filter(Boolean);
+  const failedSuffix = failures.length
+    ? `\n${failures.join(' と ')}の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`
+    : '';
+  // 打ち切った場合もそこまでの分は保存済みなので、完了ではなく不完全と伝える。
+  // 収集フェーズの打ち切りが最優先、次に ZIP フェーズのファイル欠落、どちらも無ければ完了
+  const headline =
+    params.stoppedReason === 'rate-limit-exhausted'
+      ? RATE_LIMIT_EXHAUSTED_HEADLINE
+      : params.failedFileCount > 0
+        ? PARTIAL_FILE_FAILURE_HEADLINE
+        : COMPLETE_HEADLINE;
+  return `${headline}${failedSuffix}`;
+}
 
 export class OverlayController {
   private state: OverlayState = 'settings';
@@ -348,7 +413,11 @@ export class OverlayController {
       };
 
       const json = downloadObject.stringify();
-      await downloadAsZip(saveHandle, json, downloadProgress, signal);
+      const { zip } = await downloadAsZip(saveHandle, json, downloadProgress, signal);
+      // zip.failedFileCount はカバー画像を含む対象単位の最終失敗数 (download-helper v4.4.0 が
+      // 中断由来の欠落を除いて集計する)。試行単位の記録 (attempts) とは別物なので、
+      // ここでは対象単位の集計のみを完了画面に反映する
+      publishTestState({ 'failed-file-count': String(zip.failedFileCount) });
 
       // downloadZip は中断されても ZIP を閉じて正常に戻るため、ここで見ないと
       // 途中までの ZIP を「完了しました」と表示してしまう
@@ -362,28 +431,29 @@ export class OverlayController {
         // ここまで残っているのは「ここまでで終了」ボタンによる中断のみ (収集中の
         // キャンセルは renderCollecting() のボタンが hidePanel() を伴って
         // 即座に全破棄するため、この分岐に到達する前に上の signal !== ... で弾かれる)。
-        // 全投稿を書き終えた直後に押された場合は ZIP が実際には完全な可能性もあるため、
-        // 完了・部分保存のどちらでも成り立つ文言にする。
         this.setState('complete');
-        this.renderComplete(PARTIAL_DOWNLOAD_MESSAGE);
+        this.renderComplete(
+          buildCompleteMessage({
+            aborted: true,
+            failedPostCount,
+            failedPageCount,
+            failedFileCount: zip.failedFileCount,
+            stoppedReason,
+          }),
+        );
         return;
       }
 
       this.setState('complete');
-      // ページ単位の失敗は欠落した投稿数が分からないため、投稿単位の件数とは足し合わせない
-      const failures = [
-        failedPostCount > 0 ? `${failedPostCount} 件の投稿` : '',
-        failedPageCount > 0 ? `${failedPageCount} ページ分の投稿一覧 (投稿数は不明)` : '',
-      ].filter(Boolean);
-      const failedSuffix = failures.length
-        ? `\n${failures.join(' と ')}の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`
-        : '';
-      // 打ち切った場合もそこまでの分は保存済みなので、完了ではなく不完全と伝える
-      const headline =
-        stoppedReason === 'rate-limit-exhausted'
-          ? 'レート制限のため途中で打ち切りました (取得できた分のみ保存しています)'
-          : 'ダウンロードが完了しました';
-      this.renderComplete(`${headline}${failedSuffix}`);
+      this.renderComplete(
+        buildCompleteMessage({
+          aborted: false,
+          failedPostCount,
+          failedPageCount,
+          failedFileCount: zip.failedFileCount,
+          stoppedReason,
+        }),
+      );
     } catch (e) {
       if (signal.aborted) {
         this.publishAbortedIfCurrent(signal);

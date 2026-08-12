@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import type { DownloadProgress, FileSystemFileHandle } from '../src/content/downloader';
-import { downloadAsZip } from '../src/content/downloader';
+import type { DownloadProgress, FileSystemFileHandle, MediaFetchAttempt } from '../src/content/downloader';
+import { downloadAsZip, fetchWithRetry } from '../src/content/downloader';
 
 // ZipWriter が書き込む先のモック。write() で渡る Uint8Array を蓄積する。
 class MockWritableStream {
@@ -311,5 +311,134 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
     for (const path of ['u/p/cover.png', 'u/p/f.bin']) {
       expect(entryByName(entries, path).utMtime).toBe(expectedUnix);
     }
+  });
+});
+
+/**
+ * Issue #18 第 1 段階: fetchWithRetry の試行単位の観測記録のテスト。
+ * downloadAsZip 経由の JSON 往復を挟まず、fetchWithRetry を直接呼んで検証する
+ * (test/service-worker/handlers.test.ts が handleFetchApi を直接呼ぶのと同じ理由)。
+ */
+describe('fetchWithRetry の試行記録 (Issue #18)', () => {
+  // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+  const origChrome = (globalThis as any).chrome;
+  const origSetTimeout = globalThis.setTimeout;
+  const origConsoleInfo = console.info;
+
+  afterEach(() => {
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = origChrome;
+    globalThis.setTimeout = origSetTimeout;
+    console.info = origConsoleInfo;
+  });
+
+  test('初回 429 → 再試行 200 で成功しても、初回の 429 が試行記録に残る', async () => {
+    // fetchWithRetry の再試行間には 1 秒の固定待機 (utils.sleep) があるため、
+    // setTimeout を即時実行に置換して仮想時間で進める (test/fanbox/api.test.ts と同じ手法)
+    globalThis.setTimeout = ((handler: TimerHandler) =>
+      origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
+
+    let calls = 0;
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async (message: { type: string; url: string }) => {
+          calls++;
+          if (message.type !== 'fetch') throw new Error(`unexpected message type: ${message.type}`);
+          if (calls === 1) return { ok: false, status: 429, retryAfter: '3' };
+          return { ok: true, status: 200, retryAfter: null, data: btoa('ok') };
+        },
+      },
+    };
+    const loggedAttempts: unknown[] = [];
+    console.info = ((...args: unknown[]) => loggedAttempts.push(args[0])) as typeof console.info;
+
+    const attempts: MediaFetchAttempt[] = [];
+    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, undefined, 'file', attempts);
+
+    expect(blob).not.toBeNull();
+    expect(calls).toBe(2);
+    // 対象単位では最終的に成功しているが、試行記録には初回の 429 も残る
+    expect(attempts.map((a) => a.status)).toEqual([429, 200]);
+    expect(attempts[0].kind).toBe('file');
+    expect(attempts[0].host).toBe('downloads.fanbox.cc');
+    expect(attempts[0].retryAfter).toBe('3');
+    expect(attempts[1].retryAfter).toBeNull();
+    // 試行ごとに console.info へ単一オブジェクトとして構造化ログを出す
+    expect(loggedAttempts).toEqual(attempts);
+  });
+
+  test('通信失敗 (service worker が status:0 を返す) は 2 回とも status 0 で記録され、最終的に blob は null', async () => {
+    globalThis.setTimeout = ((handler: TimerHandler) =>
+      origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
+
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async () => ({ ok: false, status: 0, retryAfter: null, error: 'network down' }),
+      },
+    };
+
+    const attempts: MediaFetchAttempt[] = [];
+    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, undefined, 'cover', attempts);
+
+    expect(blob).toBeNull();
+    expect(attempts.length).toBe(2);
+    expect(attempts.every((a) => a.status === 0)).toBe(true);
+    expect(attempts.every((a) => a.kind === 'cover')).toBe(true);
+  });
+
+  test('中断による打ち切りは失敗として記録されない (1 回目の応答後に中断すると 2 回目は試行されない)', async () => {
+    let calls = 0;
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async () => {
+          calls++;
+          return { ok: false, status: 429, retryAfter: '3' };
+        },
+      },
+    };
+
+    const controller = new AbortController();
+    const attempts: MediaFetchAttempt[] = [];
+    // 1 回目の試行が観測された直後 (attempts.push の瞬間) に中断させることで、
+    // 「応答を受け取れた試行は記録されるが、中断により見送られた 2 回目は記録されない」を
+    // タイミング競合なしに検証する
+    const originalPush = attempts.push.bind(attempts);
+    attempts.push = ((...items: MediaFetchAttempt[]) => {
+      const result = originalPush(...items);
+      controller.abort();
+      return result;
+    }) as typeof attempts.push;
+
+    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, controller.signal, 'file', attempts);
+
+    expect(blob).toBeNull();
+    expect(calls).toBe(1);
+    expect(attempts.length).toBe(1);
+    expect(attempts[0].status).toBe(429);
+  });
+
+  test('呼び出し前から中断済みなら 1 回も試行せず、記録も残らない', async () => {
+    let calls = 0;
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async () => {
+          calls++;
+          return { ok: true, status: 200, retryAfter: null, data: btoa('ok') };
+        },
+      },
+    };
+    const controller = new AbortController();
+    controller.abort();
+    const attempts: MediaFetchAttempt[] = [];
+
+    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, controller.signal, 'file', attempts);
+
+    expect(blob).toBeNull();
+    expect(calls).toBe(0);
+    expect(attempts.length).toBe(0);
   });
 });
