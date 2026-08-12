@@ -35,9 +35,18 @@ description: 実 FANBOX (https://www.fanbox.cc/) を相手に拡張を実ブラ�
 ## 拡張の操作レシピ
 
 1. 対象クリエイターのページ (`https://www.fanbox.cc/@<creatorId>` または `<creatorId>.fanbox.cc`) を開く
-2. 拡張の FAB ボタン (画面右下 `bottom: 24px; right: 24px` に固定表示、`src/content/fab.ts`) をクリックする。通常ビルドの shadow root は closed のため DOM セレクタでは shadow 内に届かない。スクリーンショットを撮って座標クリックするか、accessibility snapshot にボタンが出ていればそれを使う
-3. overlay パネルで収集対象を最小限 (1〜2 投稿) に設定して実行し、進行は overlay の表示で確認する
-4. 保存ステップ (`showSaveFilePicker`, `src/content/downloader.ts:69`) はネイティブのファイル保存ダイアログを要求するため、headless では完走できない可能性が高い (未検証)。headless での確認は収集完了までを責務範囲とし、保存まで確認したい場合は headed で行う
+2. 拡張の FAB ボタン (画面右下 `bottom: 24px; right: 24px` に固定表示、`src/content/fab.ts`) をクリックする。通常ビルドの shadow root は closed のため DOM セレクタでは shadow 内に届かない。closed shadow root でも accessibility tree には露出するため、`take_snapshot` を撮ると FAB は `button "⬇" description="FANBOX Downloader"` として uid 付きで現れる。この uid をクリックするのが最も安定する (スクリーンショットからの座標クリックでもよい)
+3. overlay パネルで収集対象を最小限に設定して実行し、進行は overlay の表示で確認する
+   - 「取得件数上限」は「`addByPostInfo` が `'added'` を返した投稿の件数」の上限であり、試行回数の上限ではない (`DownloadManage.decrementLimit` は登録成功時のみ減算する)。支援していないクリエイターでは投稿がほぼ登録できず上限に到達しないため、上限 1 に設定しても全投稿分の `post.info` を発行する。実 API への負荷を最小化したいなら、自分が支援していて数投稿だけ登録できるクリエイターを選ぶか、投稿数の少ないクリエイターを選ぶ
+4. 保存ステップ (`showSaveFilePicker`, `src/content/downloader.ts:69`) はネイティブのファイル保存ダイアログを要求するため、headless では完走できない。実測では headless Chromium の `showSaveFilePicker` は即座に `AbortError` を投げる。かつこのハンドル取得は収集より前 (ダウンロード開始直後のユーザジェスチャー中) に呼ばれるため、通常ビルドの headless では収集自体が始まらずオーバーレイが settings のまま留まる。保存まで確認したい場合は headed で行う
+
+### headless で収集フローを観測したい場合はテストビルドを使う
+
+通常ビルドの headless では上記のとおり picker が収集前に abort するため、実 API を相手にした収集・メディア取得・完了画面の分岐を観測できない。これらを headless で観測したいときはテストビルド (`__FBDL_TEST__=true`) を一時的に `dist/` へ置く。
+
+- テストビルドは (a) shadow root を `open` にする (b) `showSaveFilePicker` をインメモリ stub に差し替える (c) `document.documentElement` に `data-fbdl-*` 属性で状態を publish する。ネットワークは stub されないため実 FANBOX API を叩く点は通常ビルドと同じ
+- 手順: `bun run build:test` → `dist/` を退避して `dist-test/` の内容を `dist/` にコピー → ランチャー起動。観測後は `rm -rf dist && bun run build` で通常ビルドを再生成して必ず戻す (`dist/` は git 管理外なので commit には影響しないが、次回の通常テストのために戻す)
+- open shadow root なので `document.getElementById('fanbox-downloader-ext-fab').shadowRoot` / `...-overlay').shadowRoot` から DOM を直接操作・観測できる。最終結果は `data-fbdl-overlay-state` / `data-fbdl-added-post-count` / `data-fbdl-unavailable-post-count` / `data-fbdl-unsupported-post-count` / `data-fbdl-api-failed-post-count` / `data-fbdl-failed-page-count` / `data-fbdl-zip-done` などで読める (`data-fbdl-zip-done` が付かなければ ZIP は保存されていない)
 
 ## 診断 (CDP が応答しない・操作できない場合)
 
