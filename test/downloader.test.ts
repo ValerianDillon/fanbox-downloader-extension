@@ -503,4 +503,34 @@ describe('fetchWithRetry の試行記録 (Issue #18)', () => {
     expect(calls).toBe(0);
     expect(attempts.length).toBe(0);
   });
+
+  test('旧応答形状 { ok, data } (status/retryAfter 欠損) を受けても attempts は正規化される (status:0, retryAfter:null)', async () => {
+    // 拡張の更新中は世代の異なる content script / service worker が併存しうるため、
+    // 旧形状の応答 (status/retryAfter を持たない) を受け取ってもクラッシュせず、
+    // MediaFetchAttempt の契約 (status 欠損は 0、retryAfter は null) を守ることを確認する
+    globalThis.setTimeout = ((handler: TimerHandler) =>
+      origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
+
+    let calls = 0;
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async () => {
+          calls++;
+          // 旧形状: 失敗時は ok:false のみ (data すら無い)、成功時は ok:true + data のみ
+          if (calls === 1) return { ok: false };
+          return { ok: true, data: btoa('ok') };
+        },
+      },
+    };
+
+    const attempts: MediaFetchAttempt[] = [];
+    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, undefined, 'file', attempts);
+
+    expect(blob).not.toBeNull();
+    expect(calls).toBe(2);
+    expect(attempts.length).toBe(2);
+    expect(attempts.every((a) => a.status === 0)).toBe(true);
+    expect(attempts.every((a) => a.retryAfter === null)).toBe(true);
+  });
 });

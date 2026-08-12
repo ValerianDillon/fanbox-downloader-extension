@@ -75,8 +75,14 @@ async function proxyFetch(url: string, signal?: AbortSignal): Promise<ProxyFetch
     console.error(`proxyFetch エラー (メッセージング): ${url}`, e);
     return { blob: null, status: 0, retryAfter: null };
   }
+  // 応答の正規化: 拡張の更新中は世代の異なる content script / service worker が併存しうるため、
+  // 旧応答形状 ({ ok, data } のみで status/retryAfter を持たない) や欠損フィールドを受け取る
+  // 可能性がある。実行時の値を信頼せず、MediaFetchAttempt の契約 (status 欠損は 0、
+  // retryAfter は文字列でなければ null) をここで保証してから先へ渡す。
+  const status = Number.isFinite(response.status) ? response.status : 0;
+  const retryAfter = typeof response.retryAfter === 'string' ? response.retryAfter : null;
   if (!response.ok || !response.data) {
-    return { blob: null, status: response.status, retryAfter: response.retryAfter };
+    return { blob: null, status, retryAfter };
   }
   try {
     const binary = atob(response.data);
@@ -84,10 +90,10 @@ async function proxyFetch(url: string, signal?: AbortSignal): Promise<ProxyFetch
     for (let i = 0; i < binary.length; i++) {
       bytes[i] = binary.charCodeAt(i);
     }
-    return { blob: new Blob([bytes]), status: response.status, retryAfter: response.retryAfter };
+    return { blob: new Blob([bytes]), status, retryAfter };
   } catch (e) {
     console.error(`proxyFetch エラー (デコード): ${url}`, e);
-    return { blob: null, status: response.status, retryAfter: response.retryAfter };
+    return { blob: null, status, retryAfter };
   }
 }
 
