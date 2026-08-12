@@ -271,14 +271,15 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
     (globalThis as any).chrome = origChrome;
   });
 
-  test('cover と file の LFH の UT extra Mtime が publishedDatetime と一致', async () => {
+  test('cover と file の LFH の UT extra Mtime が publishedDatetime と一致し、戻り値 (zip/attempts) も正しく埋まる', async () => {
     const data = btoa(String.fromCharCode(0x89, 0x50, 0x4e, 0x47));
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = {
       runtime: {
         sendMessage: async (message: { type: string; url: string }) => {
           if (message.type !== 'fetch') throw new Error(`unexpected message type: ${message.type}`);
-          return { ok: true, data };
+          // 新応答形状 (status/retryAfter を含む) を模す
+          return { ok: true, status: 200, retryAfter: null, data };
         },
       },
     };
@@ -305,11 +306,72 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
       ],
     });
     const { handle, mock } = makeHandle();
-    await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
+    const { zip, attempts } = await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
 
     const entries = parseLocalEntries(mock.toBuffer());
     for (const path of ['u/p/cover.png', 'u/p/f.bin']) {
       expect(entryByName(entries, path).utMtime).toBe(expectedUnix);
+    }
+
+    // 対象単位の集計 (DownloadZipResult): カバー + ファイルの 2 件とも成功
+    expect(zip.failedFileCount).toBe(0);
+    expect(zip.writtenFileCount).toBe(2);
+    expect(zip.completedPostCount).toBe(1);
+    expect(zip.totalPostCount).toBe(1);
+    expect(zip.aborted).toBe(false);
+
+    // 試行単位の記録: cover 用・file 用それぞれ 1 回ずつ、応答のステータス/Retry-After が反映されている
+    expect(attempts.length).toBe(2);
+    expect(attempts.every((a) => a.status === 200 && a.retryAfter === null && a.host === 'example.test')).toBe(true);
+    // context.kind (download-helper から渡される取得対象の種別) が正しく attempts に伝わっている
+    expect(attempts.map((a) => a.kind).sort()).toEqual(['cover', 'file']);
+  });
+
+  test('取得に 2 回とも失敗 (429) すると zip.failedFileCount に反映され、attempts にも 2 回分の 429 が残る', async () => {
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async (message: { type: string; url: string }) => {
+          if (message.type !== 'fetch') throw new Error(`unexpected message type: ${message.type}`);
+          return { ok: false, status: 429, retryAfter: '3' };
+        },
+      },
+    };
+    const origSetTimeout = globalThis.setTimeout;
+    // fetchWithRetry の再試行間の 1 秒待機を仮想時間で進める
+    globalThis.setTimeout = ((handler: TimerHandler) =>
+      origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
+
+    try {
+      const json = JSON.stringify({
+        id: 'u',
+        url: '#main',
+        tags: [],
+        postCount: 1,
+        fileCount: 1,
+        posts: [
+          {
+            originalName: 'p',
+            encodedName: 'p',
+            informationText: '{}',
+            htmlText: '<p></p>',
+            files: [{ url: 'https://example.test/f', originalName: 'f.bin', encodedName: 'f.bin' }],
+            tags: [],
+          },
+        ],
+      });
+      const { handle } = makeHandle();
+      const { zip, attempts } = await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
+
+      expect(zip.failedFileCount).toBe(1);
+      expect(zip.writtenFileCount).toBe(0);
+      expect(zip.aborted).toBe(false);
+
+      // 1 対象最大 2 試行なので、429 が 2 回とも記録に残る
+      expect(attempts.length).toBe(2);
+      expect(attempts.every((a) => a.status === 429 && a.retryAfter === '3' && a.kind === 'file')).toBe(true);
+    } finally {
+      globalThis.setTimeout = origSetTimeout;
     }
   });
 });

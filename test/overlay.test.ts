@@ -165,22 +165,50 @@ describe('Issue #18: 完了画面の分岐 (buildCompleteMessage)', () => {
 
   test('中断かつ ZIP フェーズの失敗がある場合、PARTIAL_DOWNLOAD_MESSAGE を維持しつつ件数を併記する', () => {
     const message = buildCompleteMessage({ ...base, aborted: true, failedFileCount: 4 });
-    expect(message).toBe(`${PARTIAL_DOWNLOAD_MESSAGE}\n4 件のファイル (カバー画像含む)の取得に失敗しました`);
-    // 中断時の併記は「支援プランの範囲外か、FANBOX のレート制限の可能性があります」の
-    // 断定的な理由付けを含めない (中断は取得失敗ではなくユーザ操作によるものであるため)
-    expect(message).not.toContain('レート制限の可能性');
+    expect(message).toBe(
+      `${PARTIAL_DOWNLOAD_MESSAGE}\n4 件のファイル (カバー画像含む)の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`,
+    );
   });
 
-  test('中断時は収集フェーズの失敗件数 (failedPostCount/failedPageCount) を見ない (中断前に収集は完了済みのため無関係)', () => {
-    // startCollecting の実装上、この分岐に来るのは downloadAsZip の中断のみで、
-    // 収集フェーズはその前に正常終了しているが、万一 failedPostCount 等が非ゼロで
-    // 渡されても PARTIAL_DOWNLOAD_MESSAGE の文言を汚さないことを確認する
+  // collect() は failedPostCount/failedPageCount があっても打ち切らず ZIP フェーズへ進むため、
+  // 「中断時は収集フェーズの失敗が無い」という前提は成り立たない。ZIP フェーズだけを中断しても
+  // 収集フェーズの失敗は消えないので、PARTIAL_DOWNLOAD_MESSAGE に併記する
+  test('中断時も収集フェーズの失敗件数 (failedPostCount/failedPageCount) を併記する', () => {
     const message = buildCompleteMessage({
       aborted: true,
       failedPostCount: 9,
-      failedPageCount: 9,
+      failedPageCount: 3,
       failedFileCount: 0,
     });
-    expect(message).toBe(PARTIAL_DOWNLOAD_MESSAGE);
+    expect(message).toBe(
+      `${PARTIAL_DOWNLOAD_MESSAGE}\n9 件の投稿 と 3 ページ分の投稿一覧 (投稿数は不明)の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`,
+    );
+  });
+
+  // 収集フェーズの打ち切り (stoppedReason) は、その後 ZIP フェーズで「ここまでで終了」が
+  // 押されて中断したかどうかに関わらず最優先の見出しになる (非中断時と同じ見出し)。
+  test('収集フェーズの打ち切り (stoppedReason) は ZIP フェーズの中断より優先される (見出しは非中断時と同じ)', () => {
+    const message = buildCompleteMessage({
+      ...base,
+      aborted: true,
+      stoppedReason: 'rate-limit-exhausted',
+    });
+    // 見出しは打ち切りが勝つが、ZIP フェーズも中断したという事実は落とさず本文に併記する
+    expect(message).toBe(`${RATE_LIMIT_EXHAUSTED_HEADLINE}\n${PARTIAL_DOWNLOAD_MESSAGE}`);
+  });
+
+  test('収集フェーズの打ち切りと ZIP フェーズの中断が両方あり、かつ各フェーズの失敗もある場合、すべて併記する', () => {
+    const message = buildCompleteMessage({
+      aborted: true,
+      failedPostCount: 1,
+      failedPageCount: 2,
+      failedFileCount: 3,
+      stoppedReason: 'rate-limit-exhausted',
+    });
+    expect(message).toBe(
+      `${RATE_LIMIT_EXHAUSTED_HEADLINE}\n${PARTIAL_DOWNLOAD_MESSAGE}\n` +
+        '1 件の投稿 と 2 ページ分の投稿一覧 (投稿数は不明) と 3 件のファイル (カバー画像含む)' +
+        'の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)',
+    );
   });
 });

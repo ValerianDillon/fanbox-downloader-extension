@@ -262,4 +262,23 @@ describe('handleFetchMedia', () => {
     expect(res.retryAfter).toBeNull();
     expect(res.error).toContain('network down');
   });
+
+  test('本文読み込み (r.arrayBuffer()) が失敗しても、観測済みの status/retryAfter は status:0 にすり替えない', async () => {
+    // HTTP 応答自体は 200 で受け取れている (未到達の通信失敗ではない) ので、
+    // status: 0 は「fetch() 自体が届かなかった」ことを意味しなくなり、観測結果と矛盾する
+    globalThis.fetch = (async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'Retry-After': '7' }),
+      arrayBuffer: async () => {
+        throw new Error('body read failed');
+      },
+    })) as unknown as typeof fetch;
+    const res = await handleFetchMedia('https://downloads.fanbox.cc/f');
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(200);
+    expect(res.retryAfter).toBe('7');
+    expect(res.data).toBeUndefined();
+    expect(res.error).toContain('body read failed');
+  });
 });

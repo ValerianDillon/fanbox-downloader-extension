@@ -49,19 +49,22 @@ export type CompleteMessageParams = {
  * collect()/downloadAsZip() の実行を伴わずに、失敗件数の組み合わせごとの分岐をそのまま
  * ユニットテストできるようにするため。
  *
- * 優先順位: 中断 (PARTIAL_DOWNLOAD_MESSAGE、失敗があれば併記) > 収集フェーズの打ち切り
- * (RATE_LIMIT_EXHAUSTED_HEADLINE) > ZIP フェーズのファイル欠落 (PARTIAL_FILE_FAILURE_HEADLINE)
- * > 完全な成功 (COMPLETE_HEADLINE)。収集フェーズの失敗 (failedPostCount/failedPageCount) と
- * ZIP フェーズの失敗 (failedFileCount) は同じ文言構成 (failedSuffix) に合流させ、矛盾する
- * 表示にならないようにする。
+ * collect() は failedPostCount/failedPageCount があっても打ち切らず ZIP フェーズへ進むため、
+ * 「aborted (ZIP フェーズの中断) なら収集フェーズの失敗は無い」という前提は成り立たない。
+ * そのため failedPostCount/failedPageCount/failedFileCount の併記は aborted の有無に関わらず行う。
+ *
+ * 見出しの優先順位:
+ * 1. 収集フェーズの打ち切り (stoppedReason === 'rate-limit-exhausted'): RATE_LIMIT_EXHAUSTED_HEADLINE。
+ *    aborted かどうかに関わらず最優先 (非中断時と同じ見出し)。ZIP フェーズも中断していた場合は、
+ *    その事実 (PARTIAL_DOWNLOAD_MESSAGE) を本文で併記する
+ * 2. 単純な中断 (収集フェーズは打ち切りなく完了、ZIP フェーズのみ「ここまでで終了」): PARTIAL_DOWNLOAD_MESSAGE
+ * 3. ZIP フェーズのファイル欠落のみ: PARTIAL_FILE_FAILURE_HEADLINE
+ * 4. 何も無ければ COMPLETE_HEADLINE
+ *
+ * 収集フェーズの失敗 (failedPostCount/failedPageCount) と ZIP フェーズの失敗 (failedFileCount) は
+ * どの見出しでも同じ文言構成 (failedSuffix) に合流させ、矛盾する表示にならないようにする。
  */
 export function buildCompleteMessage(params: CompleteMessageParams): string {
-  if (params.aborted) {
-    const fileFailureNote =
-      params.failedFileCount > 0 ? `\n${params.failedFileCount} 件のファイル (カバー画像含む)の取得に失敗しました` : '';
-    return `${PARTIAL_DOWNLOAD_MESSAGE}${fileFailureNote}`;
-  }
-
   // ページ単位の失敗は欠落した投稿数が分からないため、投稿単位の件数とは足し合わせない。
   // ZIP フェーズのファイル欠落 (カバー画像含む) も同じ文言構成に合流させる
   const failures = [
@@ -72,14 +75,15 @@ export function buildCompleteMessage(params: CompleteMessageParams): string {
   const failedSuffix = failures.length
     ? `\n${failures.join(' と ')}の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`
     : '';
-  // 打ち切った場合もそこまでの分は保存済みなので、完了ではなく不完全と伝える。
-  // 収集フェーズの打ち切りが最優先、次に ZIP フェーズのファイル欠落、どちらも無ければ完了
-  const headline =
-    params.stoppedReason === 'rate-limit-exhausted'
-      ? RATE_LIMIT_EXHAUSTED_HEADLINE
-      : params.failedFileCount > 0
-        ? PARTIAL_FILE_FAILURE_HEADLINE
-        : COMPLETE_HEADLINE;
+
+  if (params.stoppedReason === 'rate-limit-exhausted') {
+    const abortedNote = params.aborted ? `\n${PARTIAL_DOWNLOAD_MESSAGE}` : '';
+    return `${RATE_LIMIT_EXHAUSTED_HEADLINE}${abortedNote}${failedSuffix}`;
+  }
+  if (params.aborted) {
+    return `${PARTIAL_DOWNLOAD_MESSAGE}${failedSuffix}`;
+  }
+  const headline = params.failedFileCount > 0 ? PARTIAL_FILE_FAILURE_HEADLINE : COMPLETE_HEADLINE;
   return `${headline}${failedSuffix}`;
 }
 
