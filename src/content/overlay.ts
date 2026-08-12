@@ -1,8 +1,8 @@
 import type { DownloadProgress, FileSystemFileHandle } from './downloader';
 import { downloadAsZip, pickSaveHandle } from './downloader';
-import type { PageType } from './fanbox/api';
-import type { CollectorSettings } from './fanbox/collector';
-import { collect } from './fanbox/collector';
+import { ApiShapeError, type PageType } from './fanbox/api';
+import type { CollectorSettings, PostFailureCounts } from './fanbox/collector';
+import { collect, PostBodyInvalidError } from './fanbox/collector';
 import css from './overlay.css' with { type: 'text' };
 import { publishTestState, resetTestState, SHADOW_ROOT_MODE } from './test-hooks';
 
@@ -23,17 +23,49 @@ export const PARTIAL_DOWNLOAD_MESSAGE = 'ここまでの内容を保存して終
 /** 失敗ゼロ・非中断の完了画面の見出し */
 export const COMPLETE_HEADLINE = 'ダウンロードが完了しました';
 
-/** ZIP フェーズでのファイル欠落 (カバー画像含む) があった、非中断の完了画面の見出し (Issue #18 第 1 段階) */
+/**
+ * 収集フェーズ (postFailures / failedPageCount) または ZIP フェーズ (failedFileCount) の
+ * いずれかに欠落があった、非中断の完了画面の見出し (Issue #18 第 1 段階。Issue #14 で
+ * 条件を ZIP フェーズのファイル欠落のみから収集フェーズの欠落も含める形に拡張した —
+ * 拡張前は収集フェーズの欠落だけがあっても見出しが COMPLETE_HEADLINE のままで、
+ * 本文に併記される欠落の詳細行と矛盾していた)。
+ */
 export const PARTIAL_FILE_FAILURE_HEADLINE = '一部取得できませんでした';
 
 /** 収集フェーズがレート制限で打ち切られた場合の完了画面の見出し */
 export const RATE_LIMIT_EXHAUSTED_HEADLINE = 'レート制限のため途中で打ち切りました (取得できた分のみ保存しています)';
 
+/**
+ * addByPostInfo が 'added' を返した投稿が 0 件だった場合の完了画面の見出し (Issue #14)。
+ *
+ * この場合 ZIP を保存しない (startCollecting 側で downloadAsZip 自体を呼ばない)。
+ * showSaveFilePicker は「ダウンロード開始」直後に既にハンドルを確保済み (ジェスチャー失効対策)
+ * のため、ファイル自体は既に (0 バイトで) 作成されている。書き込みを一切行わないことで
+ * その 0 バイトのまま残す。ハンドルからは新規作成か上書き対象の既存ファイルかを区別できず、
+ * 無条件に削除すると利用者が残したいファイルを消しかねないため、削除は行わない
+ * (Issue #17 の「showSaveFilePicker が返る前に空ファイルを作る」と同じ理由・同じ結論)。
+ */
+export const NOTHING_SAVED_HEADLINE = '保存できる投稿がなかったため ZIP を保存しませんでした';
+
+/**
+ * 収集が「未対応のレスポンス形式」(ApiShapeError または PostBodyInvalidError) で
+ * 中断した場合の完了画面の見出し (Issue #14)。
+ *
+ * この場合 collect() が例外を投げるため CompleteMessageParams を経由せず、
+ * OverlayController.startCollecting の catch から直接この見出しで complete 状態に遷移する。
+ */
+export const UNSUPPORTED_RESPONSE_HEADLINE = '未対応のレスポンス形式のため中断しました';
+
 export type CompleteMessageParams = {
   /** 「ここまでで終了」による中断か (content script 側の AbortSignal 由来) */
   aborted: boolean;
-  /** 収集フェーズで取得に失敗した投稿数 (投稿単位) */
-  failedPostCount: number;
+  /**
+   * addByPostInfo が 'added' を返した件数。0 なら他の値に関わらず NOTHING_SAVED_HEADLINE を
+   * 最優先で返す (ZIP を保存していないので、それ以外の見出しは事実と矛盾する)。
+   */
+  addedPostCount: number;
+  /** 収集フェーズで取得できなかった投稿の内訳 (理由別)。表示文言は PostFailureCounts 参照 */
+  postFailures: PostFailureCounts;
   /** 収集フェーズで取得に失敗した投稿一覧ページ数 (欠落した投稿数は不明) */
   failedPageCount: number;
   /** ZIP フェーズでの対象単位の最終失敗数。カバー画像含み、中断由来は含まない (DownloadZipResult.failedFileCount) */
@@ -43,39 +75,76 @@ export type CompleteMessageParams = {
 };
 
 /**
- * 完了画面に表示するメッセージを組み立てる (Issue #18 第 1 段階)。
+ * 収集・ZIP 両フェーズの失敗を、理由ごとに独立した行として列挙する (Issue #14)。
+ *
+ * 従来は 1 文に "と" で連結し、まとめて「支援プランの範囲外か、FANBOX のレート制限の
+ * 可能性があります」という理由を付けていたが、これは理由を混ぜて断定していた。
+ * 観測できた事実 (どの段階の何件が失敗したか) と理由の推測を、カテゴリごとに分けて出す。
+ */
+function buildFailureLines(params: CompleteMessageParams): string[] {
+  const lines: string[] = [];
+  if (params.postFailures.unavailable > 0) {
+    lines.push(
+      `本文を利用できなかった投稿: ${params.postFailures.unavailable} 件 (閲覧権限または支援プランの範囲外など)`,
+    );
+  }
+  if (params.postFailures.unsupported > 0) {
+    lines.push(`未対応の本文形式: ${params.postFailures.unsupported} 件 (拡張機能の更新が必要な可能性があります)`);
+  }
+  if (params.postFailures.apiFailed > 0) {
+    lines.push(`API 通信に失敗した投稿: ${params.postFailures.apiFailed} 件 (時間を置いて再試行してください)`);
+  }
+  if (params.failedPageCount > 0) {
+    lines.push(`取得できなかった一覧ページ: ${params.failedPageCount} ページ (欠落した投稿数は不明)`);
+  }
+  if (params.failedFileCount > 0) {
+    // ZIP フェーズのファイル欠落 (Issue #18) は Issue #14 の分類の対象外だが、
+    // 表示形式を揃えるため同じ「理由ごとに独立した行」に合流させる。
+    // failedFileCount はカバー画像・添付ファイルを合わせた「ファイル数」の集計
+    // (DownloadZipResult.failedFileCount) であり投稿数ではないため、1 投稿から
+    // 複数ファイルが失敗した場合と数が食い違わないよう「投稿」ではなく「ファイル」と表記する
+    lines.push(
+      `取得できなかったファイル: ${params.failedFileCount} 件 (カバー画像含む。時間を置いて再試行してください)`,
+    );
+  }
+  return lines;
+}
+
+/**
+ * 完了画面に表示するメッセージを組み立てる (Issue #18 第 1 段階、Issue #14 で拡張)。
  *
  * OverlayController.startCollecting から呼ばれる純粋関数として切り出している。DOM や
  * collect()/downloadAsZip() の実行を伴わずに、失敗件数の組み合わせごとの分岐をそのまま
  * ユニットテストできるようにするため。
  *
- * collect() は failedPostCount/failedPageCount があっても打ち切らず ZIP フェーズへ進むため、
+ * collect() は postFailures/failedPageCount があっても打ち切らず ZIP フェーズへ進むため、
  * 「aborted (ZIP フェーズの中断) なら収集フェーズの失敗は無い」という前提は成り立たない。
- * そのため failedPostCount/failedPageCount/failedFileCount の併記は aborted の有無に関わらず行う。
+ * そのため収集フェーズ/ZIP フェーズの失敗の併記は aborted の有無に関わらず行う。
  *
  * 見出しの優先順位:
- * 1. 収集フェーズの打ち切り (stoppedReason === 'rate-limit-exhausted'): RATE_LIMIT_EXHAUSTED_HEADLINE。
+ * 1. addedPostCount === 0: NOTHING_SAVED_HEADLINE。ZIP を保存していない事実が最優先
+ *    (addedPostCount === 0 かつ stoppedReason が同時に立つことは無い — collector.ts が
+ *    その場合は打ち切りに変換せず例外にするため。念のため他の分岐より先に判定する)
+ * 2. 収集フェーズの打ち切り (stoppedReason === 'rate-limit-exhausted'): RATE_LIMIT_EXHAUSTED_HEADLINE。
  *    aborted かどうかに関わらず最優先 (非中断時と同じ見出し)。ZIP フェーズも中断していた場合は、
  *    その事実 (PARTIAL_DOWNLOAD_MESSAGE) を本文で併記する
- * 2. 単純な中断 (収集フェーズは打ち切りなく完了、ZIP フェーズのみ「ここまでで終了」): PARTIAL_DOWNLOAD_MESSAGE
- * 3. ZIP フェーズのファイル欠落のみ: PARTIAL_FILE_FAILURE_HEADLINE
- * 4. 何も無ければ COMPLETE_HEADLINE
+ * 3. 単純な中断 (収集フェーズは打ち切りなく完了、ZIP フェーズのみ「ここまでで終了」): PARTIAL_DOWNLOAD_MESSAGE
+ * 4. 収集フェーズ (postFailures/failedPageCount) または ZIP フェーズ (failedFileCount) の
+ *    いずれかに欠落があれば: PARTIAL_FILE_FAILURE_HEADLINE (buildFailureLines が 1 行でも
+ *    出力される場合と同値。本文の詳細行と見出しが矛盾しないようにする)
+ * 5. 何も無ければ COMPLETE_HEADLINE
  *
- * 収集フェーズの失敗 (failedPostCount/failedPageCount) と ZIP フェーズの失敗 (failedFileCount) は
- * どの見出しでも同じ文言構成 (failedSuffix) に合流させ、矛盾する表示にならないようにする。
+ * 「未対応のレスポンス形式のため中断しました」(UNSUPPORTED_RESPONSE_HEADLINE) はここには
+ * 含まれない。collect() が例外を投げて CollectResult 自体を返さないケースなので、
+ * OverlayController.startCollecting の catch から別経路で表示する。
  */
 export function buildCompleteMessage(params: CompleteMessageParams): string {
-  // ページ単位の失敗は欠落した投稿数が分からないため、投稿単位の件数とは足し合わせない。
-  // ZIP フェーズのファイル欠落 (カバー画像含む) も同じ文言構成に合流させる
-  const failures = [
-    params.failedPostCount > 0 ? `${params.failedPostCount} 件の投稿` : '',
-    params.failedPageCount > 0 ? `${params.failedPageCount} ページ分の投稿一覧 (投稿数は不明)` : '',
-    params.failedFileCount > 0 ? `${params.failedFileCount} 件のファイル (カバー画像含む)` : '',
-  ].filter(Boolean);
-  const failedSuffix = failures.length
-    ? `\n${failures.join(' と ')}の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`
-    : '';
+  const failureLines = buildFailureLines(params);
+  const failedSuffix = failureLines.length ? `\n${failureLines.join('\n')}` : '';
 
+  if (params.addedPostCount === 0) {
+    return `${NOTHING_SAVED_HEADLINE}${failedSuffix}`;
+  }
   if (params.stoppedReason === 'rate-limit-exhausted') {
     const abortedNote = params.aborted ? `\n${PARTIAL_DOWNLOAD_MESSAGE}` : '';
     return `${RATE_LIMIT_EXHAUSTED_HEADLINE}${abortedNote}${failedSuffix}`;
@@ -83,7 +152,11 @@ export function buildCompleteMessage(params: CompleteMessageParams): string {
   if (params.aborted) {
     return `${PARTIAL_DOWNLOAD_MESSAGE}${failedSuffix}`;
   }
-  const headline = params.failedFileCount > 0 ? PARTIAL_FILE_FAILURE_HEADLINE : COMPLETE_HEADLINE;
+  // 収集フェーズ・ZIP フェーズのいずれかに欠落があれば PARTIAL_FILE_FAILURE_HEADLINE にする。
+  // failureLines は buildFailureLines が同じ 5 分類 (unavailable/unsupported/apiFailed/
+  // failedPageCount/failedFileCount) を見て組み立てるため、判定をそこに合わせておくことで
+  // 「本文には欠落の行があるのに見出しは完了扱い」という矛盾を防ぐ
+  const headline = failureLines.length > 0 ? PARTIAL_FILE_FAILURE_HEADLINE : COMPLETE_HEADLINE;
   return `${headline}${failedSuffix}`;
 }
 
@@ -373,7 +446,7 @@ export class OverlayController {
       const creatorId = this.pageType.creatorId;
       const postId = this.pageType.type === 'post' ? this.pageType.postId : undefined;
 
-      const { downloadObject, failedPostCount, failedPageCount, stoppedReason } = await collect(
+      const { downloadObject, addedPostCount, postFailures, failedPageCount, stoppedReason } = await collect(
         creatorId,
         postId,
         settings,
@@ -390,10 +463,25 @@ export class OverlayController {
       }
 
       publishTestState({
-        'failed-post-count': String(failedPostCount),
+        'added-post-count': String(addedPostCount),
+        'unavailable-post-count': String(postFailures.unavailable),
+        'unsupported-post-count': String(postFailures.unsupported),
+        'api-failed-post-count': String(postFailures.apiFailed),
         'failed-page-count': String(failedPageCount),
         ...(stoppedReason ? { 'stopped-reason': stoppedReason } : {}),
       });
+
+      if (addedPostCount === 0) {
+        // 登録できた投稿が無いので ZIP を保存しない (Issue #14)。saveHandle には触れない:
+        // downloadAsZip を呼ばなければ writable を開かないので、書き込みは一切発生しない。
+        // showSaveFilePicker が既に作成済みの 0 バイトファイルはそのまま残る
+        // (削除できない理由は NOTHING_SAVED_HEADLINE のコメントを参照)。
+        this.setState('complete');
+        this.renderComplete(
+          buildCompleteMessage({ aborted: false, addedPostCount, postFailures, failedPageCount, failedFileCount: 0 }),
+        );
+        return;
+      }
 
       this.setState('downloading');
       this.renderDownloading();
@@ -439,7 +527,8 @@ export class OverlayController {
         this.renderComplete(
           buildCompleteMessage({
             aborted: true,
-            failedPostCount,
+            addedPostCount,
+            postFailures,
             failedPageCount,
             failedFileCount: zip.failedFileCount,
             stoppedReason,
@@ -452,7 +541,8 @@ export class OverlayController {
       this.renderComplete(
         buildCompleteMessage({
           aborted: false,
-          failedPostCount,
+          addedPostCount,
+          postFailures,
           failedPageCount,
           failedFileCount: zip.failedFileCount,
           stoppedReason,
@@ -471,9 +561,26 @@ export class OverlayController {
         // 「ダウンロード中」画面のまま固まらせないよう通常のエラー表示に合流させる
         // (部分保存の保証はできないため「保存して終了しました」ではなく素直にエラーと伝える)。
         console.error('ダウンロードエラー (中断中の契約違反):', e);
-      } else {
-        console.error('ダウンロードエラー:', e);
+        publishTestState({ error: '1' });
+        this.setState('complete');
+        this.renderComplete(`エラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);
+        return;
       }
+      if (e instanceof ApiShapeError || e instanceof PostBodyInvalidError) {
+        // 未対応のレスポンス形式による中断 (Issue #14)。ApiShapeError は API 層
+        // (fetchJson のレスポンス形状違反)、PostBodyInvalidError はライブラリ層
+        // (addByPostInfo が読む本文フィールドの不一致) だが、どちらも「このバージョンでは
+        // 安全に取り込めない仕様変更」を意味するため同じ見出しで扱う。
+        // collect() が投稿を 1 件も返さないまま例外を投げるため、downloadAsZip は
+        // 呼ばれておらず ZIP は保存されていない (NOTHING_SAVED_HEADLINE と同じ理由で、
+        // showSaveFilePicker が作成済みの 0 バイトファイルはそのまま残る)。
+        console.error('収集を中断しました (未対応のレスポンス形式):', e);
+        publishTestState({ 'unsupported-response': '1' });
+        this.setState('complete');
+        this.renderComplete(UNSUPPORTED_RESPONSE_HEADLINE);
+        return;
+      }
+      console.error('ダウンロードエラー:', e);
       publishTestState({ error: '1' });
       this.setState('complete');
       this.renderComplete(`エラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);

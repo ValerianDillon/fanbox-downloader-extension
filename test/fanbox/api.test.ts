@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   ApiSession,
+  ApiShapeError,
   DEFAULT_API_RATE_LIMIT_MS,
   detectPage,
+  FetchApiError,
   RateLimitExhaustedError,
 } from '../../src/content/fanbox/api';
 
@@ -392,6 +394,99 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
   });
 });
 
+describe('Issue #14: エラー型の kind / status / fields', () => {
+  const origSetTimeout = globalThis.setTimeout;
+  const origClearTimeout = globalThis.clearTimeout;
+  // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+  const origChrome = (globalThis as any).chrome;
+  let calls: ApiCall[];
+  let responders: ApiResponder[];
+  let api: ApiSession;
+
+  function installFakeTimers() {
+    globalThis.setTimeout = ((handler: TimerHandler) =>
+      origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
+    globalThis.clearTimeout = origClearTimeout;
+  }
+
+  function restoreTimers() {
+    globalThis.setTimeout = origSetTimeout;
+    globalThis.clearTimeout = origClearTimeout;
+  }
+
+  beforeEach(() => {
+    calls = [];
+    responders = [];
+    ApiSession.resetSharedBackoff();
+    api = new ApiSession(DEFAULT_API_RATE_LIMIT_MS);
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: (message: { type: string; url: string }) => {
+          if (message.type === 'getBackoffUntil') return Promise.resolve({ backoffUntil: 0 });
+          if (message.type !== 'fetchApi') return Promise.reject(new Error('unexpected message type'));
+          calls.push({ url: message.url });
+          const responder = responders.shift();
+          if (!responder) return Promise.reject(new Error(`unexpected fetch: ${message.url}`));
+          return Promise.resolve(responder());
+        },
+      },
+    };
+    installFakeTimers();
+  });
+
+  afterEach(() => {
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = origChrome;
+    restoreTimers();
+    ApiSession.resetSharedBackoff();
+  });
+
+  test('レート制限の枯渇は RateLimitExhaustedError (kind: rate-limit, status: 429) を投げる', async () => {
+    for (let i = 0; i < 4; i++) responders.push(() => tooManyRequests());
+
+    const error = await api.fetchPostInfo('x').catch((e) => e);
+    expect(error).toBeInstanceOf(RateLimitExhaustedError);
+    expect(error.kind).toBe('rate-limit');
+    expect(error.status).toBe(429);
+  });
+
+  test('HTTP エラー (429 以外) は FetchApiError (kind: http) を投げ、status に実際のコードを持つ', async () => {
+    responders.push(() => errorStatus(503));
+
+    const error = await api.fetchPostInfo('w').catch((e) => e);
+    expect(error).toBeInstanceOf(FetchApiError);
+    expect(error.kind).toBe('http');
+    expect(error.status).toBe(503);
+  });
+
+  test('通信失敗 (status 0) が再試行後も続くと FetchApiError (kind: network, status: 0) を投げる', async () => {
+    responders.push(() => ({ ok: false, status: 0, retryAfter: null, error: 'Failed to fetch' }));
+    responders.push(() => ({ ok: false, status: 0, retryAfter: null, error: 'Failed to fetch' }));
+
+    const error = await api.fetchPostInfo('1').catch((e) => e);
+    expect(error).toBeInstanceOf(FetchApiError);
+    expect(error.kind).toBe('network');
+    expect(error.status).toBe(0);
+    expect(calls).toHaveLength(2);
+  });
+
+  test('sendMessage 自体の失敗が再試行後も続くと FetchApiError (kind: network, status: 0) を投げる', async () => {
+    // proxyFetchApi (chrome.runtime.sendMessage) が例外で reject し続けるケース
+    responders.push(() => {
+      throw new Error('messaging failed');
+    });
+    responders.push(() => {
+      throw new Error('messaging failed');
+    });
+
+    const error = await api.fetchPostInfo('1').catch((e) => e);
+    expect(error).toBeInstanceOf(FetchApiError);
+    expect(error.kind).toBe('network');
+    expect(error.status).toBe(0);
+  });
+});
+
 describe('レスポンスのアンラップ', () => {
   // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
   const origChrome = (globalThis as any).chrome;
@@ -442,6 +537,36 @@ describe('レスポンスのアンラップ', () => {
   test('fetchTags は形状が想定外でも収集を止めず空配列を返す', async () => {
     nextResponse = okJson({ body: [{ tag: 'イラスト' }] });
     expect(await api.fetchTags('c')).toEqual([]);
+  });
+
+  // プラン名・タグは表示の補助なので、通信/HTTP の失敗 (FetchApiError) も
+  // 形状不一致 (ApiShapeError) と同様に握りつぶして続行してよい
+  // (CLAUDE.md 「プラン名とタグは表示の補助なので握りつぶして続行し」の方針)
+  test('fetchPlans は FetchApiError (HTTP 失敗) も握りつぶして空配列を返す', async () => {
+    nextResponse = { ok: false, status: 500, retryAfter: null };
+    expect(await api.fetchPlans('c')).toEqual([]);
+  });
+
+  test('fetchTags は FetchApiError (HTTP 失敗) も握りつぶして空配列を返す', async () => {
+    nextResponse = { ok: false, status: 500, retryAfter: null };
+    expect(await api.fetchTags('c')).toEqual([]);
+  });
+
+  // FetchApiError / ApiShapeError / RateLimitExhaustedError のいずれでもない例外
+  // (validator や内部処理のバグ、あるいは互換性のない service worker が返す
+  // 破損したレスポンス形状など) までは握りつぶさず再送出する。ここでは
+  // sendMessage が応答オブジェクト自体を返さない (undefined) という壊れ方を模擬し、
+  // fetchJson 内部で TypeError が起きるようにして検証する
+  test('fetchPlans は想定外の例外 (typed error 以外) を握りつぶさず再送出する', async () => {
+    // biome-ignore lint/suspicious/noExplicitAny: 破損したレスポンス形状 (undefined) を模擬する
+    nextResponse = undefined as any;
+    await expect(api.fetchPlans('c')).rejects.toThrow(TypeError);
+  });
+
+  test('fetchTags は想定外の例外 (typed error 以外) を握りつぶさず再送出する', async () => {
+    // biome-ignore lint/suspicious/noExplicitAny: 破損したレスポンス形状 (undefined) を模擬する
+    nextResponse = undefined as any;
+    await expect(api.fetchTags('c')).rejects.toThrow(TypeError);
   });
 
   test('fetchPaginatedPosts は body.pageUrls を返す', async () => {
@@ -529,5 +654,70 @@ describe('レスポンスのアンラップ', () => {
   test('fetchPostInfo は旧形状 (body 直下が投稿) なら投げる', async () => {
     nextResponse = okJson({ body: { id: '1', title: 'x' } });
     await expect(api.fetchPostInfo('1')).rejects.toThrow(/形状が想定外/);
+  });
+});
+
+describe('Issue #14: ApiShapeError の fields (想定と違ったフィールドの内訳)', () => {
+  // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+  const origChrome = (globalThis as any).chrome;
+  let nextResponse: ProxyApiResponse;
+  let api: ApiSession;
+
+  beforeEach(() => {
+    ApiSession.resetSharedBackoff();
+    api = new ApiSession();
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: { sendMessage: () => Promise.resolve(nextResponse) },
+    };
+  });
+
+  afterEach(() => {
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = origChrome;
+  });
+
+  test('JSON として読めないレスポンス (SyntaxError) は ApiShapeError (fields: ["json"]) になる', async () => {
+    // JSON.parse の SyntaxError をそのまま投げると instanceof ApiShapeError 判定を
+    // すり抜け、「未対応のレスポンス形式のため中断しました」に乗らない
+    nextResponse = { ok: true, status: 200, retryAfter: null, body: '{ broken' };
+    const error = await api.fetchPostInfo('1').catch((e) => e);
+    expect(error).toBeInstanceOf(ApiShapeError);
+    expect(error.fields).toEqual(['json']);
+  });
+
+  test('body.post 自体が無ければ fields は ["body.post"]', async () => {
+    nextResponse = okJson({ body: {} });
+    const error = await api.fetchPostInfo('1').catch((e) => e);
+    expect(error).toBeInstanceOf(ApiShapeError);
+    expect(error.fields).toEqual(['body.post']);
+  });
+
+  test('post が type / isRestricted を欠いていれば fields にそれぞれのパスを積む', async () => {
+    nextResponse = okJson({ body: { post: { id: '1' } } });
+    const error = await api.fetchPostInfo('1').catch((e) => e);
+    expect(error).toBeInstanceOf(ApiShapeError);
+    expect(error.fields).toEqual(['body.post.type', 'body.post.isRestricted']);
+  });
+
+  test('post が id のみ欠いていれば fields は ["body.post.id"] のみ', async () => {
+    nextResponse = okJson({ body: { post: { type: 'image', isRestricted: false } } });
+    const error = await api.fetchPostInfo('1').catch((e) => e);
+    expect(error).toBeInstanceOf(ApiShapeError);
+    expect(error.fields).toEqual(['body.post.id']);
+  });
+
+  test('fetchPaginatedPosts の配列違反は fields に ["body.pageUrls"] を積む', async () => {
+    nextResponse = okJson({ body: ['https://api.fanbox.cc/post.listCreator?creatorId=c'] });
+    const error = await api.fetchPaginatedPosts('c').catch((e) => e);
+    expect(error).toBeInstanceOf(ApiShapeError);
+    expect(error.fields).toEqual(['body.pageUrls']);
+  });
+
+  test('fetchPostList の要素違反は fields に ["body.posts[]"] を積む', async () => {
+    nextResponse = okJson({ body: { posts: [{ id: '1', isRestricted: 'false' }] } });
+    const error = await api.fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c').catch((e) => e);
+    expect(error).toBeInstanceOf(ApiShapeError);
+    expect(error.fields).toEqual(['body.posts[]']);
   });
 });

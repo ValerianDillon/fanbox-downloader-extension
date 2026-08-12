@@ -1,11 +1,14 @@
 import { describe, expect, test } from 'bun:test';
+import type { PostFailureCounts } from '../src/content/fanbox/collector';
 import {
   buildCompleteMessage,
   COMPLETE_HEADLINE,
   type CompleteMessageParams,
+  NOTHING_SAVED_HEADLINE,
   PARTIAL_DOWNLOAD_MESSAGE,
   PARTIAL_FILE_FAILURE_HEADLINE,
   RATE_LIMIT_EXHAUSTED_HEADLINE,
+  UNSUPPORTED_RESPONSE_HEADLINE,
 } from '../src/content/overlay';
 
 /**
@@ -17,7 +20,13 @@ type OverlayState = 'settings' | 'collecting' | 'downloading' | 'complete';
 
 const validTransitions: Record<OverlayState, OverlayState[]> = {
   settings: ['collecting'],
-  collecting: ['downloading', 'settings'],
+  // collecting → complete (downloading を経由しない) は startCollecting (src/content/overlay.ts)
+  // の次の 3 箇所が使う。詳細は下の describe ブロックのコメントを参照。
+  // 1. collect() が正常に返り、addedPostCount === 0 (Issue #14: 保存できる投稿が無い)
+  // 2. collect() が ApiShapeError / PostBodyInvalidError を投げる (Issue #14: 未対応のレスポンス形式)
+  // 3. collect() がそれ以外の例外を投げる (例: addedPostCount === 0 のまま枯渇した
+  //    RateLimitExhaustedError、または想定外のバグ) — catch の汎用フォールバックに落ちる
+  collecting: ['downloading', 'settings', 'complete'],
   downloading: ['complete', 'settings'],
   complete: ['settings'],
 };
@@ -37,6 +46,17 @@ describe('Overlay 状態遷移', () => {
 
   test('collecting → settings (キャンセル) は有効', () => {
     expect(isValidTransition('collecting', 'settings')).toBe(true);
+  });
+
+  // Issue #14: downloading を経由せず collecting → complete に直接遷移する経路が 3 つある。
+  // いずれも downloadAsZip を呼ぶ前 (= 保存すべき ZIP が無い、または安全に取り込めない
+  // レスポンスだった) ことが分かった時点で直接 complete に着地させるための遷移である。
+  // 1. collect() が正常に返り addedPostCount === 0 (登録できた投稿が無いので ZIP を保存しない)
+  // 2. collect() が ApiShapeError / PostBodyInvalidError を投げる (未対応のレスポンス形式で中断)
+  // 3. collect() がそれ以外の例外を投げる (例: addedPostCount === 0 のまま枯渇した
+  //    RateLimitExhaustedError) — catch の汎用フォールバックが complete へ落とす
+  test('collecting → complete は有効 (downloadAsZip を呼ぶ前に保存不要/中断が確定した場合)', () => {
+    expect(isValidTransition('collecting', 'complete')).toBe(true);
   });
 
   // Issue #17: 通常の完了、および「ここまでで終了」ボタンによる中断のどちらも
@@ -95,22 +115,36 @@ describe('Issue #17: ダウンロード中の「ここまでで終了」', () =>
   });
 });
 
+function emptyPostFailures(overrides: Partial<PostFailureCounts> = {}): PostFailureCounts {
+  return {
+    unavailable: 0,
+    unavailableRestricted: 0,
+    unavailableMissingBody: 0,
+    unsupported: 0,
+    apiFailed: 0,
+    ...overrides,
+  };
+}
+
 /**
- * Issue #18 第 1 段階: 完了画面の分岐 (buildCompleteMessage) のテスト。
+ * Issue #18 第 1 段階・Issue #14: 完了画面の分岐 (buildCompleteMessage) のテスト。
  * DOM や collect()/downloadAsZip() を経由せず、失敗件数の組み合わせを直接入力して
  * 完了画面の文言を検証する (buildCompleteMessage は overlay.ts から切り出した純粋関数)。
  * 見出し文言は exports の完全一致で固定し、退行 (表現の変更) を検知できるようにする。
  */
-describe('Issue #18: 完了画面の分岐 (buildCompleteMessage)', () => {
+describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => {
   test('見出し文言が仕様どおりである (完全一致)', () => {
     expect(COMPLETE_HEADLINE).toBe('ダウンロードが完了しました');
     expect(PARTIAL_FILE_FAILURE_HEADLINE).toBe('一部取得できませんでした');
     expect(RATE_LIMIT_EXHAUSTED_HEADLINE).toBe('レート制限のため途中で打ち切りました (取得できた分のみ保存しています)');
+    expect(NOTHING_SAVED_HEADLINE).toBe('保存できる投稿がなかったため ZIP を保存しませんでした');
+    expect(UNSUPPORTED_RESPONSE_HEADLINE).toBe('未対応のレスポンス形式のため中断しました');
   });
 
   const base: CompleteMessageParams = {
     aborted: false,
-    failedPostCount: 0,
+    addedPostCount: 1,
+    postFailures: emptyPostFailures(),
     failedPageCount: 0,
     failedFileCount: 0,
   };
@@ -119,31 +153,63 @@ describe('Issue #18: 完了画面の分岐 (buildCompleteMessage)', () => {
     expect(buildCompleteMessage(base)).toBe(COMPLETE_HEADLINE);
   });
 
-  test('収集フェーズの投稿単位の失敗のみ: 見出しは変えず、件数を併記する (従来どおり)', () => {
-    const message = buildCompleteMessage({ ...base, failedPostCount: 2 });
+  // Issue #14: 収集フェーズの欠落 (postFailures/failedPageCount) だけがあっても、
+  // ZIP フェーズの欠落 (failedFileCount) と同様に見出しを PARTIAL_FILE_FAILURE_HEADLINE に
+  // 変える。以前は failedFileCount のみを見ていたため、本文に欠落の行があるのに
+  // 見出しが「完了しました」のままになる矛盾があった。
+
+  test('本文を利用できなかった投稿のみ: 見出しが一部取得できませんでしたに変わる', () => {
+    const message = buildCompleteMessage({ ...base, postFailures: emptyPostFailures({ unavailable: 2 }) });
     expect(message).toBe(
-      `${COMPLETE_HEADLINE}\n2 件の投稿の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`,
+      `${PARTIAL_FILE_FAILURE_HEADLINE}\n本文を利用できなかった投稿: 2 件 (閲覧権限または支援プランの範囲外など)`,
+    );
+  });
+
+  test('未対応の本文形式 (unsupported) のみ: 見出しが一部取得できませんでしたに変わる', () => {
+    const message = buildCompleteMessage({ ...base, postFailures: emptyPostFailures({ unsupported: 3 }) });
+    expect(message).toBe(
+      `${PARTIAL_FILE_FAILURE_HEADLINE}\n未対応の本文形式: 3 件 (拡張機能の更新が必要な可能性があります)`,
+    );
+  });
+
+  test('API 通信に失敗した投稿のみ: 見出しが一部取得できませんでしたに変わる', () => {
+    const message = buildCompleteMessage({ ...base, postFailures: emptyPostFailures({ apiFailed: 4 }) });
+    expect(message).toBe(
+      `${PARTIAL_FILE_FAILURE_HEADLINE}\nAPI 通信に失敗した投稿: 4 件 (時間を置いて再試行してください)`,
+    );
+  });
+
+  test('取得できなかった一覧ページのみ: 見出しが一部取得できませんでしたに変わる', () => {
+    const message = buildCompleteMessage({ ...base, failedPageCount: 5 });
+    expect(message).toBe(
+      `${PARTIAL_FILE_FAILURE_HEADLINE}\n取得できなかった一覧ページ: 5 ページ (欠落した投稿数は不明)`,
     );
   });
 
   test('ZIP フェーズのファイル欠落 (カバー画像含む) のみ: 見出しが一部取得できませんでしたに変わる', () => {
     const message = buildCompleteMessage({ ...base, failedFileCount: 3 });
     expect(message).toBe(
-      `${PARTIAL_FILE_FAILURE_HEADLINE}\n3 件のファイル (カバー画像含む)の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`,
+      `${PARTIAL_FILE_FAILURE_HEADLINE}\n取得できなかったファイル: 3 件 (カバー画像含む。時間を置いて再試行してください)`,
     );
   });
 
-  test('収集フェーズ (投稿・ページ) と ZIP フェーズの失敗が全部そろうと 1 つの文言に合流する', () => {
+  test('収集フェーズ (4 分類) と ZIP フェーズの失敗が全部そろうと、理由ごとに独立した行で列挙される', () => {
     const message = buildCompleteMessage({
       aborted: false,
-      failedPostCount: 1,
-      failedPageCount: 2,
-      failedFileCount: 3,
+      addedPostCount: 1,
+      postFailures: emptyPostFailures({ unavailable: 1, unsupported: 2, apiFailed: 3 }),
+      failedPageCount: 4,
+      failedFileCount: 5,
     });
     expect(message).toBe(
-      `${PARTIAL_FILE_FAILURE_HEADLINE}\n` +
-        '1 件の投稿 と 2 ページ分の投稿一覧 (投稿数は不明) と 3 件のファイル (カバー画像含む)' +
-        'の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)',
+      [
+        PARTIAL_FILE_FAILURE_HEADLINE,
+        '本文を利用できなかった投稿: 1 件 (閲覧権限または支援プランの範囲外など)',
+        '未対応の本文形式: 2 件 (拡張機能の更新が必要な可能性があります)',
+        'API 通信に失敗した投稿: 3 件 (時間を置いて再試行してください)',
+        '取得できなかった一覧ページ: 4 ページ (欠落した投稿数は不明)',
+        '取得できなかったファイル: 5 件 (カバー画像含む。時間を置いて再試行してください)',
+      ].join('\n'),
     );
   });
 
@@ -155,7 +221,7 @@ describe('Issue #18: 完了画面の分岐 (buildCompleteMessage)', () => {
   test('レート制限による打ち切りと ZIP フェーズの失敗が両方あっても見出しは打ち切りが勝ち、件数は併記する', () => {
     const message = buildCompleteMessage({ ...base, failedFileCount: 5, stoppedReason: 'rate-limit-exhausted' });
     expect(message).toBe(
-      `${RATE_LIMIT_EXHAUSTED_HEADLINE}\n5 件のファイル (カバー画像含む)の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`,
+      `${RATE_LIMIT_EXHAUSTED_HEADLINE}\n取得できなかったファイル: 5 件 (カバー画像含む。時間を置いて再試行してください)`,
     );
   });
 
@@ -166,22 +232,25 @@ describe('Issue #18: 完了画面の分岐 (buildCompleteMessage)', () => {
   test('中断かつ ZIP フェーズの失敗がある場合、PARTIAL_DOWNLOAD_MESSAGE を維持しつつ件数を併記する', () => {
     const message = buildCompleteMessage({ ...base, aborted: true, failedFileCount: 4 });
     expect(message).toBe(
-      `${PARTIAL_DOWNLOAD_MESSAGE}\n4 件のファイル (カバー画像含む)の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`,
+      `${PARTIAL_DOWNLOAD_MESSAGE}\n取得できなかったファイル: 4 件 (カバー画像含む。時間を置いて再試行してください)`,
     );
   });
 
-  // collect() は failedPostCount/failedPageCount があっても打ち切らず ZIP フェーズへ進むため、
+  // collect() は postFailures/failedPageCount があっても打ち切らず ZIP フェーズへ進むため、
   // 「中断時は収集フェーズの失敗が無い」という前提は成り立たない。ZIP フェーズだけを中断しても
   // 収集フェーズの失敗は消えないので、PARTIAL_DOWNLOAD_MESSAGE に併記する
-  test('中断時も収集フェーズの失敗件数 (failedPostCount/failedPageCount) を併記する', () => {
+  test('中断時も収集フェーズの失敗件数を併記する', () => {
     const message = buildCompleteMessage({
       aborted: true,
-      failedPostCount: 9,
+      addedPostCount: 1,
+      postFailures: emptyPostFailures({ unavailable: 9 }),
       failedPageCount: 3,
       failedFileCount: 0,
     });
     expect(message).toBe(
-      `${PARTIAL_DOWNLOAD_MESSAGE}\n9 件の投稿 と 3 ページ分の投稿一覧 (投稿数は不明)の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)`,
+      `${PARTIAL_DOWNLOAD_MESSAGE}\n` +
+        '本文を利用できなかった投稿: 9 件 (閲覧権限または支援プランの範囲外など)\n' +
+        '取得できなかった一覧ページ: 3 ページ (欠落した投稿数は不明)',
     );
   });
 
@@ -200,15 +269,78 @@ describe('Issue #18: 完了画面の分岐 (buildCompleteMessage)', () => {
   test('収集フェーズの打ち切りと ZIP フェーズの中断が両方あり、かつ各フェーズの失敗もある場合、すべて併記する', () => {
     const message = buildCompleteMessage({
       aborted: true,
-      failedPostCount: 1,
+      addedPostCount: 1,
+      postFailures: emptyPostFailures({ unavailable: 1 }),
       failedPageCount: 2,
       failedFileCount: 3,
       stoppedReason: 'rate-limit-exhausted',
     });
     expect(message).toBe(
-      `${RATE_LIMIT_EXHAUSTED_HEADLINE}\n${PARTIAL_DOWNLOAD_MESSAGE}\n` +
-        '1 件の投稿 と 2 ページ分の投稿一覧 (投稿数は不明) と 3 件のファイル (カバー画像含む)' +
-        'の取得に失敗しました (支援プランの範囲外か、FANBOX のレート制限の可能性があります)',
+      [
+        RATE_LIMIT_EXHAUSTED_HEADLINE,
+        PARTIAL_DOWNLOAD_MESSAGE,
+        '本文を利用できなかった投稿: 1 件 (閲覧権限または支援プランの範囲外など)',
+        '取得できなかった一覧ページ: 2 ページ (欠落した投稿数は不明)',
+        '取得できなかったファイル: 3 件 (カバー画像含む。時間を置いて再試行してください)',
+      ].join('\n'),
     );
+  });
+});
+
+/**
+ * Issue #14: 登録できた投稿が 0 件の場合、ZIP を保存しない (NOTHING_SAVED_HEADLINE)。
+ * 判定は addedPostCount で行い、失敗件数の多寡には依存しない
+ * (失敗ゼロ・postFailures 全て 0 でも addedPostCount === 0 なら NOTHING_SAVED_HEADLINE になる —
+ * 例えば投稿が 1 件も存在しないクリエイターの場合)。
+ */
+describe('Issue #14: 登録できた投稿が 0 件の場合 (buildCompleteMessage)', () => {
+  test('addedPostCount が 0 なら、他のフラグに関わらず NOTHING_SAVED_HEADLINE になる', () => {
+    const message = buildCompleteMessage({
+      aborted: false,
+      addedPostCount: 0,
+      postFailures: emptyPostFailures(),
+      failedPageCount: 0,
+      failedFileCount: 0,
+    });
+    expect(message).toBe(NOTHING_SAVED_HEADLINE);
+  });
+
+  test('addedPostCount が 0 のとき、失敗の内訳を理由付きで併記する', () => {
+    const message = buildCompleteMessage({
+      aborted: false,
+      addedPostCount: 0,
+      postFailures: emptyPostFailures({ unavailable: 3, unsupported: 1 }),
+      failedPageCount: 0,
+      failedFileCount: 0,
+    });
+    expect(message).toBe(
+      `${NOTHING_SAVED_HEADLINE}\n` +
+        '本文を利用できなかった投稿: 3 件 (閲覧権限または支援プランの範囲外など)\n' +
+        '未対応の本文形式: 1 件 (拡張機能の更新が必要な可能性があります)',
+    );
+  });
+
+  test('addedPostCount が 0 は stoppedReason より優先される (両立しない前提だが、優先順位として明示する)', () => {
+    const message = buildCompleteMessage({
+      aborted: false,
+      addedPostCount: 0,
+      postFailures: emptyPostFailures(),
+      failedPageCount: 0,
+      failedFileCount: 0,
+      stoppedReason: 'rate-limit-exhausted',
+    });
+    expect(message).toBe(NOTHING_SAVED_HEADLINE);
+  });
+
+  test('addedPostCount が 1 以上なら NOTHING_SAVED_HEADLINE にならない', () => {
+    const message = buildCompleteMessage({
+      aborted: false,
+      addedPostCount: 1,
+      postFailures: emptyPostFailures(),
+      failedPageCount: 0,
+      failedFileCount: 0,
+    });
+    expect(message).not.toBe(NOTHING_SAVED_HEADLINE);
+    expect(message).toBe(COMPLETE_HEADLINE);
   });
 });

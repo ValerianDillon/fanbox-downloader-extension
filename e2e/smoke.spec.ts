@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import type { BrowserContext, Locator, Page } from '@playwright/test';
 import { chromium, expect, test } from '@playwright/test';
 import {
   CREATOR_PAGE_URL,
@@ -14,6 +15,8 @@ import {
   PAGINATE_URL,
   PLANS_RESPONSE,
   PLANS_URL,
+  POST_A_STUB,
+  POST_B_STUB,
   POST_INFO_RESPONSE_A,
   POST_INFO_RESPONSE_B,
   POST_INFO_URL_A,
@@ -120,7 +123,11 @@ type TestState = {
   zipDone: string | null;
   error: string | null;
   aborted: string | null;
-  failedPostCount: string | null;
+  unsupportedResponse: string | null;
+  addedPostCount: string | null;
+  unavailablePostCount: string | null;
+  unsupportedPostCount: string | null;
+  apiFailedPostCount: string | null;
   failedPageCount: string | null;
   failedFileCount: string | null;
   fetchedUrls: string | null;
@@ -134,7 +141,11 @@ function readTestState(): TestState {
     zipDone: el.getAttribute('data-fbdl-zip-done'),
     error: el.getAttribute('data-fbdl-error'),
     aborted: el.getAttribute('data-fbdl-aborted'),
-    failedPostCount: el.getAttribute('data-fbdl-failed-post-count'),
+    unsupportedResponse: el.getAttribute('data-fbdl-unsupported-response'),
+    addedPostCount: el.getAttribute('data-fbdl-added-post-count'),
+    unavailablePostCount: el.getAttribute('data-fbdl-unavailable-post-count'),
+    unsupportedPostCount: el.getAttribute('data-fbdl-unsupported-post-count'),
+    apiFailedPostCount: el.getAttribute('data-fbdl-api-failed-post-count'),
     failedPageCount: el.getAttribute('data-fbdl-failed-page-count'),
     failedFileCount: el.getAttribute('data-fbdl-failed-file-count'),
     fetchedUrls: el.getAttribute('data-fbdl-fetched-urls'),
@@ -142,8 +153,27 @@ function readTestState(): TestState {
   };
 }
 
-test('FANBOX creator ページ: 収集から ZIP 生成まで完走する', async () => {
-  const userDataDir = await mkdtemp(path.join(tmpdir(), 'fbdl-smoke-'));
+type ExtensionSession = {
+  context: BrowserContext;
+  page: Page;
+  overlay: Locator;
+  userDataDir: string;
+  unexpectedRequests: string[];
+};
+
+/**
+ * dist-test/ を読み込んだ拡張プロファイルを起動し、FANBOX API を jsonResponses でモックした上で
+ * FAB クリック → 「ダウンロード開始」まで進める共通セットアップ。
+ *
+ * 個々のテストは戻り値の page/overlay を使って、そこから先 (完了までの待機や状態の検証) だけを書く。
+ * 呼び出し側は必ず finally で context.close() / rm(userDataDir, ...) を行うこと
+ * (このヘルパー自体は後始末をしない)。
+ */
+async function launchAndStartDownload(
+  jsonResponses: Record<string, unknown>,
+  namePrefix: string,
+): Promise<ExtensionSession> {
+  const userDataDir = await mkdtemp(path.join(tmpdir(), `fbdl-smoke-${namePrefix}-`));
   const extensionPath = path.resolve(process.cwd(), 'dist-test');
 
   const context = await chromium.launchPersistentContext(userDataDir, {
@@ -157,84 +187,91 @@ test('FANBOX creator ページ: 収集から ZIP 生成まで完走する', asyn
     ],
   });
 
-  try {
-    // 拡張の service worker (MV3 background) が起動していることを確認する
-    let serviceWorker = context.serviceWorkers().find((sw) => sw.url().startsWith('chrome-extension://'));
-    serviceWorker ??= await context.waitForEvent('serviceworker', {
-      predicate: (sw) => sw.url().startsWith('chrome-extension://'),
-    });
-    // manifest の background.service_worker (= 'service-worker.js') で終わる URL であることを見て、
-    // 「chrome-extension:// で始まる」というフィルタと同義の (常に真になる) assert ではなく、
-    // 自拡張の service worker であることを実質的に検証する
-    expect(serviceWorker.url().endsWith(`/${SERVICE_WORKER_FILE_NAME}`)).toBe(true);
+  // 拡張の service worker (MV3 background) が起動していることを確認する
+  let serviceWorker = context.serviceWorkers().find((sw) => sw.url().startsWith('chrome-extension://'));
+  serviceWorker ??= await context.waitForEvent('serviceworker', {
+    predicate: (sw) => sw.url().startsWith('chrome-extension://'),
+  });
+  // manifest の background.service_worker (= 'service-worker.js') で終わる URL であることを見て、
+  // 「chrome-extension:// で始まる」というフィルタと同義の (常に真になる) assert ではなく、
+  // 自拡張の service worker であることを実質的に検証する
+  expect(serviceWorker.url().endsWith(`/${SERVICE_WORKER_FILE_NAME}`)).toBe(true);
 
-    const unexpectedRequests: string[] = [];
+  const unexpectedRequests: string[] = [];
 
-    await context.route('**/*', async (route) => {
-      const url = route.request().url();
+  await context.route('**/*', async (route) => {
+    const url = route.request().url();
 
-      if (url === CREATOR_PAGE_URL) {
-        await route.fulfill({
-          status: 200,
-          contentType: 'text/html',
-          body: '<!doctype html><html><body></body></html>',
-        });
-        return;
-      }
+    if (url === CREATOR_PAGE_URL) {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/html',
+        body: '<!doctype html><html><body></body></html>',
+      });
+      return;
+    }
 
-      const jsonBody = JSON_RESPONSES[url];
-      if (jsonBody !== undefined) {
-        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(jsonBody) });
-        return;
-      }
+    const jsonBody = jsonResponses[url];
+    if (jsonBody !== undefined) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(jsonBody) });
+      return;
+    }
 
-      const file = FILE_BODIES[url];
-      if (file) {
-        await route.fulfill({ status: 200, contentType: file.contentType, body: file.body });
-        return;
-      }
+    const file = FILE_BODIES[url];
+    if (file) {
+      await route.fulfill({ status: 200, contentType: file.contentType, body: file.body });
+      return;
+    }
 
-      if (url.endsWith('/favicon.ico')) {
-        // ブラウザが自動的に取りに行くことがあるが、fixture/テストの本題とは無関係なので
-        // 404 で応答するだけにして「予期しないリクエスト」としては扱わない
-        await route.fulfill({ status: 404, body: '' });
-        return;
-      }
+    if (url.endsWith('/favicon.ico')) {
+      // ブラウザが自動的に取りに行くことがあるが、fixture/テストの本題とは無関係なので
+      // 404 で応答するだけにして「予期しないリクエスト」としては扱わない
+      await route.fulfill({ status: 404, body: '' });
+      return;
+    }
 
-      // 拡張自身のリソース (content.js / service-worker.js / manifest / icons) は
-      // chrome-extension:// スキームで読み込まれる。ネットワークリクエストではないので通す。
-      if (!url.startsWith('http://') && !url.startsWith('https://')) {
-        await route.continue();
-        return;
-      }
+    // 拡張自身のリソース (content.js / service-worker.js / manifest / icons) は
+    // chrome-extension:// スキームで読み込まれる。ネットワークリクエストではないので通す。
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      await route.continue();
+      return;
+    }
 
-      const hostname = new URL(url).hostname;
-      if (!isWithinExtensionHostPermissions(hostname)) {
-        // host_permissions (*://*.fanbox.cc/*, *://*.pximg.net/*) の対象外ドメインは
-        // このテストの関心事ではないので黙って abort する
-        await route.abort();
-        return;
-      }
-
-      // host_permissions の対象内なのに fixture に定義がない = テストが想定していないリクエスト
-      // (fail-closed: 収集ロジックが fixture にない URL を叩いていないか検出する)
-      unexpectedRequests.push(url);
+    const hostname = new URL(url).hostname;
+    if (!isWithinExtensionHostPermissions(hostname)) {
+      // host_permissions (*://*.fanbox.cc/*, *://*.pximg.net/*) の対象外ドメインは
+      // このテストの関心事ではないので黙って abort する
       await route.abort();
-    });
+      return;
+    }
 
-    const page = await context.newPage();
-    await page.goto(CREATOR_PAGE_URL);
+    // host_permissions の対象内なのに fixture に定義がない = テストが想定していないリクエスト
+    // (fail-closed: 収集ロジックが fixture にない URL を叩いていないか検出する)
+    unexpectedRequests.push(url);
+    await route.abort();
+  });
 
-    const fab = page.locator('#fanbox-downloader-ext-fab');
-    await fab.waitFor({ state: 'visible' });
-    await fab.locator('button').click();
+  const page = await context.newPage();
+  await page.goto(CREATOR_PAGE_URL);
 
-    const overlay = page.locator('#fanbox-downloader-ext-overlay');
-    // renderSettings(): 1つ目の number input が取得件数上限、2つ目が API 間隔(ms)
-    const intervalInput = overlay.locator('.setting-row input[type="number"]').nth(1);
-    await intervalInput.fill('50');
-    await overlay.getByRole('button', { name: 'ダウンロード開始' }).click();
+  const fab = page.locator('#fanbox-downloader-ext-fab');
+  await fab.waitFor({ state: 'visible' });
+  await fab.locator('button').click();
 
+  const overlay = page.locator('#fanbox-downloader-ext-overlay');
+  // renderSettings(): 1つ目の number input が取得件数上限、2つ目が API 間隔(ms)
+  const intervalInput = overlay.locator('.setting-row input[type="number"]').nth(1);
+  await intervalInput.fill('50');
+  await overlay.getByRole('button', { name: 'ダウンロード開始' }).click();
+
+  return { context, page, overlay, userDataDir, unexpectedRequests };
+}
+
+test('FANBOX creator ページ: 収集から ZIP 生成まで完走する', async () => {
+  const session = await launchAndStartDownload(JSON_RESPONSES, 'ok');
+  const { context, page, userDataDir, unexpectedRequests } = session;
+
+  try {
     await expect
       .poll(() => page.evaluate(readTestState), { timeout: 30_000 })
       .toMatchObject({ overlayState: 'complete', zipDone: '1' });
@@ -243,7 +280,11 @@ test('FANBOX creator ページ: 収集から ZIP 生成まで完走する', asyn
 
     expect(state.error, 'startCollecting でエラーが発生した').toBeNull();
     expect(state.aborted, 'ダウンロードが中断された').toBeNull();
-    expect(state.failedPostCount).toBe('0');
+    expect(state.unsupportedResponse, '未対応のレスポンス形式として中断された').toBeNull();
+    expect(state.addedPostCount).toBe('2');
+    expect(state.unavailablePostCount).toBe('0');
+    expect(state.unsupportedPostCount).toBe('0');
+    expect(state.apiFailedPostCount).toBe('0');
     expect(state.failedPageCount).toBe('0');
     expect(state.failedFileCount).toBe('0');
 
@@ -260,6 +301,71 @@ test('FANBOX creator ページ: 収集から ZIP 生成まで完走する', asyn
     const parsed = parseZip(zipBytes);
     const entryNames = [...parsed.entries.map((e) => e.name)].sort();
     expect(entryNames).toEqual(EXPECTED_ZIP_ENTRIES);
+  } finally {
+    await context.close();
+    await rm(userDataDir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Issue #14 の中心要件の回帰テスト: 登録できた投稿 (addByPostInfo が 'added' を返した投稿) が
+ * 0 件のとき、ZIP を一切書き込まない (downloadAsZip / handle.createWritable を呼ばない) こと。
+ *
+ * buildCompleteMessage の文言テスト (test/overlay.test.ts) は「見出しがどう組み立つか」しか
+ * 検証しておらず、「実際に downloadAsZip を呼んでいないか」は別の懸念である。0 件判定が
+ * ZIP 生成後に移動する、あるいは削除されるような回帰が起きても、文言テストだけでは検出できない。
+ *
+ * ここでは 2 投稿とも一覧時点で isRestricted (支援プランの範囲外) の fixture を使い、
+ * addByPostInfo を一度も呼ばずに addedPostCount === 0 で collect() が正常に返るケースを再現する。
+ * downloadAsZip が呼ばれていれば test-hooks.ts の createTestSaveHandle().writable.close() が
+ * data-fbdl-zip-done / data-fbdl-zip-b64 を publish するため、これらが null のまま
+ * overlayState が 'complete' に到達することが「ZIP を書き込んでいない」ことの直接的な証拠になる。
+ */
+test('登録できた投稿が 0 件のとき ZIP を生成せず保存しない (Issue #14)', async () => {
+  const allRestrictedResponses: Record<string, unknown> = {
+    [PLANS_URL]: PLANS_RESPONSE,
+    [TAGS_URL]: TAGS_RESPONSE,
+    [PAGINATE_URL]: PAGINATE_RESPONSE,
+    [LIST_PAGE_URL]: {
+      body: {
+        posts: [
+          { ...POST_A_STUB, isRestricted: true },
+          { ...POST_B_STUB, isRestricted: true },
+        ],
+      },
+    },
+    // isRestricted な投稿は post.info を叩かずスキップされる想定なので、
+    // POST_INFO_URL_A/B はここに含めない。含めていないのに万一リクエストされれば
+    // unexpectedRequests (fail-closed) で検出される。
+  };
+
+  const session = await launchAndStartDownload(allRestrictedResponses, 'nosave');
+  const { context, page, overlay, userDataDir, unexpectedRequests } = session;
+
+  try {
+    await expect
+      .poll(() => page.evaluate(readTestState), { timeout: 30_000 })
+      .toMatchObject({ overlayState: 'complete' });
+
+    const state = await page.evaluate(readTestState);
+
+    expect(state.error, 'startCollecting でエラーが発生した').toBeNull();
+    expect(state.aborted, 'ダウンロードが中断された').toBeNull();
+    expect(state.unsupportedResponse, '未対応のレスポンス形式として中断された').toBeNull();
+    expect(state.addedPostCount).toBe('0');
+    expect(state.unavailablePostCount).toBe('2');
+
+    // 中心要件: downloadAsZip が呼ばれていない (= ZIP を一切書き込んでいない)
+    expect(state.zipDone, 'addedPostCount 0 なのに ZIP が書き込まれた (downloadAsZip が呼ばれた)').toBeNull();
+    expect(state.zipB64, 'addedPostCount 0 なのに ZIP の中身が生成された').toBeNull();
+    // ZIP フェーズ (downloadAsZip 内) に入っていれば publish されるはずの値も未設定のまま
+    expect(state.failedFileCount, 'ZIP フェーズの集計が publish された (downloadAsZip に入ってしまった)').toBeNull();
+    expect(state.fetchedUrls, 'ZIP フェーズのファイル取得が発生した').toBeNull();
+
+    const resultText = await overlay.locator('.result-text').textContent();
+    expect(resultText, '完了画面に非保存の理由が表示されていない').toBeTruthy();
+
+    expect(unexpectedRequests, `予期しないリクエストが発生した: ${unexpectedRequests.join(', ')}`).toEqual([]);
   } finally {
     await context.close();
     await rm(userDataDir, { recursive: true, force: true });
