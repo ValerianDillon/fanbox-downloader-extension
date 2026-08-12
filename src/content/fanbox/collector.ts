@@ -218,6 +218,11 @@ async function getItemsByCreator(
     console.error('投稿一覧の取得に失敗:', e);
     // 形状エラーと枯渇は原因が特定できているので、汎用の文言に潰さずそのまま伝える
     if (e instanceof ApiShapeError || e instanceof RateLimitExhaustedError) throw e;
+    // FetchApiError (通信/HTTP の失敗) だけを汎用の文言に変換する。それ以外の想定外の例外
+    // (abort、validator や内部処理のバグ等) まで丸めると、元の型・メッセージ・スタックが
+    // 失われ、原因調査ができなくなる。他の経路 (getItemsByCreator 内の各 catch) で
+    // 採用した陽性判定の方針とも矛盾する。
+    if (!(e instanceof FetchApiError)) throw e;
     throw new Error('投稿一覧の取得に失敗しました');
   }
 

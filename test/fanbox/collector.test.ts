@@ -127,6 +127,22 @@ describe('collect', () => {
     await expect(collectCreator()).rejects.toThrow(/形状が想定外/);
   });
 
+  test('ページ URL 一覧の取得中の想定外の例外 (FetchApiError 以外) は汎用エラーに丸めず元のまま伝播する', async () => {
+    // service worker からの応答オブジェクト自体が壊れている (undefined) ケースを模擬する。
+    // fetchJson 内部で response.backoffUntil の参照時に TypeError が起きる
+    // (test/fanbox/api.test.ts の「想定外の例外」テストと同じ技法)。TypeError は
+    // FetchApiError ではないので、「投稿一覧の取得に失敗しました」という汎用エラーに
+    // 丸めず、型・メッセージ・スタックを保ったまま伝播すべき
+    mockApi({
+      ...BASE_RESPONSES,
+      [`https://api.fanbox.cc/post.paginateCreator?creatorId=${CREATOR_ID}`]: () =>
+        undefined as unknown as ProxyApiResponse,
+    });
+
+    const error = await collectCreator().catch((e) => e);
+    expect(error).toBeInstanceOf(TypeError);
+  });
+
   test('一覧要素が id / isRestricted を欠いていれば中断する', async () => {
     // ラッパーは新形状のまま、要素側の型だけが変わったケース
     mockApi({ ...BASE_RESPONSES, [LIST_PAGE_URL]: { body: { posts: [{ id: '1001', isRestricted: 'false' }] } } });
