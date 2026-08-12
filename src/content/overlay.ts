@@ -93,9 +93,12 @@ function buildFailureLines(params: CompleteMessageParams): string[] {
   }
   if (params.failedFileCount > 0) {
     // ZIP フェーズのファイル欠落 (Issue #18) は Issue #14 の分類の対象外だが、
-    // 表示形式を揃えるため同じ「理由ごとに独立した行」に合流させる
+    // 表示形式を揃えるため同じ「理由ごとに独立した行」に合流させる。
+    // failedFileCount はカバー画像・添付ファイルを合わせた「ファイル数」の集計
+    // (DownloadZipResult.failedFileCount) であり投稿数ではないため、1 投稿から
+    // 複数ファイルが失敗した場合と数が食い違わないよう「投稿」ではなく「ファイル」と表記する
     lines.push(
-      `ファイルの取得に失敗した投稿: ${params.failedFileCount} 件 (カバー画像含む。時間を置いて再試行してください)`,
+      `取得できなかったファイル: ${params.failedFileCount} 件 (カバー画像含む。時間を置いて再試行してください)`,
     );
   }
   return lines;

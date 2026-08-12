@@ -20,7 +20,13 @@ type OverlayState = 'settings' | 'collecting' | 'downloading' | 'complete';
 
 const validTransitions: Record<OverlayState, OverlayState[]> = {
   settings: ['collecting'],
-  collecting: ['downloading', 'settings'],
+  // collecting → complete (downloading を経由しない) は startCollecting (src/content/overlay.ts)
+  // の次の 3 箇所が使う。詳細は下の describe ブロックのコメントを参照。
+  // 1. collect() が正常に返り、addedPostCount === 0 (Issue #14: 保存できる投稿が無い)
+  // 2. collect() が ApiShapeError / PostBodyInvalidError を投げる (Issue #14: 未対応のレスポンス形式)
+  // 3. collect() がそれ以外の例外を投げる (例: addedPostCount === 0 のまま枯渇した
+  //    RateLimitExhaustedError、または想定外のバグ) — catch の汎用フォールバックに落ちる
+  collecting: ['downloading', 'settings', 'complete'],
   downloading: ['complete', 'settings'],
   complete: ['settings'],
 };
@@ -40,6 +46,17 @@ describe('Overlay 状態遷移', () => {
 
   test('collecting → settings (キャンセル) は有効', () => {
     expect(isValidTransition('collecting', 'settings')).toBe(true);
+  });
+
+  // Issue #14: downloading を経由せず collecting → complete に直接遷移する経路が 3 つある。
+  // いずれも downloadAsZip を呼ぶ前 (= 保存すべき ZIP が無い、または安全に取り込めない
+  // レスポンスだった) ことが分かった時点で直接 complete に着地させるための遷移である。
+  // 1. collect() が正常に返り addedPostCount === 0 (登録できた投稿が無いので ZIP を保存しない)
+  // 2. collect() が ApiShapeError / PostBodyInvalidError を投げる (未対応のレスポンス形式で中断)
+  // 3. collect() がそれ以外の例外を投げる (例: addedPostCount === 0 のまま枯渇した
+  //    RateLimitExhaustedError) — catch の汎用フォールバックが complete へ落とす
+  test('collecting → complete は有効 (downloadAsZip を呼ぶ前に保存不要/中断が確定した場合)', () => {
+    expect(isValidTransition('collecting', 'complete')).toBe(true);
   });
 
   // Issue #17: 通常の完了、および「ここまでで終了」ボタンによる中断のどちらも
@@ -161,7 +178,7 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
   test('ZIP フェーズのファイル欠落 (カバー画像含む) のみ: 見出しが一部取得できませんでしたに変わる', () => {
     const message = buildCompleteMessage({ ...base, failedFileCount: 3 });
     expect(message).toBe(
-      `${PARTIAL_FILE_FAILURE_HEADLINE}\nファイルの取得に失敗した投稿: 3 件 (カバー画像含む。時間を置いて再試行してください)`,
+      `${PARTIAL_FILE_FAILURE_HEADLINE}\n取得できなかったファイル: 3 件 (カバー画像含む。時間を置いて再試行してください)`,
     );
   });
 
@@ -180,7 +197,7 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
         '未対応の本文形式: 2 件 (拡張機能の更新が必要な可能性があります)',
         'API 通信に失敗した投稿: 3 件 (時間を置いて再試行してください)',
         '取得できなかった一覧ページ: 4 ページ (欠落した投稿数は不明)',
-        'ファイルの取得に失敗した投稿: 5 件 (カバー画像含む。時間を置いて再試行してください)',
+        '取得できなかったファイル: 5 件 (カバー画像含む。時間を置いて再試行してください)',
       ].join('\n'),
     );
   });
@@ -193,7 +210,7 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
   test('レート制限による打ち切りと ZIP フェーズの失敗が両方あっても見出しは打ち切りが勝ち、件数は併記する', () => {
     const message = buildCompleteMessage({ ...base, failedFileCount: 5, stoppedReason: 'rate-limit-exhausted' });
     expect(message).toBe(
-      `${RATE_LIMIT_EXHAUSTED_HEADLINE}\nファイルの取得に失敗した投稿: 5 件 (カバー画像含む。時間を置いて再試行してください)`,
+      `${RATE_LIMIT_EXHAUSTED_HEADLINE}\n取得できなかったファイル: 5 件 (カバー画像含む。時間を置いて再試行してください)`,
     );
   });
 
@@ -204,7 +221,7 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
   test('中断かつ ZIP フェーズの失敗がある場合、PARTIAL_DOWNLOAD_MESSAGE を維持しつつ件数を併記する', () => {
     const message = buildCompleteMessage({ ...base, aborted: true, failedFileCount: 4 });
     expect(message).toBe(
-      `${PARTIAL_DOWNLOAD_MESSAGE}\nファイルの取得に失敗した投稿: 4 件 (カバー画像含む。時間を置いて再試行してください)`,
+      `${PARTIAL_DOWNLOAD_MESSAGE}\n取得できなかったファイル: 4 件 (カバー画像含む。時間を置いて再試行してください)`,
     );
   });
 
@@ -253,7 +270,7 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
         PARTIAL_DOWNLOAD_MESSAGE,
         '本文を利用できなかった投稿: 1 件 (閲覧権限または支援プランの範囲外など)',
         '取得できなかった一覧ページ: 2 ページ (欠落した投稿数は不明)',
-        'ファイルの取得に失敗した投稿: 3 件 (カバー画像含む。時間を置いて再試行してください)',
+        '取得できなかったファイル: 3 件 (カバー画像含む。時間を置いて再試行してください)',
       ].join('\n'),
     );
   });
