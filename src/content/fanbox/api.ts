@@ -553,13 +553,15 @@ export class ApiSession {
   }
 
   /**
-   * 閲覧できない投稿は HTTP 4xx で返るため、200 なのに body.post が無いのは形状の想定違いとみなす。
-   * 全投稿がこの経路を通る以上、undefined を返して投稿単位の失敗に丸めると、
-   * 仕様変更時に「中身が空の ZIP を完了扱い」で出してしまう。
+   * 200 なのに body.post が無いのは形状の想定違いとみなす。全投稿がこの経路を通る以上、
+   * undefined を返して投稿単位の失敗に丸めると、仕様変更時に「中身が空の ZIP を完了扱い」で
+   * 出してしまう。
    *
    * 投稿オブジェクト側は収集の分岐に使う id / type / isRestricted だけを検査する。
-   * body は支援額が足りない投稿では正常に欠落しうる (addByPostInfo がそれを検出して
-   * スキップする) ので、必須にはできない。
+   * body は必須にはできない。実 API では、支援額が足りず閲覧できない投稿も HTTP 200 で
+   * 投稿オブジェクトを返し、`body` プロパティ自体は存在したまま値が `null` になる
+   * (`isRestricted: true` / `type` / `coverImageUrl` / `tags` は通常どおり入る)。
+   * addByPostInfo がこれを検出して投稿単位でスキップする。
    */
   async fetchPostInfo(postId: string, signal?: AbortSignal): Promise<PostInfo> {
     const url = `https://api.fanbox.cc/post.info?postId=${postId}`;
