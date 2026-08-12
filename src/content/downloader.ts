@@ -81,7 +81,9 @@ async function proxyFetch(url: string, signal?: AbortSignal): Promise<ProxyFetch
   // retryAfter は文字列でなければ null) をここで保証してから先へ渡す。
   const status = Number.isFinite(response.status) ? response.status : 0;
   const retryAfter = typeof response.retryAfter === 'string' ? response.retryAfter : null;
-  if (!response.ok || !response.data) {
+  // data の欠損判定は型で行う。0 バイトのファイルは有効な空文字列 base64 (data: '') として
+  // 届くため、truthiness (!response.data) で判定すると正常な空ファイルを失敗扱いしてしまう。
+  if (!response.ok || typeof response.data !== 'string') {
     return { blob: null, status, retryAfter };
   }
   try {

@@ -533,4 +533,23 @@ describe('fetchWithRetry の試行記録 (Issue #18)', () => {
     expect(attempts.every((a) => a.status === 0)).toBe(true);
     expect(attempts.every((a) => a.retryAfter === null)).toBe(true);
   });
+
+  test('0 バイトのファイル (data が空文字列) は失敗ではなく空の Blob として成功する', async () => {
+    // HTTP 2xx で本文 0 バイトのファイルは data: '' (有効な空 base64) として届く。
+    // data の欠損判定を truthiness で行うと、この正常な空ファイルを失敗扱いして
+    // failedFileCount に誤計上してしまうため、型 (string かどうか) で判定する
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async () => ({ ok: true, status: 200, retryAfter: null, data: '' }),
+      },
+    };
+
+    const attempts: MediaFetchAttempt[] = [];
+    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, undefined, 'file', attempts);
+
+    expect(blob).not.toBeNull();
+    expect(blob?.size).toBe(0);
+    expect(attempts.map((a) => a.status)).toEqual([200]);
+  });
 });
