@@ -86,7 +86,7 @@ function makeHandle(): { handle: FileSystemFileHandle; mock: MockWritableStream 
 }
 
 describe('downloadAsZip - publishedDatetime (info/html, chrome 不要)', () => {
-  test('post 配下 info/index.html は日時付与、ルートと fallback は付与なし', async () => {
+  test('post 配下 info/index.html とルートは日時付与、publishedDatetime なしの post 配下は付与なし', async () => {
     const published = '2024-05-01T12:34:56Z';
     const expectedUnix = Math.floor(new Date(published).getTime() / 1000);
     const json = JSON.stringify({
@@ -121,17 +121,18 @@ describe('downloadAsZip - publishedDatetime (info/html, chrome 不要)', () => {
 
     const entries = parseLocalEntries(mock.toBuffer());
 
-    // ルート index.html は date なし
-    const root = entryByName(entries, 'u/index.html');
-    expect(root.dosTime).toBe(0);
-    expect(root.dosDate).toBe(0);
-    expect(root.extraLen).toBe(0);
-    expect(root.utMtime).toBeNull();
-
     // ルートディレクトリの日時は、投稿の publishedDatetime のうち有効な値の最大値
     // (このケースでは withDate のみが有効な値なので withDate の日時と一致する)
     const rootDir = entryByName(entries, 'u/');
     expect(rootDir.utMtime).toBe(expectedUnix);
+
+    // ルート index.html にもルートディレクトリと同じ日時が付く (download-helper v4.6.0 以降)。
+    // 日時を与えないと DOS date 0 となり、展開時に ZIP の epoch (1980-01-01) より前の
+    // 不正な mtime になるため
+    const root = entryByName(entries, 'u/index.html');
+    expect(root.utMtime).toBe(expectedUnix);
+    expect(root.dosDate).not.toBe(0);
+    expect(root.extraLen).toBeGreaterThan(0);
 
     // publishedDatetime ありの post 配下は DOS time/date + UT extra
     for (const path of ['u/withDate/info.json', 'u/withDate/index.html']) {
