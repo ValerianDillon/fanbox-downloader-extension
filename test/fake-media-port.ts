@@ -96,6 +96,8 @@ export function simpleResponder(
       retryAfter: res.retryAfter ?? null,
       contentLength: ok ? (res.body?.length ?? 0) : null,
       contentRange: null,
+      etag: null,
+      lastModified: null,
       ...(res.status === 0 ? { error: 'network down' } : {}),
     });
     if (!ok) return;

@@ -127,6 +127,8 @@ describe('streamMedia', () => {
       retryAfter: null,
       contentLength: body.length,
       contentRange: null,
+      etag: null,
+      lastModified: null,
     });
     const chunks = messages.filter((m) => m.type === 'chunk');
     // 本文は CHUNK_BYTES × 2 + 端数なので、CHUNK_BYTES ちょうど × 2 + 端数の 3 メッセージに分かれる。
@@ -210,7 +212,16 @@ describe('streamMedia', () => {
       depsWith(async () => fakeResponse({ status: 429, headers: { 'Retry-After': '30' }, body: bytesOf(10) })),
     );
     expect(messages).toEqual([
-      { type: 'head', ok: false, status: 429, retryAfter: '30', contentLength: null, contentRange: null },
+      {
+        type: 'head',
+        ok: false,
+        status: 429,
+        retryAfter: '30',
+        contentLength: null,
+        contentRange: null,
+        etag: null,
+        lastModified: null,
+      },
     ]);
   });
 
@@ -222,7 +233,16 @@ describe('streamMedia', () => {
       depsWith(async () => fakeResponse({ status: 404 })),
     );
     expect(messages).toEqual([
-      { type: 'head', ok: false, status: 404, retryAfter: null, contentLength: null, contentRange: null },
+      {
+        type: 'head',
+        ok: false,
+        status: 404,
+        retryAfter: null,
+        contentLength: null,
+        contentRange: null,
+        etag: null,
+        lastModified: null,
+      },
     ]);
   });
 
@@ -320,24 +340,53 @@ describe('streamMedia', () => {
     expect(capturedSignal?.aborted).toBe(true);
   });
 
-  test('本文の到着が遅いときは CHUNK_BYTES 未満でも FLUSH_INTERVAL_MS ごとに送る (service worker の idle timer リセット用)', async () => {
-    const body = bytesOf(3000);
+  test('read() がブロック中でも、溜まっているぶんを FLUSH_INTERVAL_MS ごとに実時間タイマーで送る (idle timer リセット)', async () => {
+    // 小さい断片 (CHUNK_BYTES 未満) を 1 つ流したあと read() が長くブロックするストリームを作り、
+    // read() が返らない間でも定期 flush で chunk が送られることを確認する。
+    // read() が返った時だけ時間を見る方式ではこの chunk は送られず、service worker が停止しうる。
+    const first = bytesOf(1000);
+    let release = () => {};
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let pulls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        pulls++;
+        if (pulls === 1) {
+          controller.enqueue(first);
+          return;
+        }
+        // 2 回目の pull はテストが解放するまでブロックする
+        await blocked;
+        controller.close();
+      },
+    });
+    const response = {
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'Content-Length': '1000' }),
+      body: stream,
+    } as unknown as Response;
+
     const { port, messages } = fakePort();
-    // now() を piece の到着ごとに 3 秒進めることで、FLUSH_INTERVAL_MS (2 秒) 経過を再現する
-    let clock = 0;
-    await streamMedia(
+    const done = streamMedia(
       port,
       { type: 'start', url: 'https://downloads.fanbox.cc/f', offset: 0 },
-      depsWith(async () => fakeResponse({ status: 200, body, pieces: 3 }), {
-        now: () => {
-          clock += 3000;
-          return clock;
-        },
-      }),
+      {
+        fetch: async () => response,
+        flushIntervalMs: 10,
+      },
     );
-    // 3 piece それぞれが個別の chunk として送られる (CHUNK_BYTES には遠く及ばないが時間経過で flush される)
-    expect(messages.filter((m) => m.type === 'chunk').length).toBe(3);
-    expect(concatChunks(messages)).toEqual(body);
-    expect(messages[messages.length - 1]).toEqual({ type: 'end', bytes: 3000 });
+    // read() がブロックしている間に、実時間タイマーで最初の 1000 バイトが flush されるのを待つ
+    await Bun.sleep(60);
+    expect(messages.filter((m) => m.type === 'chunk').length).toBe(1);
+    expect((messages.find((m) => m.type === 'chunk') as { data: string }).data).toBe(
+      btoa(String.fromCharCode(...first)),
+    );
+    // ブロックを解放してストリームを終端させる
+    release();
+    await done;
+    expect(messages[messages.length - 1]).toEqual({ type: 'end', bytes: 1000 });
   });
 });

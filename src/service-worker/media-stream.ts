@@ -21,7 +21,11 @@ export type MediaStreamDeps = {
   fetch: (url: string, init: RequestInit) => Promise<Response>;
   /** 各 chunk の送信直前に呼ばれる観測フック (テストビルドの状態公開・切断シミュレーション用)。省略可 */
   onChunkSent?: (info: { url: string; sentBytes: number }) => void;
-  now?: () => number;
+  /** 定期 flush の間隔 (ミリ秒)。省略時は FLUSH_INTERVAL_MS。テストで短くする */
+  flushIntervalMs?: number;
+  /** setInterval / clearInterval の差し替え (テスト用)。省略時はグローバル */
+  setInterval?: (handler: () => void, ms: number) => ReturnType<typeof setInterval>;
+  clearInterval?: (id: ReturnType<typeof setInterval>) => void;
 };
 
 const defaultDeps: MediaStreamDeps = {
@@ -32,7 +36,10 @@ const defaultDeps: MediaStreamDeps = {
  * `start` 要求 1 つぶんのメディア取得を Port 上に流す (Issue #22)。
  *
  * - `head` を必ず 1 度送る。fetch() 自体の失敗 (通信障害) は ok:false, status:0 で表し、fetchApi と揃える
- * - ok な応答は本文を逐次読み、CHUNK_BYTES 溜まるか FLUSH_INTERVAL_MS 経過するごとに `chunk` を送る
+ * - ok な応答は本文を逐次読み、CHUNK_BYTES 溜まったら `chunk` を送る。加えて FLUSH_INTERVAL_MS ごとに
+ *   実時間タイマーで溜まっているぶんを flush する (read() が長時間ブロックしても、溜まっているデータを
+ *   送って service worker の idle timer をリセットするため。read() が返った時だけ時間を見る方式では、
+ *   次の read() が 30 秒以上返らないと flush されず service worker が停止しうる)
  * - 本文を読み切ったら `end` を送る。読み込み中に失敗したら `error` を送る
  * - Port が切断されたら (content script のキャンセル/タブ閉鎖) fetch を abort し、以後は何も送らない
  *
@@ -77,12 +84,16 @@ export async function streamMedia(
       console.warn('メディア転送先の Port へ送信できなかったため転送を打ち切ります:', e);
     }
   };
-  const now = deps.now ?? (() => Date.now());
 
   let r: Response;
   try {
     const headers: Record<string, string> = {};
-    if (request.offset > 0) headers.Range = `bytes=${request.offset}-`;
+    if (request.offset > 0) {
+      headers.Range = `bytes=${request.offset}-`;
+      // 切断中に中身が差し替わっていたら、サーバは If-Range 不一致で 206 ではなく 200 (全体) を返す。
+      // content script 側はそれを受けて先頭から取り直す (旧本文 prefix + 新本文 suffix の結合を防ぐ)
+      if (request.ifRange) headers['If-Range'] = request.ifRange;
+    }
     r = await deps.fetch(request.url, { credentials: 'include', signal: controller.signal, headers });
   } catch (e) {
     // fetch() 自体の失敗 (実際の通信障害)、または切断による abort。後者は送っても届かないので post が捨てる
@@ -93,6 +104,8 @@ export async function streamMedia(
       retryAfter: null,
       contentLength: null,
       contentRange: null,
+      etag: null,
+      lastModified: null,
       error: String(e),
     });
     return;
@@ -111,6 +124,8 @@ export async function streamMedia(
     retryAfter,
     contentLength,
     contentRange: r.headers.get('Content-Range'),
+    etag: r.headers.get('ETag'),
+    lastModified: r.headers.get('Last-Modified'),
   });
   if (!r.ok) {
     // 本文は読まずに捨てる。HTTP エラーの本文を content script に転送する用途はない
@@ -132,7 +147,6 @@ export async function streamMedia(
   const pending: Uint8Array[] = [];
   let pendingBytes = 0;
   let sentBytes = 0;
-  let lastFlushAt = now();
 
   /**
    * pending の先頭から size バイトを 1 つの Uint8Array に切り出す (size <= pendingBytes)。
@@ -170,7 +184,6 @@ export async function streamMedia(
     sentBytes += bytes.length;
     deps.onChunkSent?.({ url: request.url, sentBytes });
     post({ type: 'chunk', data: uint8ArrayToBase64(bytes) });
-    lastFlushAt = now();
   };
 
   /** CHUNK_BYTES 単位で送れるだけ送る。force なら端数も送る */
@@ -183,6 +196,15 @@ export async function streamMedia(
     }
   };
 
+  // 実時間タイマーで定期 flush する。read() が長時間ブロックしても、溜まっているぶんを送って
+  // service worker の idle timer をリセットする (post は同期・非再入なので read ループとの競合はない)。
+  const setIntervalFn = deps.setInterval ?? ((handler, ms) => setInterval(handler, ms));
+  const clearIntervalFn = deps.clearInterval ?? ((id) => clearInterval(id));
+  const flushIntervalMs = deps.flushIntervalMs ?? FLUSH_INTERVAL_MS;
+  const timer = setIntervalFn(() => {
+    if (!disconnected) flush(true);
+  }, flushIntervalMs);
+
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -191,11 +213,7 @@ export async function streamMedia(
       if (value.length === 0) continue;
       pending.push(value);
       pendingBytes += value.length;
-      if (pendingBytes >= CHUNK_BYTES) {
-        flush(false);
-      } else if (now() - lastFlushAt >= FLUSH_INTERVAL_MS) {
-        flush(true);
-      }
+      if (pendingBytes >= CHUNK_BYTES) flush(false);
       if (disconnected) return;
     }
     flush(true);
@@ -208,5 +226,7 @@ export async function streamMedia(
     } catch {
       // 既に閉じている等
     }
+  } finally {
+    clearIntervalFn(timer);
   }
 }

@@ -70,13 +70,17 @@ type StreamOutcome =
  * それ以外 (HTTP エラー、通信失敗、切断が続いて諦めた) は blob: null と観測済みの status を返す。
  *
  * 再開: 終端 (`end`) より前に Port が切れたら、受信済みバイト数を offset にして新しい Port で `start` を送る。
- * - 206 かつ Content-Range の開始が offset と一致 → 続きとして受け取る
- * - 200 (サーバが Range を無視) → 受信済みのぶんを捨てて先頭から受け直す
- * - それ以外 (416 等) → HTTP 失敗として報告する
+ * 初回応答の ETag / Last-Modified を `If-Range` として渡すため、切断中に中身が差し替わっていたら
+ * サーバは 200 (全体) を返し、先頭から取り直す (旧本文 prefix + 新本文 suffix の結合を防ぐ)。
+ * - 206 かつ Content-Range が要求 offset と一致 → 続きとして受け取り、Content-Range の total を全体長に採用する
+ * - 200 (サーバが Range を無視 / If-Range 不一致) → 受信済みのぶんを捨てて先頭から受け直す
+ * - それ以外の成功 (204 等) や不一致な 206 → 失敗として上位の再試行に委ねる
  *
- * 整合性: 本文の総バイト数は、初回応答の Content-Length (あれば)、および各 Port の `end.bytes` と
- * 突き合わせる。どちらかが合わなければ通信失敗 (transport) として扱い、成功とは報告しない
- * (欠けたファイルを完了として ZIP に入れないため)。
+ * 整合性: 全体長は初回の Content-Length か 206 の Content-Range total から得る。得られた場合は最終的な
+ * 受信合計と突き合わせ、一致しなければ成功にしない。全体長が最後まで不明なまま終端を受けた場合は、
+ * 先頭から一度も途切れず受け切った (baseOffset === 0) ときだけ成功とみなす (途中から再開したのに
+ * 全体長を確認できないケースは、欠落を検出できないので成功にしない)。各 Port の `end.bytes` も
+ * 受信数と突き合わせる。いずれの不一致も通信失敗 (transport) として扱い、欠けたファイルを ZIP に入れない。
  *
  * メモリ: chunk ごとに Blob 化して配列に持ち、最後に 1 つの Blob に結合する。JS ヒープに本文全体を
  * 置かない (Blob の実体はブラウザ側で管理され、必要ならディスクに退避される)。
@@ -88,15 +92,21 @@ export async function fetchMediaViaPort(
 ): Promise<MediaFetchResult | null> {
   const parts: Blob[] = [];
   let received = 0;
-  /** 初回応答の Content-Length (不明なら null)。再開時の 206 の Content-Range total とも突き合わせる */
+  /** 全体長 (不明なら null)。初回の Content-Length か 206 の Content-Range total から確定する */
   let expectedTotal: number | null = null;
+  /** 初回応答の representation validator (ETag 優先、なければ Last-Modified)。再開時の If-Range に使う */
+  let validator: string | null = null;
   let resumes = 0;
 
   while (true) {
     if (signal?.aborted) return null;
-    const outcome = await streamOnce(url, received, signal, deps, {
-      onHead: (total) => {
-        if (expectedTotal === null) expectedTotal = total;
+    const outcome = await streamOnce(url, received, validator, signal, deps, {
+      setExpectedTotal: (total) => {
+        expectedTotal = total;
+      },
+      getExpectedTotal: () => expectedTotal,
+      setValidator: (v) => {
+        if (validator === null) validator = v;
       },
       onRestart: () => {
         parts.length = 0;
@@ -107,7 +117,6 @@ export async function fetchMediaViaPort(
         parts.push(new Blob([bytes]));
         received += bytes.length;
       },
-      expectedTotal: () => expectedTotal,
     });
     switch (outcome.kind) {
       case 'aborted':
@@ -117,6 +126,8 @@ export async function fetchMediaViaPort(
       case 'http':
         return { blob: null, status: outcome.status, retryAfter: outcome.retryAfter };
       case 'transport':
+        // 受信済みがある (received > 0) ときだけ Range で続きを要求する。received === 0 は資すべき受信が
+        // 無く、offset 0 からの取り直しは fetchWithRetry の再試行と同じなので、ここでは重ねて回さず失敗を返す。
         if (received > 0 && resumes < MAX_RESUMES) {
           resumes++;
           console.warn(
@@ -130,16 +141,20 @@ export async function fetchMediaViaPort(
 }
 
 type StreamCallbacks = {
-  onHead: (total: number | null) => void;
+  /** 全体長を確定する (初回の Content-Length / 206 の Content-Range total) */
+  setExpectedTotal: (total: number) => void;
+  getExpectedTotal: () => number | null;
+  /** 初回 head の validator を記録する (2 回目以降は無視される) */
+  setValidator: (validator: string | null) => void;
   onRestart: () => void;
   onChunk: (bytes: Uint8Array<ArrayBuffer>) => void;
-  expectedTotal: () => number | null;
 };
 
 /** 1 つの Port で `start` を送り、終端か切断まで受信する */
 function streamOnce(
   url: string,
   offset: number,
+  ifRange: string | null,
   signal: AbortSignal | undefined,
   deps: MediaFetchDeps,
   callbacks: StreamCallbacks,
@@ -206,16 +221,27 @@ function streamOnce(
             finish(status === 0 ? { kind: 'transport', status, retryAfter } : { kind: 'http', status, retryAfter });
             return;
           }
+          // 初回応答の validator を記録する (再開時の If-Range に使う)。ETag 優先、なければ Last-Modified
+          callbacks.setValidator(
+            typeof message.etag === 'string' && message.etag.length > 0
+              ? message.etag
+              : typeof message.lastModified === 'string' && message.lastModified.length > 0
+                ? message.lastModified
+                : null,
+          );
           if (offset > 0) {
             if (status === 206) {
               const range = parseContentRange(message.contentRange);
-              const expected = callbacks.expectedTotal();
-              if (
-                !range ||
-                range.start !== offset ||
-                (expected !== null && range.total !== null && range.total !== expected)
-              ) {
-                // 要求した位置から始まっていない、または総量が初回と食い違う 206 は信用できない。
+              const expected = callbacks.getExpectedTotal();
+              // 要求した位置から始まっているか、Content-Length が Content-Range の幅と整合するか、
+              // total が既知の全体長と食い違わないか。いずれも満たさない 206 は信用しない。
+              const rangeOk =
+                range !== null &&
+                range.start === offset &&
+                range.end >= range.start &&
+                (message.contentLength === null || message.contentLength === range.end - range.start + 1) &&
+                !(range.total !== null && expected !== null && range.total !== expected);
+              if (!rangeOk) {
                 // 受信済みのぶんも捨てる (どこまでが正しいか分からないため)。上位の再試行に委ねる
                 console.warn(
                   `Range 再開の応答が要求と一致しないため受信済みデータを破棄します: ${url}`,
@@ -225,14 +251,22 @@ function streamOnce(
                 finish({ kind: 'transport', status, retryAfter });
                 return;
               }
-            } else {
-              // 200: サーバが Range を無視して全体を返した。受信済みのぶんを捨てて先頭から受け直す
+              // Content-Range total が得られたら全体長として採用する (初回に Content-Length が無くても
+              // ここで確定でき、終端時の欠落検出が効くようになる)
+              if (range.total !== null) callbacks.setExpectedTotal(range.total);
+            } else if (status === 200) {
+              // サーバが Range を無視 (または If-Range 不一致) で全体を返した。先頭から受け直す
               callbacks.onRestart();
               baseOffset = 0;
-              callbacks.onHead(message.contentLength);
+              if (message.contentLength !== null) callbacks.setExpectedTotal(message.contentLength);
+            } else {
+              // 206/200 以外の成功 (204 等) は Range 再開として解釈できない。失敗として扱う
+              console.warn(`Range 再開に想定外の成功ステータス (${status}) が返りました: ${url}`);
+              finish({ kind: 'transport', status, retryAfter });
+              return;
             }
-          } else {
-            callbacks.onHead(message.contentLength);
+          } else if (message.contentLength !== null) {
+            callbacks.setExpectedTotal(message.contentLength);
           }
           return;
         }
@@ -252,17 +286,23 @@ function streamOnce(
         }
         case 'end': {
           if (!headSeen) return;
-          const expected = callbacks.expectedTotal();
+          const expected = callbacks.getExpectedTotal();
           const totalReceived = baseOffset + portBytes;
           if (message.bytes !== portBytes) {
             console.error(`メディア転送のバイト数が一致しません (送信 ${message.bytes} / 受信 ${portBytes}): ${url}`);
             finish({ kind: 'transport', status, retryAfter });
             return;
           }
-          if (expected !== null && totalReceived !== expected) {
-            console.error(
-              `メディアの長さが Content-Length と一致しません (期待 ${expected} / 受信 ${totalReceived}): ${url}`,
-            );
+          if (expected !== null) {
+            if (totalReceived !== expected) {
+              console.error(`メディアの長さが全体長と一致しません (期待 ${expected} / 受信 ${totalReceived}): ${url}`);
+              finish({ kind: 'transport', status, retryAfter });
+              return;
+            }
+          } else if (baseOffset !== 0) {
+            // 全体長が最後まで不明なまま、途中から再開したストリームを受け切った。欠落を検出できないので
+            // 成功にしない (先頭から一度も途切れず受け切った場合のみ、全体長不明でも成功とみなす)
+            console.error(`全体長が不明なため再開後の完全性を確認できません: ${url}`);
             finish({ kind: 'transport', status, retryAfter });
             return;
           }
@@ -287,7 +327,7 @@ function streamOnce(
       signal.addEventListener('abort', onAbort, { once: true });
     }
     try {
-      port.postMessage({ type: 'start', url, offset });
+      port.postMessage({ type: 'start', url, offset, ifRange: offset > 0 ? ifRange : null });
       armStallTimer();
     } catch (e) {
       console.error(`メディア取得の要求を送れませんでした: ${url}`, e);

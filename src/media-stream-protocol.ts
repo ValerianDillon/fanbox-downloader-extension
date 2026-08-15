@@ -61,6 +61,12 @@ export type MediaStreamRequest = {
    * (受信済みのぶんを捨てて先頭から受け直す)。
    */
   offset: number;
+  /**
+   * 再開時に付ける `If-Range` の値 (初回応答の ETag または Last-Modified)。offset > 0 のときのみ意味を持つ。
+   * 切断中に同じ URL の中身が差し替わっていた場合、サーバは 206 ではなく 200 (全体) を返すため、
+   * content script 側が受信済みを捨てて取り直せる (旧本文の prefix と新本文の suffix を結合してしまうのを防ぐ)。
+   */
+  ifRange?: string | null;
 };
 
 /** 応答ヘッダの観測結果。fetch() 自体の失敗 (通信障害) は ok:false, status:0 で表す */
@@ -73,6 +79,10 @@ export type MediaStreamHead = {
   contentLength: number | null;
   /** Content-Range ヘッダの生の値。206 のときの再開位置の検証に使う */
   contentRange: string | null;
+  /** ETag ヘッダの生の値。再開時の `If-Range` に使う (representation validator) */
+  etag: string | null;
+  /** Last-Modified ヘッダの生の値。ETag が無いときの `If-Range` フォールバックに使う */
+  lastModified: string | null;
   error?: string;
 };
 
