@@ -78,6 +78,8 @@ export function resetTestState(): void {
       'failed-file-count',
       'fetched-urls',
       'zip-b64',
+      'zip-url',
+      'zip-size',
       'zip-done',
     ];
     for (const key of keys) {
@@ -87,9 +89,21 @@ export function resetTestState(): void {
 }
 
 /**
+ * data-fbdl-zip-b64 (ZIP 全体の base64) を publish する上限サイズ。
+ * これを超える ZIP (Issue #22 の大きいファイルの smoke test) は base64 文字列を DOM 属性に置くコストが
+ * 大きすぎるため zip-b64 を publish せず、zip-url (Blob URL) と zip-size だけを publish する。
+ * テスト側は zip-url を fetch して中身を検証する。
+ */
+const ZIP_B64_PUBLISH_LIMIT = 8 * 1024 * 1024;
+
+/**
  * showSaveFilePicker の代わりに使う in-memory な FileSystemFileHandle 互換オブジェクト。
  * createWritable() で得られる writable への write/close で書き込まれたチャンクを結合し、
- * close() 時に data-fbdl-zip-b64 (base64) / data-fbdl-zip-done ('1') を publish する。
+ * close() 時に data-fbdl-zip-url (Blob URL) / data-fbdl-zip-size / data-fbdl-zip-done ('1') を publish する。
+ * ZIP_B64_PUBLISH_LIMIT 以下なら data-fbdl-zip-b64 (base64) も publish する。
+ *
+ * Blob URL は content script (ISOLATED world) で作ってもページ origin に紐付くため、Playwright の
+ * page.evaluate (MAIN world) から fetch できる。
  *
  * 呼び出し側 (downloader.ts の pickSaveHandle) が既に `if (IS_TEST_BUILD)` の中でのみ
  * 呼ぶため、ここでは内部ガードを持たない (呼び出し規約は本ファイル冒頭のコメントを参照)。
@@ -108,7 +122,16 @@ export function createTestSaveHandle(): FileSystemFileHandle {
         buffer.set(chunk, offset);
         offset += chunk.length;
       }
-      publishTestState({ 'zip-b64': uint8ArrayToBase64(buffer), 'zip-done': '1' });
+      const state: Record<string, string> = {
+        'zip-url': URL.createObjectURL(new Blob([buffer], { type: 'application/zip' })),
+        'zip-size': String(total),
+      };
+      if (total <= ZIP_B64_PUBLISH_LIMIT) {
+        state['zip-b64'] = uint8ArrayToBase64(buffer);
+      }
+      // zip-done は最後に publish する (テスト側は zip-done を待ってから他の属性を読む)
+      publishTestState(state);
+      publishTestState({ 'zip-done': '1' });
     },
   };
   return { createWritable: async () => writable } as unknown as FileSystemFileHandle;

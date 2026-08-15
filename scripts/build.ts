@@ -16,9 +16,9 @@ import { join } from 'node:path';
 const isTest = process.argv.includes('--test');
 const outdir = isTest ? 'dist-test' : 'dist';
 
-/** 通常ビルドの成果物にテスト専用コードの痕跡が残っていないかの post-build 検証対象 */
+/** 通常ビルドの成果物にテスト専用コードの痕跡が残っていないかの post-build 検証対象 (`__fbdlTest` は service worker 側の観測フック src/service-worker/test-hooks.ts の残留チェック) */
 const ENTRY_FILE_NAMES = ['content.js', 'service-worker.js'];
-const TEST_LEAK_PATTERN = /__FBDL_TEST__|data-fbdl/;
+const TEST_LEAK_PATTERN = /__FBDL_TEST__|data-fbdl|__fbdlTest/;
 
 async function main() {
   rmSync(outdir, { recursive: true, force: true });
@@ -62,7 +62,7 @@ async function main() {
       const contents = readFileSync(join(outdir, fileName), 'utf-8');
       if (TEST_LEAK_PATTERN.test(contents)) {
         console.error(
-          `post-build 検証失敗: ${outdir}/${fileName} にテスト専用コードの痕跡 (__FBDL_TEST__ / data-fbdl) が残留しています`,
+          `post-build 検証失敗: ${outdir}/${fileName} にテスト専用コードの痕跡 (__FBDL_TEST__ / data-fbdl / __fbdlTest) が残留しています`,
         );
         process.exit(1);
       }
