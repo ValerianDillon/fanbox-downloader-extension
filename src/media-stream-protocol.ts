@@ -83,7 +83,23 @@ export type MediaStreamHead = {
   etag: string | null;
   /** Last-Modified ヘッダの生の値。ETag が無いときの `If-Range` フォールバックに使う */
   lastModified: string | null;
+  /**
+   * Content-Encoding ヘッダの生の値。非 identity のとき、fetch() の body は展開済みなのに
+   * Content-Length は符号化後の長さを指すため、受信バイト数との照合に使えない。また Range は
+   * 符号化表現に対して適用されるので、展開後バイト数で数えた offset での再開も成立しない。
+   * content script 側はこれを見て全体長の採用と Range 再開を無効化する。
+   */
+  contentEncoding: string | null;
   error?: string;
+};
+
+/**
+ * keepalive。本文が流れていない期間 (応答ヘッダ待ち、本文の到着間隔が空くとき) にも Port 上の
+ * メッセージ活動を作り、MV3 service worker の idle timer (30 秒) をリセットするために送る。
+ * content script 側は受信しても何もしない (受信自体が無応答 watchdog をリセットする)。
+ */
+export type MediaStreamPing = {
+  type: 'ping';
 };
 
 export type MediaStreamChunk = {
@@ -104,7 +120,12 @@ export type MediaStreamError = {
   error: string;
 };
 
-export type MediaStreamMessage = MediaStreamHead | MediaStreamChunk | MediaStreamEnd | MediaStreamError;
+export type MediaStreamMessage =
+  | MediaStreamHead
+  | MediaStreamChunk
+  | MediaStreamEnd
+  | MediaStreamError
+  | MediaStreamPing;
 
 /**
  * Content-Range (`bytes <start>-<end>/<total|*>`) を解釈する。形式が読めなければ null。

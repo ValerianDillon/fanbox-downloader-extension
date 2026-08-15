@@ -30,6 +30,7 @@ function head(
     contentRange: null,
     etag: null,
     lastModified: null,
+    contentEncoding: null,
     ...partial,
   };
 }
@@ -305,6 +306,94 @@ describe('fetchMediaViaPort', () => {
     // 1: If-Range 無し, 2: "A" で再開 (→200), 3: 新しい "B" で再開 (→206)
     expect(ports.map((p) => p.request?.ifRange)).toEqual([null, '"A"', '"B"']);
     expect(ports.map((p) => p.request?.offset)).toEqual([0, 300, 600]);
+  });
+
+  test('圧縮応答 (Content-Encoding: gzip) では Content-Length を全体長に採用せず、展開後の本文を成功として受け取る', async () => {
+    // fetch() の body は展開済みだが Content-Length は符号化後の長さ。照合すると正常な本文を
+    // 長さ不一致として落としてしまう (Codex R3 #1)
+    const body = bytesOf(1000); // 展開後 1000 bytes
+    const { connect } = fakeConnect((_req, server) => {
+      // Content-Length は符号化後の 700 (展開後と一致しない)
+      server.send(head({ ok: true, status: 200, contentLength: 700, contentEncoding: 'gzip', etag: '"z"' }));
+      server.send({ type: 'chunk', data: b64(body) });
+      server.send({ type: 'end', bytes: body.length });
+    });
+    const result = await fetchMediaViaPort(URL_, undefined, { connect });
+    expect(await blobBytes(result)).toEqual(body);
+  });
+
+  test('圧縮応答は切断後に Range 再開せず、先頭から取り直す', async () => {
+    // offset は展開後バイト数で数えており、符号化表現に対する Range と対応しないため
+    const body = bytesOf(1000);
+    let dropped = false;
+    const { connect, ports } = fakeConnect((_req, server) => {
+      if (!dropped) {
+        dropped = true;
+        server.send(head({ ok: true, status: 200, contentLength: 700, contentEncoding: 'gzip', etag: '"z"' }));
+        server.send({ type: 'chunk', data: b64(body.subarray(0, 400)) });
+        server.drop();
+        return;
+      }
+      server.send(head({ ok: true, status: 200, contentLength: 700, contentEncoding: 'gzip', etag: '"z"' }));
+      server.send({ type: 'chunk', data: b64(body) });
+      server.send({ type: 'end', bytes: body.length });
+    });
+    const result = await fetchMediaViaPort(URL_, undefined, { connect });
+    expect(await blobBytes(result)).toEqual(body);
+    // 2 回目も offset 0 (Range を使わない)
+    expect(ports.map((p) => p.request?.offset)).toEqual([0, 0]);
+  });
+
+  test('Content-Length の無い 206 でも、Content-Range の宣言幅より多い本文は成功にしない', async () => {
+    // 宣言 100 bytes (bytes 400-499/1000) の応答に 600 bytes 載せると、合計 1000 で全体長とは
+    // 一致してしまう。Port 単位の幅検証が無いと破損を成功として受理する (Codex R3 #2)
+    const body = bytesOf(1000);
+    const { connect } = fakeConnect((req, server) => {
+      if (req.offset === 0) {
+        server.send(okHead(body.length));
+        server.send({ type: 'chunk', data: b64(body.subarray(0, 400)) });
+        server.drop();
+        return;
+      }
+      server.send(head({ ok: true, status: 206, contentRange: `bytes 400-499/${body.length}` })); // Content-Length 無し
+      server.send({ type: 'chunk', data: b64(body.subarray(400)) }); // 宣言 100 bytes に対し 600 bytes
+      server.send({ type: 'end', bytes: 600 });
+    });
+    const result = await fetchMediaViaPort(URL_, undefined, { connect });
+    expect(result?.blob).toBeNull();
+    expect(result?.status).toBe(206);
+  });
+
+  test('206 の Content-Range の end が total 以上なら信用しない', async () => {
+    const body = bytesOf(1000);
+    const { connect } = fakeConnect((req, server) => {
+      if (req.offset === 0) {
+        server.send(okHead(body.length));
+        server.send({ type: 'chunk', data: b64(body.subarray(0, 400)) });
+        server.drop();
+        return;
+      }
+      // end (1000) が total (1000) 以上の不正な Content-Range
+      server.send(head({ ok: true, status: 206, contentRange: 'bytes 400-1000/1000' }));
+      server.send({ type: 'chunk', data: b64(body.subarray(400)) });
+      server.send({ type: 'end', bytes: 600 });
+    });
+    const result = await fetchMediaViaPort(URL_, undefined, { connect });
+    expect(result?.blob).toBeNull();
+  });
+
+  test('ping は無応答 watchdog をリセットするだけで、受信データに影響しない', async () => {
+    const body = bytesOf(100);
+    const { connect } = fakeConnect((_req, server) => {
+      server.send({ type: 'ping' });
+      server.send(okHead(body.length));
+      server.send({ type: 'ping' });
+      server.send({ type: 'chunk', data: b64(body) });
+      server.send({ type: 'ping' });
+      server.send({ type: 'end', bytes: body.length });
+    });
+    const result = await fetchMediaViaPort(URL_, undefined, { connect });
+    expect(await blobBytes(result)).toEqual(body);
   });
 
   test('初回応答が 204 なら空 Blob を成功として返さない', async () => {

@@ -98,6 +98,7 @@ export function simpleResponder(
       contentRange: null,
       etag: null,
       lastModified: null,
+      contentEncoding: null,
       ...(res.status === 0 ? { error: 'network down' } : {}),
     });
     if (!ok) return;

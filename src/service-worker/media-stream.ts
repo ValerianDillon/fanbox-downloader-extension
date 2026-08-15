@@ -36,10 +36,12 @@ const defaultDeps: MediaStreamDeps = {
  * `start` 要求 1 つぶんのメディア取得を Port 上に流す (Issue #22)。
  *
  * - `head` を必ず 1 度送る。fetch() 自体の失敗 (通信障害) は ok:false, status:0 で表し、fetchApi と揃える
- * - ok な応答は本文を逐次読み、CHUNK_BYTES 溜まったら `chunk` を送る。加えて FLUSH_INTERVAL_MS ごとに
- *   実時間タイマーで溜まっているぶんを flush する (read() が長時間ブロックしても、溜まっているデータを
- *   送って service worker の idle timer をリセットするため。read() が返った時だけ時間を見る方式では、
- *   次の read() が 30 秒以上返らないと flush されず service worker が停止しうる)
+ * - ok な応答は本文を逐次読み、CHUNK_BYTES 溜まったら `chunk` を送る
+ * - fetch 開始の時点から FLUSH_INTERVAL_MS ごとの実時間タイマーを動かし、溜まっているぶんがあれば
+ *   flush し、無ければ `ping` を送る。応答ヘッダ待ちや本文の到着間隔が空く期間にも Port 上の
+ *   メッセージ活動を作り、service worker の idle timer (30 秒無活動) をリセットするため
+ *   (Port は開くだけではリセットされない。また read() が返った時だけ時間を見る方式では、次の read() が
+ *   30 秒以上返らないと何も送られず停止しうる)
  * - 本文を読み切ったら `end` を送る。読み込み中に失敗したら `error` を送る
  * - Port が切断されたら (content script のキャンセル/タブ閉鎖) fetch を abort し、以後は何も送らない
  *
@@ -85,148 +87,163 @@ export async function streamMedia(
     }
   };
 
-  let r: Response;
-  try {
-    const headers: Record<string, string> = {};
-    if (request.offset > 0) {
-      headers.Range = `bytes=${request.offset}-`;
-      // 切断中に中身が差し替わっていたら、サーバは If-Range 不一致で 206 ではなく 200 (全体) を返す。
-      // content script 側はそれを受けて先頭から取り直す (旧本文 prefix + 新本文 suffix の結合を防ぐ)
-      if (request.ifRange) headers['If-Range'] = request.ifRange;
-    }
-    r = await deps.fetch(request.url, { credentials: 'include', signal: controller.signal, headers });
-  } catch (e) {
-    // fetch() 自体の失敗 (実際の通信障害)、または切断による abort。後者は送っても届かないので post が捨てる
-    post({
-      type: 'head',
-      ok: false,
-      status: 0,
-      retryAfter: null,
-      contentLength: null,
-      contentRange: null,
-      etag: null,
-      lastModified: null,
-      error: String(e),
-    });
-    return;
-  }
-
-  const retryAfter = r.headers.get('Retry-After');
-  const contentLengthHeader = r.headers.get('Content-Length');
-  const contentLength =
-    contentLengthHeader !== null && /^\d+$/.test(contentLengthHeader.trim())
-      ? Number.parseInt(contentLengthHeader, 10)
-      : null;
-  post({
-    type: 'head',
-    ok: r.ok,
-    status: r.status,
-    retryAfter,
-    contentLength,
-    contentRange: r.headers.get('Content-Range'),
-    etag: r.headers.get('ETag'),
-    lastModified: r.headers.get('Last-Modified'),
-  });
-  if (!r.ok) {
-    // 本文は読まずに捨てる。HTTP エラーの本文を content script に転送する用途はない
-    try {
-      await r.body?.cancel();
-    } catch {
-      // 既に閉じている等。観測結果 (head) は送信済みなので無視してよい
-    }
-    return;
-  }
-  if (!r.body) {
-    // 空の本文 (204 等、あるいは環境によって body が null になる 0 バイト応答)
-    post({ type: 'end', bytes: 0 });
-    return;
-  }
-
-  const reader = r.body.getReader();
-  /** 未送信の本文断片。合計が CHUNK_BYTES に達したら先頭から CHUNK_BYTES ちょうどを切り出して送る */
-  const pending: Uint8Array[] = [];
-  let pendingBytes = 0;
-  let sentBytes = 0;
-
-  /**
-   * pending の先頭から size バイトを 1 つの Uint8Array に切り出す (size <= pendingBytes)。
-   * 1 メッセージの生バイト数を CHUNK_BYTES 以下に保つため、read() が返す断片の大きさに依存しない
-   * (ローカルのモックサーバや高速な回線では 1 回の read() で数十 MiB が返りうる。そのまま送ると
-   * base64 化後に runtime messaging の 64 MiB 上限に当たる)。
-   */
-  const take = (size: number): Uint8Array => {
-    if (pending.length === 1 && pending[0].length === size) {
-      const only = pending[0];
-      pending.length = 0;
-      pendingBytes = 0;
-      return only;
-    }
-    const out = new Uint8Array(size);
-    let filled = 0;
-    while (filled < size) {
-      const head = pending[0];
-      const need = size - filled;
-      if (head.length <= need) {
-        out.set(head, filled);
-        filled += head.length;
-        pending.shift();
-      } else {
-        out.set(head.subarray(0, need), filled);
-        pending[0] = head.subarray(need);
-        filled += need;
-      }
-    }
-    pendingBytes -= size;
-    return out;
-  };
-
-  const send = (bytes: Uint8Array) => {
-    sentBytes += bytes.length;
-    deps.onChunkSent?.({ url: request.url, sentBytes });
-    post({ type: 'chunk', data: uint8ArrayToBase64(bytes) });
-  };
-
-  /** CHUNK_BYTES 単位で送れるだけ送る。force なら端数も送る */
-  const flush = (force: boolean) => {
-    while (pendingBytes >= CHUNK_BYTES && !disconnected) {
-      send(take(CHUNK_BYTES));
-    }
-    if (force && pendingBytes > 0 && !disconnected) {
-      send(take(pendingBytes));
-    }
-  };
-
-  // 実時間タイマーで定期 flush する。read() が長時間ブロックしても、溜まっているぶんを送って
-  // service worker の idle timer をリセットする (post は同期・非再入なので read ループとの競合はない)。
+  // heartbeat: fetch の開始時点から動かす。溜まっているぶんがあれば flush、無ければ ping を送る。
+  // flush 関数は本文読み取りの段になって初めて意味を持つので、参照を差し替えられるようにしておく
+  let onHeartbeat: () => void = () => post({ type: 'ping' });
   const setIntervalFn = deps.setInterval ?? ((handler, ms) => setInterval(handler, ms));
   const clearIntervalFn = deps.clearInterval ?? ((id) => clearInterval(id));
-  const flushIntervalMs = deps.flushIntervalMs ?? FLUSH_INTERVAL_MS;
-  const timer = setIntervalFn(() => {
-    if (!disconnected) flush(true);
-  }, flushIntervalMs);
+  const heartbeat = setIntervalFn(() => {
+    if (!disconnected) onHeartbeat();
+  }, deps.flushIntervalMs ?? FLUSH_INTERVAL_MS);
 
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (disconnected) return;
-      if (done) break;
-      if (value.length === 0) continue;
-      pending.push(value);
-      pendingBytes += value.length;
-      if (pendingBytes >= CHUNK_BYTES) flush(false);
-      if (disconnected) return;
-    }
-    flush(true);
-    post({ type: 'end', bytes: sentBytes });
-  } catch (e) {
-    if (disconnected) return;
-    post({ type: 'error', error: String(e) });
-    try {
-      await reader.cancel();
-    } catch {
-      // 既に閉じている等
-    }
+    await streamMediaInner();
   } finally {
-    clearIntervalFn(timer);
+    clearIntervalFn(heartbeat);
+  }
+
+  async function streamMediaInner(): Promise<void> {
+    let r: Response;
+    try {
+      const headers: Record<string, string> = {};
+      if (request.offset > 0) {
+        headers.Range = `bytes=${request.offset}-`;
+        // 切断中に中身が差し替わっていたら、サーバは If-Range 不一致で 206 ではなく 200 (全体) を返す。
+        // content script 側はそれを受けて先頭から取り直す (旧本文 prefix + 新本文 suffix の結合を防ぐ)
+        if (request.ifRange) headers['If-Range'] = request.ifRange;
+      }
+      r = await deps.fetch(request.url, { credentials: 'include', signal: controller.signal, headers });
+    } catch (e) {
+      // fetch() 自体の失敗 (実際の通信障害)、または切断による abort。後者は送っても届かないので post が捨てる
+      post({
+        type: 'head',
+        ok: false,
+        status: 0,
+        retryAfter: null,
+        contentLength: null,
+        contentRange: null,
+        etag: null,
+        lastModified: null,
+        contentEncoding: null,
+        error: String(e),
+      });
+      return;
+    }
+
+    const retryAfter = r.headers.get('Retry-After');
+    const contentLengthHeader = r.headers.get('Content-Length');
+    const contentLength =
+      contentLengthHeader !== null && /^\d+$/.test(contentLengthHeader.trim())
+        ? Number.parseInt(contentLengthHeader, 10)
+        : null;
+    post({
+      type: 'head',
+      ok: r.ok,
+      status: r.status,
+      retryAfter,
+      contentLength,
+      contentRange: r.headers.get('Content-Range'),
+      etag: r.headers.get('ETag'),
+      lastModified: r.headers.get('Last-Modified'),
+      contentEncoding: r.headers.get('Content-Encoding'),
+    });
+    if (!r.ok) {
+      // 本文は読まずに捨てる。HTTP エラーの本文を content script に転送する用途はない
+      try {
+        await r.body?.cancel();
+      } catch {
+        // 既に閉じている等。観測結果 (head) は送信済みなので無視してよい
+      }
+      return;
+    }
+    if (!r.body) {
+      // 空の本文 (204 等、あるいは環境によって body が null になる 0 バイト応答)
+      post({ type: 'end', bytes: 0 });
+      return;
+    }
+
+    const reader = r.body.getReader();
+    /** 未送信の本文断片。合計が CHUNK_BYTES に達したら先頭から CHUNK_BYTES ちょうどを切り出して送る */
+    const pending: Uint8Array[] = [];
+    let pendingBytes = 0;
+    let sentBytes = 0;
+
+    /**
+     * pending の先頭から size バイトを 1 つの Uint8Array に切り出す (size <= pendingBytes)。
+     * 1 メッセージの生バイト数を CHUNK_BYTES 以下に保つため、read() が返す断片の大きさに依存しない
+     * (ローカルのモックサーバや高速な回線では 1 回の read() で数十 MiB が返りうる。そのまま送ると
+     * base64 化後に runtime messaging の 64 MiB 上限に当たる)。
+     */
+    const take = (size: number): Uint8Array => {
+      if (pending.length === 1 && pending[0].length === size) {
+        const only = pending[0];
+        pending.length = 0;
+        pendingBytes = 0;
+        return only;
+      }
+      const out = new Uint8Array(size);
+      let filled = 0;
+      while (filled < size) {
+        const head = pending[0];
+        const need = size - filled;
+        if (head.length <= need) {
+          out.set(head, filled);
+          filled += head.length;
+          pending.shift();
+        } else {
+          out.set(head.subarray(0, need), filled);
+          pending[0] = head.subarray(need);
+          filled += need;
+        }
+      }
+      pendingBytes -= size;
+      return out;
+    };
+
+    const send = (bytes: Uint8Array) => {
+      sentBytes += bytes.length;
+      deps.onChunkSent?.({ url: request.url, sentBytes });
+      post({ type: 'chunk', data: uint8ArrayToBase64(bytes) });
+    };
+
+    /** CHUNK_BYTES 単位で送れるだけ送る。force なら端数も送る */
+    const flush = (force: boolean) => {
+      while (pendingBytes >= CHUNK_BYTES && !disconnected) {
+        send(take(CHUNK_BYTES));
+      }
+      if (force && pendingBytes > 0 && !disconnected) {
+        send(take(pendingBytes));
+      }
+    };
+
+    // 本文読み取り中の heartbeat: 溜まっているぶんがあれば flush、無ければ ping (post は同期・非再入なので
+    // read ループとの競合はない)
+    onHeartbeat = () => {
+      if (pendingBytes > 0) flush(true);
+      else post({ type: 'ping' });
+    };
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (disconnected) return;
+        if (done) break;
+        if (value.length === 0) continue;
+        pending.push(value);
+        pendingBytes += value.length;
+        if (pendingBytes >= CHUNK_BYTES) flush(false);
+        if (disconnected) return;
+      }
+      flush(true);
+      post({ type: 'end', bytes: sentBytes });
+    } catch (e) {
+      if (disconnected) return;
+      post({ type: 'error', error: String(e) });
+      try {
+        await reader.cancel();
+      } catch {
+        // 既に閉じている等
+      }
+    }
   }
 }

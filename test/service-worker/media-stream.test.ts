@@ -129,6 +129,7 @@ describe('streamMedia', () => {
       contentRange: null,
       etag: null,
       lastModified: null,
+      contentEncoding: null,
     });
     const chunks = messages.filter((m) => m.type === 'chunk');
     // 本文は CHUNK_BYTES × 2 + 端数なので、CHUNK_BYTES ちょうど × 2 + 端数の 3 メッセージに分かれる。
@@ -221,6 +222,7 @@ describe('streamMedia', () => {
         contentRange: null,
         etag: null,
         lastModified: null,
+        contentEncoding: null,
       },
     ]);
   });
@@ -242,6 +244,7 @@ describe('streamMedia', () => {
         contentRange: null,
         etag: null,
         lastModified: null,
+        contentEncoding: null,
       },
     ]);
   });
@@ -338,6 +341,72 @@ describe('streamMedia', () => {
       ),
     ).resolves.toBeUndefined();
     expect(capturedSignal?.aborted).toBe(true);
+  });
+
+  test('応答ヘッダ待ちの間も FLUSH_INTERVAL_MS ごとに ping を送る (idle timer リセット)', async () => {
+    // fetch がヘッダを返すまで 30 秒以上かかると service worker が停止しうるため、
+    // heartbeat は fetch 開始時点から動き、送るものが無い間は ping を送る (Codex R3 #3)
+    const { port, messages } = fakePort();
+    let releaseFetch: (r: Response) => void = () => {};
+    const done = streamMedia(
+      port,
+      { type: 'start', url: 'https://downloads.fanbox.cc/f', offset: 0 },
+      {
+        fetch: () =>
+          new Promise<Response>((resolve) => {
+            releaseFetch = resolve;
+          }),
+        flushIntervalMs: 10,
+      },
+    );
+    await Bun.sleep(60);
+    // ヘッダが返る前から ping が届いている
+    expect(messages.filter((m) => m.type === 'ping').length).toBeGreaterThanOrEqual(2);
+    expect(messages.some((m) => m.type === 'head')).toBe(false);
+    releaseFetch(fakeResponse({ status: 200, headers: { 'Content-Length': '0' }, body: new Uint8Array() }));
+    await done;
+    expect(messages.some((m) => m.type === 'head')).toBe(true);
+    expect(messages[messages.length - 1]).toEqual({ type: 'end', bytes: 0 });
+  });
+
+  test('本文の到着間隔が空いて pending が空でも、ping で Port 上の活動を維持する', async () => {
+    const first = bytesOf(1000);
+    let release = () => {};
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let pulls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        pulls++;
+        if (pulls === 1) {
+          controller.enqueue(first);
+          return;
+        }
+        await blocked;
+        controller.close();
+      },
+    });
+    const response = {
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'Content-Length': '1000' }),
+      body: stream,
+    } as unknown as Response;
+
+    const { port, messages } = fakePort();
+    const done = streamMedia(
+      port,
+      { type: 'start', url: 'https://downloads.fanbox.cc/f', offset: 0 },
+      { fetch: async () => response, flushIntervalMs: 10 },
+    );
+    await Bun.sleep(80);
+    // 最初の 1000 bytes は実時間 flush で送られ、その後 pending が空の間は ping が届く
+    expect(messages.filter((m) => m.type === 'chunk').length).toBe(1);
+    expect(messages.filter((m) => m.type === 'ping').length).toBeGreaterThanOrEqual(1);
+    release();
+    await done;
+    expect(messages[messages.length - 1]).toEqual({ type: 'end', bytes: 1000 });
   });
 
   test('read() がブロック中でも、溜まっているぶんを FLUSH_INTERVAL_MS ごとに実時間タイマーで送る (idle timer リセット)', async () => {

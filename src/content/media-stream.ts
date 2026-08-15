@@ -96,6 +96,8 @@ export async function fetchMediaViaPort(
   let expectedTotal: number | null = null;
   /** 直近の応答の representation validator (strong ETag 優先、なければ Last-Modified)。再開時の If-Range に使う */
   let validator: string | null = null;
+  /** Range 再開が成立するか。非 identity Content-Encoding の応答では false (展開後バイト数で offset を数えられない) */
+  let resumable = true;
   let resumes = 0;
 
   const discard = () => {
@@ -116,6 +118,9 @@ export async function fetchMediaViaPort(
       setValidator: (v) => {
         validator = v;
       },
+      setResumable: (r) => {
+        resumable = r;
+      },
       onRestart: discard,
       onChunk: (bytes) => {
         parts.push(new Blob([bytes]));
@@ -134,11 +139,13 @@ export async function fetchMediaViaPort(
         // ここでは重ねて回さず失敗を返す。
         if (received > 0 && resumes < MAX_RESUMES) {
           resumes++;
-          if (validator === null) {
-            // representation validator が無いと Range 再開は世代混在 (旧 prefix + 新 suffix) を検出できない。
-            // 受信済みを捨てて先頭から取り直す (単一ストリームは常に単一表現なので混在しない)。
+          if (validator === null || !resumable) {
+            // validator が無いと Range 再開は世代混在 (旧 prefix + 新 suffix) を検出できず、
+            // 非 identity Content-Encoding では offset (展開後バイト数) が符号化表現に対する Range と
+            // 対応しない。どちらの場合も受信済みを捨てて先頭から取り直す
+            // (単一ストリームは常に単一表現なので混在しない)。
             discard();
-            console.warn(`validator が無いため先頭から取り直します (${resumes}/${MAX_RESUMES}): ${url}`);
+            console.warn(`Range 再開できないため先頭から取り直します (${resumes}/${MAX_RESUMES}): ${url}`);
           } else {
             console.warn(
               `メディア転送が切断されたため ${received} バイト目から再開します (${resumes}/${MAX_RESUMES}): ${url}`,
@@ -168,6 +175,8 @@ type StreamCallbacks = {
   getExpectedTotal: () => number | null;
   /** validator を記録する (初回応答と 200 restart のときだけ呼ばれる。206 継続時は呼ばれない) */
   setValidator: (validator: string | null) => void;
+  /** Range 再開が成立するか (非 identity Content-Encoding では false)。初回応答と 200 restart で確定する */
+  setResumable: (resumable: boolean) => void;
   onRestart: () => void;
   onChunk: (bytes: Uint8Array<ArrayBuffer>) => void;
 };
@@ -200,6 +209,8 @@ function streamOnce(
     let headSeen = false;
     /** この Port の本文が全体のどこから始まるか。Range を無視された (200) ときは 0 に戻る */
     let baseOffset = offset;
+    /** この Port が運ぶべき本文長 (206 の Content-Range 幅 / 200 の Content-Length)。不明なら null */
+    let portExpected: number | null = null;
 
     const stallTimeoutMs = deps.stallTimeoutMs ?? STALL_TIMEOUT_MS;
     let stallTimer: ReturnType<typeof setTimeout> | undefined;
@@ -244,20 +255,32 @@ function streamOnce(
             return;
           }
           const respValidator = pickValidator(message.etag, message.lastModified);
+          // fetch() の body は Content-Encoding を展開済みだが、Content-Length は符号化後の長さを指す。
+          // 非 identity の応答では Content-Length を受信バイト数の照合に使えず、また Range は符号化表現に
+          // 適用されるため、展開後バイト数で数えた offset での再開も成立しない。
+          const identityEncoding =
+            message.contentEncoding === null ||
+            message.contentEncoding === undefined ||
+            message.contentEncoding.trim().toLowerCase() === 'identity';
+          // この応答で数えられる本文長 (非 identity では使えない)
+          const usableLength = identityEncoding ? message.contentLength : null;
           if (offset > 0) {
             if (status === 206) {
               const range = parseContentRange(message.contentRange);
               const expected = callbacks.getExpectedTotal();
-              // 要求した位置から始まっているか、Content-Length が Content-Range の幅と整合するか、
-              // total が既知の全体長と食い違わないか。いずれも満たさない 206 は信用しない。
+              // 要求した位置から始まっているか、範囲が正か、範囲が total に収まるか、Content-Length が
+              // Content-Range の幅と整合するか、total が既知の全体長と食い違わないか。
+              // いずれも満たさない 206 は信用しない。
               const rangeOk =
                 range !== null &&
                 range.start === offset &&
                 range.end >= range.start &&
-                (message.contentLength === null || message.contentLength === range.end - range.start + 1) &&
+                (range.total === null || range.end < range.total) &&
+                (usableLength === null || usableLength === range.end - range.start + 1) &&
                 !(range.total !== null && expected !== null && range.total !== expected);
-              if (!rangeOk) {
-                // 受信済みのぶんも捨てる (どこまでが正しいか分からないため)。上位の再試行に委ねる
+              if (!rangeOk || !identityEncoding) {
+                // 非 identity の 206 も拒否する: offset は展開後バイト数で数えており、符号化表現に対する
+                // Range 応答とは対応しない。受信済みのぶんも捨てる (どこまでが正しいか分からないため)
                 console.warn(
                   `Range 再開の応答が要求と一致しないため受信済みデータを破棄します: ${url}`,
                   message.contentRange,
@@ -267,6 +290,9 @@ function streamOnce(
                 return;
               }
               // 206 継続時は validator を更新しない (初回に確定した validator を保つ)。
+              // この Port が運ぶべき本文長は Content-Range の幅で確定する (Content-Length が無くても)。
+              // 終端時に portBytes と照合し、宣言より多い/少ない本文を成功にしない
+              portExpected = range.end - range.start + 1;
               // Content-Range total が得られたら全体長として採用する (初回に Content-Length が無くても
               // ここで確定でき、終端時の欠落検出が効くようになる)
               if (range.total !== null) callbacks.setExpectedTotal(range.total);
@@ -277,7 +303,11 @@ function streamOnce(
               callbacks.onRestart();
               baseOffset = 0;
               callbacks.setValidator(respValidator);
-              if (message.contentLength !== null) callbacks.setExpectedTotal(message.contentLength);
+              callbacks.setResumable(identityEncoding);
+              if (usableLength !== null) {
+                callbacks.setExpectedTotal(usableLength);
+                portExpected = usableLength;
+              }
             } else {
               // 206/200 以外の成功 (204 等) は Range 再開として解釈できない。失敗として扱う
               console.warn(`Range 再開に想定外の成功ステータス (${status}) が返りました: ${url}`);
@@ -293,7 +323,11 @@ function streamOnce(
               return;
             }
             callbacks.setValidator(respValidator);
-            if (message.contentLength !== null) callbacks.setExpectedTotal(message.contentLength);
+            callbacks.setResumable(identityEncoding);
+            if (usableLength !== null) {
+              callbacks.setExpectedTotal(usableLength);
+              portExpected = usableLength;
+            }
           }
           return;
         }
@@ -320,6 +354,16 @@ function streamOnce(
             finish({ kind: 'transport', status, retryAfter });
             return;
           }
+          // この Port が運ぶべき本文長 (206 の Content-Range 幅 / 200 の Content-Length) と照合する。
+          // 全体長の照合 (下) だけでは、Content-Range の宣言より多い本文が載って合計が偶然一致する
+          // ケースを検出できない
+          if (portExpected !== null && portBytes !== portExpected) {
+            console.error(
+              `この転送の本文長が応答ヘッダの宣言と一致しません (宣言 ${portExpected} / 受信 ${portBytes}): ${url}`,
+            );
+            finish({ kind: 'transport', status, retryAfter });
+            return;
+          }
           if (expected !== null) {
             if (totalReceived !== expected) {
               console.error(`メディアの長さが全体長と一致しません (期待 ${expected} / 受信 ${totalReceived}): ${url}`);
@@ -336,6 +380,9 @@ function streamOnce(
           finish({ kind: 'complete', status, retryAfter });
           return;
         }
+        case 'ping':
+          // keepalive。受信自体が無応答 watchdog (armStallTimer) をリセットするので、他には何もしない
+          return;
         case 'error': {
           console.error(`service worker 側でメディア本文の読み込みに失敗しました: ${url}`, message.error);
           finish({ kind: 'transport', status, retryAfter });
