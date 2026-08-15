@@ -34,7 +34,10 @@ function head(
   };
 }
 
-const okHead = (contentLength: number | null): MediaStreamMessage => head({ ok: true, status: 200, contentLength });
+// 既定で strong ETag を持たせる (validator があると Range 再開が使えるので、多くの再開テストがこれを使う)。
+// validator が無いケースは head({ ... }) を直接使って etag/lastModified を省く。
+const okHead = (contentLength: number | null): MediaStreamMessage =>
+  head({ ok: true, status: 200, contentLength, etag: '"v"' });
 
 const URL_ = 'https://downloads.fanbox.cc/f';
 
@@ -210,7 +213,26 @@ describe('fetchMediaViaPort', () => {
     expect(result?.status).toBe(204);
   });
 
-  test('再開要求に初回応答の validator を If-Range として渡す (ETag 優先)', async () => {
+  test('再開要求に初回応答の strong ETag を If-Range として渡す', async () => {
+    const body = bytesOf(1000);
+    const { connect, ports } = fakeConnect((req, server) => {
+      if (req.offset === 0) {
+        server.send(head({ ok: true, status: 200, contentLength: body.length, etag: '"abc"', lastModified: 'Mon' }));
+        server.send({ type: 'chunk', data: b64(body.subarray(0, 400)) });
+        server.drop();
+        return;
+      }
+      server.send(head({ ok: true, status: 206, contentLength: 600, contentRange: `bytes 400-999/${body.length}` }));
+      server.send({ type: 'chunk', data: b64(body.subarray(400)) });
+      server.send({ type: 'end', bytes: 600 });
+    });
+    const result = await fetchMediaViaPort(URL_, undefined, { connect });
+    expect(await blobBytes(result)).toEqual(body);
+    // 初回 (offset 0) は If-Range 無し、再開 (offset 400) は strong ETag を If-Range として送る
+    expect(ports.map((p) => p.request?.ifRange)).toEqual([null, '"abc"']);
+  });
+
+  test('weak ETag (W/) は If-Range に使えないので Last-Modified にフォールバックする (RFC 9110 §13.1.5)', async () => {
     const body = bytesOf(1000);
     const { connect, ports } = fakeConnect((req, server) => {
       if (req.offset === 0) {
@@ -225,8 +247,86 @@ describe('fetchMediaViaPort', () => {
     });
     const result = await fetchMediaViaPort(URL_, undefined, { connect });
     expect(await blobBytes(result)).toEqual(body);
-    // 初回 (offset 0) は If-Range 無し、再開 (offset 400) は初回の ETag を If-Range として送る
-    expect(ports.map((p) => p.request?.ifRange)).toEqual([null, 'W/"abc"']);
+    expect(ports[1].request?.ifRange).toBe('Mon');
+  });
+
+  test('validator が全く無ければ Range 再開せず、受信済みを捨てて先頭から取り直す (世代混在を防ぐ)', async () => {
+    // validator が無い状態で Range 再開すると、切断中に同じ長さの別データへ差し替わったとき
+    // 旧 prefix + 新 suffix を結合してしまう (Codex R2 #1)。validator 無しなら先頭から取り直す
+    const body = bytesOf(1000);
+    let firstAttemptDropped = false;
+    const { connect, ports } = fakeConnect((_req, server) => {
+      if (!firstAttemptDropped) {
+        firstAttemptDropped = true;
+        server.send(head({ ok: true, status: 200, contentLength: body.length })); // validator 無し
+        server.send({ type: 'chunk', data: b64(body.subarray(0, 400)) });
+        server.drop();
+        return;
+      }
+      // 取り直しは先頭から (offset 0)。Range 再開ではない
+      server.send(head({ ok: true, status: 200, contentLength: body.length }));
+      server.send({ type: 'chunk', data: b64(body) });
+      server.send({ type: 'end', bytes: body.length });
+    });
+    const result = await fetchMediaViaPort(URL_, undefined, { connect });
+    expect(await blobBytes(result)).toEqual(body);
+    // 2 回目も offset 0 (Range を使わない) で、If-Range も付かない
+    expect(ports.map((p) => p.request?.offset)).toEqual([0, 0]);
+    expect(ports.every((p) => p.request?.ifRange === null || p.request?.ifRange === undefined)).toBe(true);
+  });
+
+  test('200 restart 後は新しい representation の validator を使う (旧 validator を送り続けない)', async () => {
+    // 表現A を If-Range: "A" で再開 → 内容変更で 200 (表現B) → B を受信中に再切断。
+    // 旧 "A" を送り続けると準拠サーバは毎回 200 を返し MAX_RESUMES で失敗する (Codex R2 #2)
+    const body = bytesOf(900);
+    let phase = 0;
+    const { connect, ports } = fakeConnect((_req, server) => {
+      phase++;
+      if (phase === 1) {
+        server.send(head({ ok: true, status: 200, contentLength: body.length, etag: '"A"' }));
+        server.send({ type: 'chunk', data: b64(body.subarray(0, 300)) });
+        server.drop();
+        return;
+      }
+      if (phase === 2) {
+        // If-Range: "A" 不一致で 200 (表現B、新しい ETag)。先頭から受け直しの途中で再切断
+        server.send(head({ ok: true, status: 200, contentLength: body.length, etag: '"B"' }));
+        server.send({ type: 'chunk', data: b64(body.subarray(0, 600)) });
+        server.drop();
+        return;
+      }
+      // 3 回目は "B" で 206 再開できる
+      server.send(head({ ok: true, status: 206, contentLength: 300, contentRange: `bytes 600-899/${body.length}` }));
+      server.send({ type: 'chunk', data: b64(body.subarray(600)) });
+      server.send({ type: 'end', bytes: 300 });
+    });
+    const result = await fetchMediaViaPort(URL_, undefined, { connect });
+    expect(await blobBytes(result)).toEqual(body);
+    // 1: If-Range 無し, 2: "A" で再開 (→200), 3: 新しい "B" で再開 (→206)
+    expect(ports.map((p) => p.request?.ifRange)).toEqual([null, '"A"', '"B"']);
+    expect(ports.map((p) => p.request?.offset)).toEqual([0, 300, 600]);
+  });
+
+  test('初回応答が 204 なら空 Blob を成功として返さない', async () => {
+    const { connect } = fakeConnect((_req, server) => {
+      server.send(head({ ok: true, status: 204 }));
+      server.send({ type: 'end', bytes: 0 });
+    });
+    const result = await fetchMediaViaPort(URL_, undefined, { connect });
+    expect(result?.blob).toBeNull();
+    expect(result?.status).toBe(204);
+  });
+
+  test('初回応答が (要求していない) 部分 206 なら成功にしない', async () => {
+    const body = bytesOf(4);
+    const { connect } = fakeConnect((_req, server) => {
+      server.send(head({ ok: true, status: 206, contentLength: 2, contentRange: 'bytes 0-1/4' }));
+      server.send({ type: 'chunk', data: b64(body.subarray(0, 2)) });
+      server.send({ type: 'end', bytes: 2 });
+    });
+    const result = await fetchMediaViaPort(URL_, undefined, { connect });
+    expect(result?.blob).toBeNull();
+    expect(result?.status).toBe(206);
   });
 
   test('ETag が無ければ Last-Modified を If-Range に使う', async () => {

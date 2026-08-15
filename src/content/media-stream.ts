@@ -94,9 +94,15 @@ export async function fetchMediaViaPort(
   let received = 0;
   /** 全体長 (不明なら null)。初回の Content-Length か 206 の Content-Range total から確定する */
   let expectedTotal: number | null = null;
-  /** 初回応答の representation validator (ETag 優先、なければ Last-Modified)。再開時の If-Range に使う */
+  /** 直近の応答の representation validator (strong ETag 優先、なければ Last-Modified)。再開時の If-Range に使う */
   let validator: string | null = null;
   let resumes = 0;
+
+  const discard = () => {
+    parts.length = 0;
+    received = 0;
+    expectedTotal = null;
+  };
 
   while (true) {
     if (signal?.aborted) return null;
@@ -105,14 +111,12 @@ export async function fetchMediaViaPort(
         expectedTotal = total;
       },
       getExpectedTotal: () => expectedTotal,
+      // 応答ごとに validator を置き換える (200 restart で表現が変わったら新しい方を採る)。
+      // 呼ぶのは初回応答と 200 restart のときだけで、206 継続時は呼ばない (初回の validator を保つ)。
       setValidator: (v) => {
-        if (validator === null) validator = v;
+        validator = v;
       },
-      onRestart: () => {
-        parts.length = 0;
-        received = 0;
-        expectedTotal = null;
-      },
+      onRestart: discard,
       onChunk: (bytes) => {
         parts.push(new Blob([bytes]));
         received += bytes.length;
@@ -126,13 +130,20 @@ export async function fetchMediaViaPort(
       case 'http':
         return { blob: null, status: outcome.status, retryAfter: outcome.retryAfter };
       case 'transport':
-        // 受信済みがある (received > 0) ときだけ Range で続きを要求する。received === 0 は資すべき受信が
-        // 無く、offset 0 からの取り直しは fetchWithRetry の再試行と同じなので、ここでは重ねて回さず失敗を返す。
+        // received === 0 は資すべき受信が無く、offset 0 からの取り直しは fetchWithRetry の再試行と同じなので、
+        // ここでは重ねて回さず失敗を返す。
         if (received > 0 && resumes < MAX_RESUMES) {
           resumes++;
-          console.warn(
-            `メディア転送が途中で切断されたため ${received} バイト目から再開します (${resumes}/${MAX_RESUMES}): ${url}`,
-          );
+          if (validator === null) {
+            // representation validator が無いと Range 再開は世代混在 (旧 prefix + 新 suffix) を検出できない。
+            // 受信済みを捨てて先頭から取り直す (単一ストリームは常に単一表現なので混在しない)。
+            discard();
+            console.warn(`validator が無いため先頭から取り直します (${resumes}/${MAX_RESUMES}): ${url}`);
+          } else {
+            console.warn(
+              `メディア転送が切断されたため ${received} バイト目から再開します (${resumes}/${MAX_RESUMES}): ${url}`,
+            );
+          }
           continue;
         }
         return { blob: null, status: outcome.status, retryAfter: outcome.retryAfter };
@@ -140,11 +151,22 @@ export async function fetchMediaViaPort(
   }
 }
 
+/**
+ * If-Range に使える representation validator を選ぶ。
+ * strong ETag のみ使える (weak ETag `W/...` は If-Range に使えない。RFC 9110 §13.1.5)。
+ * strong ETag が無ければ Last-Modified を使う (サーバは exact match で判定する)。
+ */
+function pickValidator(etag: string | null, lastModified: string | null): string | null {
+  if (typeof etag === 'string' && etag.length > 0 && !etag.startsWith('W/')) return etag;
+  if (typeof lastModified === 'string' && lastModified.length > 0) return lastModified;
+  return null;
+}
+
 type StreamCallbacks = {
   /** 全体長を確定する (初回の Content-Length / 206 の Content-Range total) */
   setExpectedTotal: (total: number) => void;
   getExpectedTotal: () => number | null;
-  /** 初回 head の validator を記録する (2 回目以降は無視される) */
+  /** validator を記録する (初回応答と 200 restart のときだけ呼ばれる。206 継続時は呼ばれない) */
   setValidator: (validator: string | null) => void;
   onRestart: () => void;
   onChunk: (bytes: Uint8Array<ArrayBuffer>) => void;
@@ -221,14 +243,7 @@ function streamOnce(
             finish(status === 0 ? { kind: 'transport', status, retryAfter } : { kind: 'http', status, retryAfter });
             return;
           }
-          // 初回応答の validator を記録する (再開時の If-Range に使う)。ETag 優先、なければ Last-Modified
-          callbacks.setValidator(
-            typeof message.etag === 'string' && message.etag.length > 0
-              ? message.etag
-              : typeof message.lastModified === 'string' && message.lastModified.length > 0
-                ? message.lastModified
-                : null,
-          );
+          const respValidator = pickValidator(message.etag, message.lastModified);
           if (offset > 0) {
             if (status === 206) {
               const range = parseContentRange(message.contentRange);
@@ -251,13 +266,17 @@ function streamOnce(
                 finish({ kind: 'transport', status, retryAfter });
                 return;
               }
+              // 206 継続時は validator を更新しない (初回に確定した validator を保つ)。
               // Content-Range total が得られたら全体長として採用する (初回に Content-Length が無くても
               // ここで確定でき、終端時の欠落検出が効くようになる)
               if (range.total !== null) callbacks.setExpectedTotal(range.total);
             } else if (status === 200) {
-              // サーバが Range を無視 (または If-Range 不一致) で全体を返した。先頭から受け直す
+              // サーバが Range を無視 (または If-Range 不一致で内容が変わった) ため全体を返した。先頭から
+              // 受け直し、validator も新しい representation のものへ置き換える (旧 validator を使い続けると
+              // 再切断のたびに 200 が返り MAX_RESUMES まで先頭からやり直しになる)
               callbacks.onRestart();
               baseOffset = 0;
+              callbacks.setValidator(respValidator);
               if (message.contentLength !== null) callbacks.setExpectedTotal(message.contentLength);
             } else {
               // 206/200 以外の成功 (204 等) は Range 再開として解釈できない。失敗として扱う
@@ -265,8 +284,16 @@ function streamOnce(
               finish({ kind: 'transport', status, retryAfter });
               return;
             }
-          } else if (message.contentLength !== null) {
-            callbacks.setExpectedTotal(message.contentLength);
+          } else {
+            // 初回応答は Range を付けていないので 200 が正常。204 や (要求していない) 部分 206 は、
+            // 全体を受け取れたか保証できないので成功にしない
+            if (status !== 200) {
+              console.warn(`初回応答が 200 以外の成功ステータス (${status}) でした: ${url}`);
+              finish({ kind: 'transport', status, retryAfter });
+              return;
+            }
+            callbacks.setValidator(respValidator);
+            if (message.contentLength !== null) callbacks.setExpectedTotal(message.contentLength);
           }
           return;
         }

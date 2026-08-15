@@ -144,6 +144,8 @@ function bigBodyRoute(bodies: Record<string, { body: Buffer; supportsRange: bool
   const handler = async (route: Route, url: string): Promise<boolean> => {
     const entry = bodies[url];
     if (!entry) return false;
+    // strong ETag を返す (無いと content 側は Range 再開せず先頭から取り直す。ここでは再開を検証したい)
+    const etag = `"fbdl-${entry.body.length}"`;
     const rangeHeader = route.request().headers().range;
     if (rangeHeader) {
       rangeRequests[url] ??= [];
@@ -163,6 +165,7 @@ function bigBodyRoute(bodies: Record<string, { body: Buffer; supportsRange: bool
           'Content-Type': 'application/octet-stream',
           'Content-Length': String(total - start),
           'Content-Range': `bytes ${start}-${total - 1}/${total}`,
+          ETag: etag,
         },
         body: entry.body.subarray(start),
       });
@@ -170,7 +173,7 @@ function bigBodyRoute(bodies: Record<string, { body: Buffer; supportsRange: bool
     }
     await route.fulfill({
       status: 200,
-      headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(entry.body.length) },
+      headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(entry.body.length), ETag: etag },
       body: entry.body,
     });
     return true;
