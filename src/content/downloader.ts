@@ -1,6 +1,6 @@
 import type { DownloadZipResult, FileSystemFileHandle } from 'download-helper/download-helper';
 import { DownloadHelper, DownloadUtils } from 'download-helper/download-helper';
-import { sendMessageAbortable } from './messaging';
+import { fetchMediaViaPort } from './media-stream';
 import { createTestSaveHandle, IS_TEST_BUILD, wrapFetchFileForTest } from './test-hooks';
 
 export type { FileSystemFileHandle } from 'download-helper/download-helper';
@@ -8,28 +8,11 @@ export type { FileSystemFileHandle } from 'download-helper/download-helper';
 const utils = new DownloadUtils();
 const helper = new DownloadHelper(utils);
 
-/**
- * service worker (`type: 'fetch'`) からの応答の型。
- *
- * service worker 側 (src/service-worker/handlers.ts) の MediaFetchResponse とワイヤ形状は
- * 一致させているが、content/fanbox/api.ts の ApiFetchResponse と同様、型としては別モジュールの
- * ものを import せずローカルに持つ (service worker と content script は別バンドルであり、
- * 型のみの結合であっても実装がどちらかの都合で変わったときにもう片方の型定義まで追随を
- * 強制されないようにするため)。
- */
-type MediaFetchResponse = {
-  ok: boolean;
-  status: number;
-  retryAfter: string | null;
-  data?: string;
-  error?: string;
-};
-
 /** ZIP フェーズの 1 回のメディア取得試行の記録 (Issue #18 第 1 段階の観測用契約) */
 export type MediaFetchAttempt = {
   /** 取得先ホスト名 (downloads.fanbox.cc / *.pximg.net 等)。URL 解析に失敗した場合は 'unknown' */
   host: string;
-  /** HTTP ステータス。fetchApi と揃え、通信失敗 (message 応答が status を持たない/例外) は 0 とする */
+  /** HTTP ステータス。fetchApi と揃え、通信失敗 (応答ヘッダを観測できなかった) は 0 とする */
   status: number;
   retryAfter: string | null;
   kind: 'cover' | 'file';
@@ -51,56 +34,17 @@ function hostnameOf(url: string): string {
   }
 }
 
-type ProxyFetchResult = { blob: Blob | null; status: number; retryAfter: string | null };
-
-/**
- * service worker 経由で fetch する (CORS 回避)
- * content script の fetch はページのオリジンとして扱われるため、
- * downloads.fanbox.cc への fetch が CORS でブロックされる。
- * service worker 経由であれば host_permissions が適用される。
- *
- * 戻り値が null なのは、応答そのものを観測できなかった場合 (signal による中断で
- * sendMessageAbortable が reject した) に限る。service worker 側の handleFetchMedia は
- * content script の中断とは無関係に完走する (handleFetchApi と同様) ため、この場合でも
- * fetch 自体は成功/失敗しているかもしれないが、その結果は content script からは観測できない。
- * HTTP エラーや通信失敗など、応答を受け取れた場合は status/retryAfter を伴って返す
- * (blob は null になりうるが、これは「試行はした」ことを意味する)。
- */
-async function proxyFetch(url: string, signal?: AbortSignal): Promise<ProxyFetchResult | null> {
-  let response: MediaFetchResponse;
-  try {
-    response = await sendMessageAbortable<MediaFetchResponse>({ type: 'fetch', url }, signal);
-  } catch (e) {
-    if (signal?.aborted) return null;
-    console.error(`proxyFetch エラー (メッセージング): ${url}`, e);
-    return { blob: null, status: 0, retryAfter: null };
-  }
-  // 応答の正規化: 拡張の更新中は世代の異なる content script / service worker が併存しうるため、
-  // 旧応答形状 ({ ok, data } のみで status/retryAfter を持たない) や欠損フィールドを受け取る
-  // 可能性がある。実行時の値を信頼せず、MediaFetchAttempt の契約 (status 欠損は 0、
-  // retryAfter は文字列でなければ null) をここで保証してから先へ渡す。
-  const status = Number.isFinite(response.status) ? response.status : 0;
-  const retryAfter = typeof response.retryAfter === 'string' ? response.retryAfter : null;
-  // data の欠損判定は型で行う。0 バイトのファイルは有効な空文字列 base64 (data: '') として
-  // 届くため、truthiness (!response.data) で判定すると正常な空ファイルを失敗扱いしてしまう。
-  if (!response.ok || typeof response.data !== 'string') {
-    return { blob: null, status, retryAfter };
-  }
-  try {
-    const binary = atob(response.data);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return { blob: new Blob([bytes]), status, retryAfter };
-  } catch (e) {
-    console.error(`proxyFetch エラー (デコード): ${url}`, e);
-    return { blob: null, status, retryAfter };
-  }
-}
-
 /**
  * リトライ付き fetch (service worker プロキシ経由)
+ *
+ * content script の fetch はページのオリジンとして扱われるため、downloads.fanbox.cc への fetch は
+ * CORS でブロックされる。service worker 経由であれば host_permissions が適用される。本文は Port 上で
+ * chunk に分けて転送される (Issue #22。単発メッセージの応答に載せる方式は runtime messaging の 64 MiB
+ * 上限に当たり、約 48 MiB 以上のファイルが必ず失敗していた)。実装は ./media-stream.ts。
+ *
+ * ここでの再試行は「1 回の取得全体」の単位で、通信失敗・HTTP エラーが対象になる。転送途中の切断からの
+ * 再開 (Range) は fetchMediaViaPort の内側で行うので、ここには現れない。サイズ起因で必ず失敗する経路は
+ * 分割転送により存在しなくなったため、サイズ失敗を再試行から除外する分岐は持たない。
  *
  * 中断されたら即座に null を返す。downloadZip は次のループ境界で signal を見て
  * ZIP を閉じるので、ここで例外にする必要はない。リトライ待ちを挟むと、
@@ -108,7 +52,7 @@ async function proxyFetch(url: string, signal?: AbortSignal): Promise<ProxyFetch
  *
  * 試行単位の観測 (Issue #18 第 1 段階): 実際に応答を受け取れた試行ごとに `attempts` へ記録し、
  * 併せて構造化ログとして console.info に単一オブジェクトで出力する。中断により応答を
- * 観測できなかった試行 (proxyFetch が null を返す場合) は記録しない — 実際に何が起きたか
+ * 観測できなかった試行 (fetchMediaViaPort が null を返す場合) は記録しない — 実際に何が起きたか
  * 分からないものを「失敗」として記録すると、以後の集計 (対象単位の失敗集計) を汚すため。
  *
  * downloadAsZip からしか呼ばれないが、試行記録の性質 (429 → 成功でも初回の 429 が残る、
@@ -126,7 +70,7 @@ export async function fetchWithRetry(
   const host = hostnameOf(url);
   for (let i = 0; i <= retries; i++) {
     if (signal?.aborted) return null;
-    const result = await proxyFetch(url, signal);
+    const result = await fetchMediaViaPort(url, signal);
     if (result) {
       const attempt: MediaFetchAttempt = {
         host,

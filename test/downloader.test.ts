@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import type { DownloadProgress, FileSystemFileHandle, MediaFetchAttempt } from '../src/content/downloader';
 import { downloadAsZip, fetchWithRetry } from '../src/content/downloader';
+import { installFakeMediaRuntime, simpleResponder } from './fake-media-port';
 
 // ZipWriter が書き込む先のモック。write() で渡る Uint8Array を蓄積する。
 class MockWritableStream {
@@ -265,25 +266,15 @@ describe('downloadAsZip - publishedDatetime (info/html, chrome 不要)', () => {
 });
 
 describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () => {
-  // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-  const origChrome = (globalThis as any).chrome;
+  let restoreRuntime: (() => void) | null = null;
   afterEach(() => {
-    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-    (globalThis as any).chrome = origChrome;
+    restoreRuntime?.();
+    restoreRuntime = null;
   });
 
   test('cover と file の LFH の UT extra Mtime が publishedDatetime と一致し、戻り値 (zip/attempts) も正しく埋まる', async () => {
-    const data = btoa(String.fromCharCode(0x89, 0x50, 0x4e, 0x47));
-    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-    (globalThis as any).chrome = {
-      runtime: {
-        sendMessage: async (message: { type: string; url: string }) => {
-          if (message.type !== 'fetch') throw new Error(`unexpected message type: ${message.type}`);
-          // 新応答形状 (status/retryAfter を含む) を模す
-          return { ok: true, status: 200, retryAfter: null, data };
-        },
-      },
-    };
+    const data = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    restoreRuntime = installFakeMediaRuntime(simpleResponder(() => ({ status: 200, body: data }))).restore;
 
     const published = '2023-08-15T09:00:00Z';
     const expectedUnix = Math.floor(new Date(published).getTime() / 1000);
@@ -329,15 +320,7 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
   });
 
   test('取得に 2 回とも失敗 (429) すると zip.failedFileCount に反映され、attempts にも 2 回分の 429 が残る', async () => {
-    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-    (globalThis as any).chrome = {
-      runtime: {
-        sendMessage: async (message: { type: string; url: string }) => {
-          if (message.type !== 'fetch') throw new Error(`unexpected message type: ${message.type}`);
-          return { ok: false, status: 429, retryAfter: '3' };
-        },
-      },
-    };
+    restoreRuntime = installFakeMediaRuntime(simpleResponder(() => ({ status: 429, retryAfter: '3' }))).restore;
     const origSetTimeout = globalThis.setTimeout;
     // fetchWithRetry の再試行間の 1 秒待機を仮想時間で進める
     globalThis.setTimeout = ((handler: TimerHandler) =>
@@ -383,14 +366,13 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
  * (test/service-worker/handlers.test.ts が handleFetchApi を直接呼ぶのと同じ理由)。
  */
 describe('fetchWithRetry の試行記録 (Issue #18)', () => {
-  // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-  const origChrome = (globalThis as any).chrome;
   const origSetTimeout = globalThis.setTimeout;
   const origConsoleInfo = console.info;
+  let restoreRuntime: (() => void) | null = null;
 
   afterEach(() => {
-    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-    (globalThis as any).chrome = origChrome;
+    restoreRuntime?.();
+    restoreRuntime = null;
     globalThis.setTimeout = origSetTimeout;
     console.info = origConsoleInfo;
   });
@@ -402,17 +384,14 @@ describe('fetchWithRetry の試行記録 (Issue #18)', () => {
       origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
 
     let calls = 0;
-    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-    (globalThis as any).chrome = {
-      runtime: {
-        sendMessage: async (message: { type: string; url: string }) => {
-          calls++;
-          if (message.type !== 'fetch') throw new Error(`unexpected message type: ${message.type}`);
-          if (calls === 1) return { ok: false, status: 429, retryAfter: '3' };
-          return { ok: true, status: 200, retryAfter: null, data: btoa('ok') };
-        },
-      },
-    };
+    const runtime = installFakeMediaRuntime(
+      simpleResponder(() => {
+        calls++;
+        if (calls === 1) return { status: 429, retryAfter: '3' };
+        return { status: 200, body: new TextEncoder().encode('ok') };
+      }),
+    );
+    restoreRuntime = runtime.restore;
     const loggedAttempts: unknown[] = [];
     console.info = ((...args: unknown[]) => loggedAttempts.push(args[0])) as typeof console.info;
 
@@ -435,12 +414,7 @@ describe('fetchWithRetry の試行記録 (Issue #18)', () => {
     globalThis.setTimeout = ((handler: TimerHandler) =>
       origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
 
-    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-    (globalThis as any).chrome = {
-      runtime: {
-        sendMessage: async () => ({ ok: false, status: 0, retryAfter: null, error: 'network down' }),
-      },
-    };
+    restoreRuntime = installFakeMediaRuntime(simpleResponder(() => ({ status: 0 }))).restore;
 
     const attempts: MediaFetchAttempt[] = [];
     const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, undefined, 'cover', attempts);
@@ -453,15 +427,12 @@ describe('fetchWithRetry の試行記録 (Issue #18)', () => {
 
   test('中断による打ち切りは失敗として記録されない (1 回目の応答後に中断すると 2 回目は試行されない)', async () => {
     let calls = 0;
-    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-    (globalThis as any).chrome = {
-      runtime: {
-        sendMessage: async () => {
-          calls++;
-          return { ok: false, status: 429, retryAfter: '3' };
-        },
-      },
-    };
+    restoreRuntime = installFakeMediaRuntime(
+      simpleResponder(() => {
+        calls++;
+        return { status: 429, retryAfter: '3' };
+      }),
+    ).restore;
 
     const controller = new AbortController();
     const attempts: MediaFetchAttempt[] = [];
@@ -485,15 +456,12 @@ describe('fetchWithRetry の試行記録 (Issue #18)', () => {
 
   test('呼び出し前から中断済みなら 1 回も試行せず、記録も残らない', async () => {
     let calls = 0;
-    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-    (globalThis as any).chrome = {
-      runtime: {
-        sendMessage: async () => {
-          calls++;
-          return { ok: true, status: 200, retryAfter: null, data: btoa('ok') };
-        },
-      },
-    };
+    restoreRuntime = installFakeMediaRuntime(
+      simpleResponder(() => {
+        calls++;
+        return { status: 200, body: new TextEncoder().encode('ok') };
+      }),
+    ).restore;
     const controller = new AbortController();
     controller.abort();
     const attempts: MediaFetchAttempt[] = [];
@@ -505,46 +473,10 @@ describe('fetchWithRetry の試行記録 (Issue #18)', () => {
     expect(attempts.length).toBe(0);
   });
 
-  test('旧応答形状 { ok, data } (status/retryAfter 欠損) を受けても attempts は正規化される (status:0, retryAfter:null)', async () => {
-    // 拡張の更新中は世代の異なる content script / service worker が併存しうるため、
-    // 旧形状の応答 (status/retryAfter を持たない) を受け取ってもクラッシュせず、
-    // MediaFetchAttempt の契約 (status 欠損は 0、retryAfter は null) を守ることを確認する
-    globalThis.setTimeout = ((handler: TimerHandler) =>
-      origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
-
-    let calls = 0;
-    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-    (globalThis as any).chrome = {
-      runtime: {
-        sendMessage: async () => {
-          calls++;
-          // 旧形状: 失敗時は ok:false のみ (data すら無い)、成功時は ok:true + data のみ
-          if (calls === 1) return { ok: false };
-          return { ok: true, data: btoa('ok') };
-        },
-      },
-    };
-
-    const attempts: MediaFetchAttempt[] = [];
-    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, undefined, 'file', attempts);
-
-    expect(blob).not.toBeNull();
-    expect(calls).toBe(2);
-    expect(attempts.length).toBe(2);
-    expect(attempts.every((a) => a.status === 0)).toBe(true);
-    expect(attempts.every((a) => a.retryAfter === null)).toBe(true);
-  });
-
-  test('0 バイトのファイル (data が空文字列) は失敗ではなく空の Blob として成功する', async () => {
-    // HTTP 2xx で本文 0 バイトのファイルは data: '' (有効な空 base64) として届く。
-    // data の欠損判定を truthiness で行うと、この正常な空ファイルを失敗扱いして
-    // failedFileCount に誤計上してしまうため、型 (string かどうか) で判定する
-    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-    (globalThis as any).chrome = {
-      runtime: {
-        sendMessage: async () => ({ ok: true, status: 200, retryAfter: null, data: '' }),
-      },
-    };
+  test('0 バイトのファイル (chunk なしで end) は失敗ではなく空の Blob として成功する', async () => {
+    // HTTP 2xx で本文 0 バイトのファイルは head → end (bytes 0) だけで届く。
+    // これを失敗扱いすると正常な空ファイルを failedFileCount に誤計上してしまう
+    restoreRuntime = installFakeMediaRuntime(simpleResponder(() => ({ status: 200, body: new Uint8Array() }))).restore;
 
     const attempts: MediaFetchAttempt[] = [];
     const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, undefined, 'file', attempts);
