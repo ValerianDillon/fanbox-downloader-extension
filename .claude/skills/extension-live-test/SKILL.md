@@ -53,6 +53,7 @@ description: 実 FANBOX (https://www.fanbox.cc/) を相手に拡張を実ブラ�
 - ランチャーが `dist/ が見つかりません` と出力して終了した → `bun run build` を先に実行する (自動ビルドはしない設計)
 - `--remote-debugging-port` のポートが既に使用中 (bind エラー) → 前回のランチャーが残っていないか `pgrep -af live-browser.ts` で確認し、残っていれば SIGTERM で止める。無関係なプロセスが占有している場合は勝手に kill せず、「ポートを変更する場合」(下記 MCP 接続確認の節) に従って別ポートで起動する
 - 同じ `--profile` を指す別プロセスが起動している → Chrome の profile ロックにより起動に失敗することがある。`pgrep -af live-browser.ts` で他のプロセスが同じ profile を使っていないか確認してから再起動する
+- メディア取得だけが全件 `status 0` で失敗し、ページ console に `Unchecked runtime.lastError: Could not establish connection. Receiving end does not exist.` が並ぶ → 永続プロファイルに **旧版の service worker がキャッシュされている** (`live-profile/Default/Service Worker/ScriptCache`)。unpacked 拡張でも manifest の `version` が変わらないと Chrome は SW スクリプトをキャッシュから起動することがあり、content script (毎回ディスクから注入される新版) との間でワイヤ契約が食い違う。実測では PR #35 (Port 分割転送) 以後の content script が旧 SW (`onConnect` なし) に接続して全件失敗した。確認は CDP の SW ターゲットで `chrome.runtime.onConnect.hasListeners()` を評価する (新版なら `true`)。対処はランチャー停止後に `rm -rf ~/.local/share/fanbox-downloader-extension/live-profile/Default/"Service Worker"` して再起動する (Cookie は別の場所にあり消えない)。SW を変更した後の実機テストでは毎回この削除を行うこと
 - CDP (`/json/version`) には応答するが拡張が見当たらない → `curl -s http://127.0.0.1:<port>/json/list` を見て `"type": "service_worker"` のエントリ (`chrome-extension://.../service-worker.js`) があるか確認する。無ければ拡張の読み込み自体に失敗しているので `dist/` の中身 (`manifest.json` の有無など) を確認する
 
 ## ログイン bootstrap (初回 / セッションが切れている場合)
