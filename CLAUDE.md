@@ -25,7 +25,7 @@ fanbox-downloader のブックマークレット版を Chrome 拡張に移行し
 - **content script + service worker の 2 プロセス構成。** content script が UI (FAB / overlay) とデータ収集と ZIP 生成を担い、service worker を fetch プロキシとして使う。content script の fetch はページ origin として扱われ downloads.fanbox.cc などが CORS でブロックされるため、host_permissions を持つ service worker 経由で取得する
 - **overlay は状態マシン** `settings` → `collecting` → `downloading` → `complete`。UI は shadow DOM でページのスタイルから隔離する
 - **メディア取得は Port で分割転送する (Issue #22)。** 単発の `chrome.runtime.sendMessage` の応答に本文全体を base64 で載せる方式は runtime messaging の 64 MiB 上限に base64 の 4/3 膨張込みで当たり、約 48 MiB 以上のファイルが必ず失敗していた。content script が Port を張り、service worker が本文を `CHUNK_BYTES` (8 MiB) ごとに chunk へ分けて流す。ワイヤ契約は `src/media-stream-protocol.ts` に集約し両バンドルで共有する
-  - MV3 の service worker はいつでも停止しうる (30 秒無活動 / 5 分上限 / fetch 応答 30 秒)。転送途中で Port が切れたら受信済みバイト数を offset にした `Range` 要求で新しい Port を張って再開する。Range を無視して 200 が返ったら先頭から受け直し、切断が続けば `MAX_RESUMES` 回で諦めて上位の再試行に委ねる
+  - MV3 の service worker はいつでも停止しうる (30 秒無活動 / 5 分上限 / fetch 応答 30 秒)。転送途中で Port が切れたら受信済みバイト数を offset にした `Range` 要求で新しい Port を張って再開する。Range を無視して 200 が返ったら先頭から受け直し、切断が続けば `MAX_RESUMES` 回で諦めて上位の再試行に委ねる。実測 (2026-08-16) では `downloads.fanbox.cc` は Range に対応する (206 + `Accept-Ranges: bytes`) が ETag / Last-Modified を返さないため、実サイトでは validator 無しの分岐 (`src/content/media-stream.ts:142`) に入り Range 再開は行われず先頭からの取り直しになる (正しさは保たれ、切断時の効率のみ下がる)
   - 低速回線で `CHUNK_BYTES` が 30 秒以内に溜まらないと転送中に service worker が停止するため、chunk が満たなくても `FLUSH_INTERVAL_MS` ごとに送って idle timer をリセットする (Chrome 114 以降、Port は開くだけでなくメッセージ送受信でリセットされる)
   - 本文全体を JS ヒープに保持しない。受信合計を `Content-Length` と各 Port の終端メッセージのバイト数に突き合わせ、一致しなければ成功にしない (欠けたファイルを ZIP に入れないため)
   - API 取得 (`fetchApi` / `getBackoffUntil`) は単発の `sendMessage` のまま (JSON はサイズ上限に達しない)
