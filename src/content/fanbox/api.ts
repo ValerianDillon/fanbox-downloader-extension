@@ -1,12 +1,12 @@
 import type {
-  PaginatedPosts,
   PlanInfo,
-  Plans,
+  PlansResponse,
   PostInfo,
   PostInfoResponse,
-  PostList,
   PostListItem,
-  Tags,
+  PostListResponse,
+  PostPaginationResponse,
+  TagsResponse,
 } from 'download-helper/fanbox-collector';
 import { parseRetryAfter } from '../../retry-after';
 import { sendMessageAbortable } from '../messaging';
@@ -508,7 +508,7 @@ export class ApiSession {
   async fetchPlans(creatorId: string, signal?: AbortSignal): Promise<PlanInfo[]> {
     const url = `https://api.fanbox.cc/plan.listCreator?creatorId=${creatorId}`;
     try {
-      return await this.fetchJson<Plans, PlanInfo[]>(
+      return await this.fetchJson<PlansResponse, PlanInfo[]>(
         url,
         (result) => unwrapArray<PlanInfo>(result?.body?.plans, url, 'body.plans', isValidPlan),
         signal,
@@ -532,7 +532,7 @@ export class ApiSession {
   async fetchTags(creatorId: string, signal?: AbortSignal): Promise<string[]> {
     const url = `https://api.fanbox.cc/tag.getFeatured?creatorId=${creatorId}`;
     try {
-      return await this.fetchJson<Tags, string[]>(
+      return await this.fetchJson<TagsResponse, string[]>(
         url,
         (result) =>
           unwrapArray<{ tag: string }>(
@@ -587,7 +587,7 @@ export class ApiSession {
 
   async fetchPaginatedPosts(creatorId: string, signal?: AbortSignal): Promise<string[]> {
     const url = `https://api.fanbox.cc/post.paginateCreator?creatorId=${creatorId}`;
-    return this.fetchJson<PaginatedPosts, string[]>(
+    return this.fetchJson<PostPaginationResponse, string[]>(
       url,
       (result) => unwrapArray<string>(result?.body?.pageUrls, url, 'body.pageUrls', (item) => typeof item === 'string'),
       signal,
@@ -595,7 +595,7 @@ export class ApiSession {
   }
 
   async fetchPostList(url: string, signal?: AbortSignal): Promise<PostListItem[]> {
-    return this.fetchJson<PostList, PostListItem[]>(
+    return this.fetchJson<PostListResponse, PostListItem[]>(
       url,
       (result) => unwrapArray<PostListItem>(result?.body?.posts, url, 'body.posts', isValidPostListItem),
       signal,
