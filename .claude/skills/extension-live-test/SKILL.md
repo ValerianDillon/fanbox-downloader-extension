@@ -89,7 +89,7 @@ headless Chromium は UA が `HeadlessChrome/...` になり、Cloudflare のボ�
 
 ## 実 API のレスポンス形状を観測する (service worker 経由)
 
-`api.fanbox.cc/post.info` はページ origin (`www.fanbox.cc`) からの fetch では CORS で読めない (`Access-Control-Allow-Origin` を返さない。拡張の有無に依存しない FANBOX 側の挙動で、拡張を読み込まないブラウザでも同じ)。`post.listCreator` や `plan.listSupporting` は読めるので、エンドポイントによって異なる。
+`api.fanbox.cc/post.info` はページ origin (`www.fanbox.cc` / `<creatorId>.fanbox.cc`) からでも読める。同期 XHR・`fetch` とも 200 を返す。`post.listCreator` や `plan.listSupporting` も同様に読める。
 
 生のレスポンス形状を観測したいときは、host_permissions を持つ拡張の service worker コンテキストで evaluate する。`playwright.connectOverCDP` は chrome-devtools MCP が同じ endpoint を掴んでいると接続がタイムアウトすることがあるため、`bun scripts/live-cdp-eval.ts sw '<expression>'` を使う (service worker ターゲットの webSocketDebuggerUrl に直接 WebSocket で接続し `Runtime.evaluate` を送る CLI)。
 
