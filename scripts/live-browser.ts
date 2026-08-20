@@ -8,11 +8,11 @@
  * branded Chrome は --load-extension が廃止されているため使わない
  * (e2e/smoke.spec.ts と同じく Playwright 管理の Chromium を使う)。
  *
- * 使い方: bun scripts/live-browser.ts [--headed] [--port <n>] [--profile <dir>]
+ * 使い方: bun scripts/live-browser.ts [--headed] [--port <n>] [--profile <dir>] [--keep-sw-cache]
  *
  * 詳細な運用手順は .claude/skills/extension-live-test/SKILL.md を参照。
  */
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { chromium } from '@playwright/test';
@@ -25,12 +25,14 @@ type Options = {
   headed: boolean;
   port: number;
   profileDir: string;
+  keepSwCache: boolean;
 };
 
 function parseArgs(argv: string[]): Options {
   let headed = false;
   let port = DEFAULT_PORT;
   let profileDir = DEFAULT_PROFILE_DIR;
+  let keepSwCache = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -55,12 +57,35 @@ function parseArgs(argv: string[]): Options {
         profileDir = path.resolve(value);
         break;
       }
+      case '--keep-sw-cache':
+        keepSwCache = true;
+        break;
       default:
         throw new Error(`不明な引数です: ${arg}`);
     }
   }
 
-  return { headed, port, profileDir };
+  return { headed, port, profileDir, keepSwCache };
+}
+
+/**
+ * <profileDir>/Default/Service Worker を起動前に削除する。
+ *
+ * Why not: unpacked 拡張でも manifest の version が変わらないと、Chrome は service worker
+ * スクリプトをキャッシュ (ScriptCache) から起動することがある。その場合、ディスクから毎回
+ * 注入される新版の content script と、キャッシュされた旧版 service worker との間でワイヤ契約
+ * (src/media-stream-protocol.ts) が食い違い、Port 接続が「Receiving end does not exist」で
+ * 全件失敗する (詳細は CLAUDE.md / SKILL.md「診断」節)。永続プロファイルを使い回す
+ * ランチャーの性質上、SW を変更するたびにこの不整合が起き得るため毎回削除して踏まない
+ * ようにする。Cookie はプロファイル内の別ディレクトリ (Default/Cookies 等) にあるため
+ * このディレクトリを消しても消えない。
+ * `--keep-sw-cache` はこの削除自体の挙動を確認したい場合などに抑止する脱出弁。
+ */
+function clearServiceWorkerCache(profileDir: string): void {
+  const swCacheDir = path.join(profileDir, 'Default', 'Service Worker');
+  if (!existsSync(swCacheDir)) return;
+  rmSync(swCacheDir, { recursive: true, force: true });
+  console.log(`service worker キャッシュを削除しました: ${swCacheDir}`);
 }
 
 /**
@@ -91,6 +116,10 @@ async function main() {
   }
 
   mkdirSync(options.profileDir, { recursive: true });
+
+  if (!options.keepSwCache) {
+    clearServiceWorkerCache(options.profileDir);
+  }
 
   const context = await chromium.launchPersistentContext(options.profileDir, {
     channel: 'chromium',
