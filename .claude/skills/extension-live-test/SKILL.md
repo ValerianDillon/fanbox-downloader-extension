@@ -53,7 +53,7 @@ description: 実 FANBOX (https://www.fanbox.cc/) を相手に拡張を実ブラ�
 - ランチャーが `dist/ が見つかりません` と出力して終了した → `bun run build` を先に実行する (自動ビルドはしない設計)
 - `--remote-debugging-port` のポートが既に使用中 (bind エラー) → 前回のランチャーが残っていないか `pgrep -af live-browser.ts` で確認し、残っていれば SIGTERM で止める。無関係なプロセスが占有している場合は勝手に kill せず、「ポートを変更する場合」(下記 MCP 接続確認の節) に従って別ポートで起動する
 - 同じ `--profile` を指す別プロセスが起動している → Chrome の profile ロックにより起動に失敗することがある。`pgrep -af live-browser.ts` で他のプロセスが同じ profile を使っていないか確認してから再起動する
-- メディア取得だけが全件 `status 0` で失敗し、ページ console に `Unchecked runtime.lastError: Could not establish connection. Receiving end does not exist.` が並ぶ → 永続プロファイルに **旧版の service worker がキャッシュされている** (`live-profile/Default/Service Worker/ScriptCache`)。unpacked 拡張でも manifest の `version` が変わらないと Chrome は SW スクリプトをキャッシュから起動することがあり、content script (毎回ディスクから注入される新版) との間でワイヤ契約が食い違う。実測では PR #35 (Port 分割転送) 以後の content script が旧 SW (`onConnect` なし) に接続して全件失敗した。確認は CDP の SW ターゲットで `chrome.runtime.onConnect.hasListeners()` を評価する (新版なら `true`)。対処はランチャー停止後に `rm -rf ~/.local/share/fanbox-downloader-extension/live-profile/Default/"Service Worker"` して再起動する (Cookie は別の場所にあり消えない)。SW を変更した後の実機テストでは毎回この削除を行うこと
+- メディア取得だけが全件 `status 0` で失敗し、ページ console に `Unchecked runtime.lastError: Could not establish connection. Receiving end does not exist.` が並ぶ → 旧版の service worker がキャッシュされて起きる症状。ランチャーが起動時に `Default/Service Worker` を自動削除するため通常は起きない。`--keep-sw-cache` を付けた場合のみ発生し得るので、その場合は手動で削除して再起動する。確認は `bun scripts/live-cdp-eval.ts sw 'chrome.runtime.onConnect.hasListeners()'` (新版なら `true`)
 - CDP (`/json/version`) には応答するが拡張が見当たらない → `curl -s http://127.0.0.1:<port>/json/list` を見て `"type": "service_worker"` のエントリ (`chrome-extension://.../service-worker.js`) があるか確認する。無ければ拡張の読み込み自体に失敗しているので `dist/` の中身 (`manifest.json` の有無など) を確認する
 
 ## ログイン bootstrap (初回 / セッションが切れている場合)
@@ -90,20 +90,16 @@ headless Chromium は UA が `HeadlessChrome/...` になり、Cloudflare のボ�
 
 `api.fanbox.cc/post.info` はページ origin (`www.fanbox.cc`) からの fetch では CORS で読めない (`Access-Control-Allow-Origin` を返さない。拡張の有無に依存しない FANBOX 側の挙動で、拡張を読み込まないブラウザでも同じ)。`post.listCreator` や `plan.listSupporting` は読めるので、エンドポイントによって異なる。
 
-生のレスポンス形状を観測したいときは、host_permissions を持つ拡張の service worker コンテキストで evaluate する。CDP の service worker ターゲットに WebSocket で直接つないで `Runtime.evaluate` を送るのが確実である (`playwright.connectOverCDP` は chrome-devtools MCP が同じ endpoint を掴んでいると接続がタイムアウトすることがある)。
+生のレスポンス形状を観測したいときは、host_permissions を持つ拡張の service worker コンテキストで evaluate する。`playwright.connectOverCDP` は chrome-devtools MCP が同じ endpoint を掴んでいると接続がタイムアウトすることがあるため、`bun scripts/live-cdp-eval.ts sw '<expression>'` を使う (service worker ターゲットの webSocketDebuggerUrl に直接 WebSocket で接続し `Runtime.evaluate` を送る CLI)。
 
-```
-curl -s http://127.0.0.1:9222/json/list   # "type": "service_worker" の webSocketDebuggerUrl を得る
-```
-
-得た URL に WebSocket で接続し、`{"id":1,"method":"Runtime.evaluate","params":{"expression":"(async()=>{...})()","awaitPromise":true,"returnByValue":true}}` を送る。
+例: `bun scripts/live-cdp-eval.ts sw "(async()=>{ const res = await fetch('...'); return await res.json(); })()"`
 
 ## 生成した ZIP を実データで検証する
 
 テストビルドは `showSaveFilePicker` を stub し、生成した ZIP を base64 で `data-fbdl-zip-b64` に publish する。実データの ZIP を検証したいときはこれを取り出す。
 
-- 数十 MB になるため、`evaluate_script` の戻り値としてインラインで受け取らないこと。chrome-devtools MCP の `filePath` パラメータでファイルに保存してから base64 デコードする
-- デコード後は `unzip -l` (ディレクトリエントリと日時) / `unzip -t` (整合性) / 展開して `date -r` (展開後の mtime) で検証できる
+- `data-fbdl-zip-b64` が publish されるのは ZIP が `ZIP_B64_PUBLISH_LIMIT` (8 MiB、`src/content/test-hooks.ts`) 以下のときだけで、超えると `zip-url` (Blob URL) と `zip-size` のみになる。取り出しは ZIP サイズによらず `bun scripts/live-pull-zip.ts <out.zip>` を使う (8 MiB 以下で zip-b64 を使う場合も MCP `evaluate_script` の戻り値でインラインに受け取らず `filePath` で保存する)
+- 保存後は `unzip -l` (ディレクトリエントリと日時) / `unzip -t` (整合性) / 展開して `date -r` (展開後の mtime) で検証できる
 
 ## フォールバック: Windows 側にウィンドウを出さず headed 実行する (未整備)
 
