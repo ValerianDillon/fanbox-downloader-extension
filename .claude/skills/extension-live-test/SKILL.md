@@ -38,7 +38,7 @@ description: 実 FANBOX (https://www.fanbox.cc/) を相手に拡張を実ブラ�
 2. 拡張の FAB ボタン (画面右下 `bottom: 24px; right: 24px` に固定表示、`src/content/fab.ts`) をクリックする。通常ビルドの shadow root は closed のため DOM セレクタでは shadow 内に届かない。closed shadow root でも accessibility tree には露出するため、`take_snapshot` を撮ると FAB は `button "⬇" description="FANBOX Downloader"` として uid 付きで現れる。この uid をクリックするのが最も安定する (スクリーンショットからの座標クリックでもよい)
 3. overlay パネルで収集対象を最小限に設定して実行し、進行は overlay の表示で確認する
    - 「取得件数上限」は「`addByPostInfo` が `'added'` を返した投稿の件数」の上限であり、試行回数の上限ではない (`DownloadManage.decrementLimit` は登録成功時のみ減算する)。支援していないクリエイターでは投稿がほぼ登録できず上限に到達しないため、上限 1 に設定しても全投稿分の `post.info` を発行する。実 API への負荷を最小化したいなら、自分が支援していて数投稿だけ登録できるクリエイターを選ぶか、投稿数の少ないクリエイターを選ぶ
-4. 保存ステップ (`showSaveFilePicker`, `src/content/downloader.ts:69`) はネイティブのファイル保存ダイアログを要求するため、headless では完走できない。実測では headless Chromium の `showSaveFilePicker` は即座に `AbortError` を投げる。かつこのハンドル取得は収集より前 (ダウンロード開始直後のユーザジェスチャー中) に呼ばれるため、通常ビルドの headless では収集自体が始まらずオーバーレイが settings のまま留まる。保存まで確認したい場合は headed で行う
+4. 保存ステップ (`pickSaveHandle` → `showSaveFilePicker`, `src/content/downloader.ts`) はネイティブのファイル保存ダイアログを要求するため、headless では完走できない。実測では headless Chromium の `showSaveFilePicker` は即座に `AbortError` を投げる。かつこのハンドル取得は収集より前 (ダウンロード開始直後のユーザジェスチャー中) に呼ばれるため、通常ビルドの headless では収集自体が始まらずオーバーレイが settings のまま留まる。保存まで確認したい場合は headed で行う
 
 ### headless で収集フローを観測したい場合はテストビルドを使う
 
@@ -83,6 +83,7 @@ headless Chromium は UA が `HeadlessChrome/...` になり、Cloudflare のボ�
 | --- | --- | --- |
 | UA | `HeadlessChrome/149.0.0.0` | `Chrome/149.0.0.0` |
 | 収集 216 件中の `post.info` 失敗 | 34 件 | 0 件 |
+| 収集 73 件中の `post.info` 失敗 (別クリエイター、2026-08-16) | 65 件 | 0 件 |
 
 つまり **headless で観測した「API 通信に失敗した投稿」は拡張の不具合ではなくボット判定である可能性が高い**。失敗率や通信エラーを評価したいときは headed で確認する。UI の遷移や状態管理の確認だけなら headless で足りる。
 
@@ -97,6 +98,8 @@ headless Chromium は UA が `HeadlessChrome/...` になり、Cloudflare のボ�
 ## 生成した ZIP を実データで検証する
 
 テストビルドは `showSaveFilePicker` を stub し、生成した ZIP を base64 で `data-fbdl-zip-b64` に publish する。実データの ZIP を検証したいときはこれを取り出す。
+
+- ZIP に投稿が入るには `addByPostInfo` が登録できる必要があるため **headed で行う**。headless はボット判定で `post.info` がほぼ全件失敗し (実測 2026-08-16: 73 件中 65 件失敗、登録 0 件)、ZIP が生成されない
 
 - `data-fbdl-zip-b64` が publish されるのは ZIP が `ZIP_B64_PUBLISH_LIMIT` (8 MiB、`src/content/test-hooks.ts`) 以下のときだけで、超えると `zip-url` (Blob URL) と `zip-size` のみになる。取り出しは ZIP サイズによらず `bun scripts/live-pull-zip.ts <out.zip>` を使う (8 MiB 以下で zip-b64 を使う場合も MCP `evaluate_script` の戻り値でインラインに受け取らず `filePath` で保存する)
 - 保存後は `unzip -l` (ディレクトリエントリと日時) / `unzip -t` (整合性) / 展開して `date -r` (展開後の mtime) で検証できる
