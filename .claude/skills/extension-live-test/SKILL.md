@@ -95,6 +95,8 @@ headless Chromium は UA が `HeadlessChrome/...` になり、Cloudflare のボ�
 
 例: `bun scripts/live-cdp-eval.ts sw "(async()=>{ const res = await fetch('...'); return await res.json(); })()"`
 
+ページ origin からの見え方を確認したいときは `page` ターゲットを使う: `bun scripts/live-cdp-eval.ts page '<expression>'`。第 1 引数が対象ターゲットで、`page` は `type === 'page'` の先頭、`sw` は service worker を選ぶ。
+
 ## 生成した ZIP を実データで検証する
 
 テストビルドは `showSaveFilePicker` を stub し、生成した ZIP を base64 で `data-fbdl-zip-b64` に publish する。実データの ZIP を検証したいときはこれを取り出す。
