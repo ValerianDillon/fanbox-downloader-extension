@@ -2,11 +2,14 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   ApiSession,
   ApiShapeError,
+  createChromeProxyTransport,
   DEFAULT_API_RATE_LIMIT_MS,
   detectPage,
   HttpError,
   RateLimitExhaustedError,
+  ResponseParseError,
   resetSharedBackoff,
+  TransportExhaustedError,
 } from '../../src/content/fanbox/api';
 
 describe('detectPage', () => {
@@ -98,6 +101,7 @@ function errorStatus(status: number): ProxyApiResponse {
 describe('fetchJson レートリミッタ / 429 リトライ', () => {
   const origSetTimeout = globalThis.setTimeout;
   const origClearTimeout = globalThis.clearTimeout;
+  const origDateNow = Date.now;
   // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
   const origChrome = (globalThis as any).chrome;
   let calls: ApiCall[];
@@ -105,20 +109,32 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
   let api: ApiSession;
   // 仮想時間: setTimeout を即時実行に置換し、待機時間の累積だけ測る
   let virtualWaitMs: number;
+  /**
+   * 待機した分だけ Date.now も進める。
+   * 共有セッションは deferred (service worker のバックオフ期限中で発行していない) を受けると
+   * 「期限まで待ってから transport を呼び直す」。時計を止めたままにすると、待機後の再呼び出しで
+   * adapter が依然として期限内と判断して deferred を返し続け、待機が実際には経過している
+   * はずの場面で deferred の上限に達してしまう。
+   */
+  let virtualClockMs: number;
 
   function installFakeTimers() {
     virtualWaitMs = 0;
+    virtualClockMs = 0;
     globalThis.setTimeout = ((handler: TimerHandler, timeout?: number) => {
       virtualWaitMs += timeout ?? 0;
+      virtualClockMs += timeout ?? 0;
       const id = origSetTimeout(handler as () => void, 0);
       return id;
     }) as unknown as typeof setTimeout;
     globalThis.clearTimeout = origClearTimeout;
+    Date.now = () => origDateNow() + virtualClockMs;
   }
 
   function restoreTimers() {
     globalThis.setTimeout = origSetTimeout;
     globalThis.clearTimeout = origClearTimeout;
+    Date.now = origDateNow;
   }
 
   beforeEach(() => {
@@ -269,11 +285,14 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
   });
 
   test('status 0 が続けば再試行上限で投げる', async () => {
-    responders.push(() => ({ ok: false, status: 0, retryAfter: null, error: 'Failed to fetch' }));
-    responders.push(() => ({ ok: false, status: 0, retryAfter: null, error: 'Failed to fetch' }));
+    // 観測できない失敗の再試行は 5 秒・15 秒の 2 回。初回と合わせて 3 要求で枯渇する
+    for (let i = 0; i < 3; i++) {
+      responders.push(() => ({ ok: false, status: 0, retryAfter: null, error: 'Failed to fetch' }));
+    }
 
-    await expect(api.fetchPostInfo('1')).rejects.toThrow(/通信に失敗/);
-    expect(calls).toHaveLength(2);
+    await expect(api.fetchPostInfo('1')).rejects.toThrow(TransportExhaustedError);
+    expect(calls).toHaveLength(3);
+    expect(virtualWaitMs).toBeGreaterThanOrEqual(5_000 + 15_000);
   });
 
   test('サーバー指定のバックオフは収集をまたいでも守る', async () => {
@@ -354,9 +373,7 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     expect(calls).toHaveLength(1);
   });
 
-  test('中断中は事前確認の失敗を握りつぶさず、中断として伝播する', async () => {
-    // fail-open にするのは通常の (中断ではない) 失敗だけ。中断はそのまま伝播しないと、
-    // キャンセル操作が効かなくなる
+  test('中断済みの signal では要求を一切発行せず、中断として伝播する', async () => {
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = {
       runtime: {
@@ -365,7 +382,48 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     };
     const controller = new AbortController();
     controller.abort();
-    await expect(api.fetchPostInfo('1', controller.signal)).rejects.toThrow(/Aborted/);
+    const error = await api.fetchPostInfo('1', controller.signal).catch((e) => e);
+    expect((error as Error).name).toBe('AbortError');
+  });
+
+  test('中断中は事前確認 (getBackoffUntil) の失敗を握りつぶさず、中断として伝播する', async () => {
+    // fail-open にするのは通常の (中断ではない) 失敗だけ。中断まで fail-open に落とすと、
+    // 中断の理由が「続行してよい失敗」として握り潰される。
+    //
+    // transport を直に叩くのは、セッション経由では中断が先に検出されて adapter の
+    // 事前確認まで到達しないため。また fail-open か否かは警告ログでしか区別できない:
+    // 握りつぶした場合も直後の proxyFetchApi が中断済みの signal で reject するので、
+    // 呼び出し側から見た結果 (AbortError / fetchApi 未発行) は同じになる
+    const controller = new AbortController();
+    const transport = createChromeProxyTransport();
+    let fetchApiCalls = 0;
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: (message: { type: string }) => {
+          if (message.type === 'getBackoffUntil') {
+            // 事前確認の最中に中断された状況を作る
+            controller.abort();
+            return Promise.reject(new Error('getBackoffUntil failed'));
+          }
+          fetchApiCalls++;
+          return Promise.resolve(okPost());
+        },
+      },
+    };
+    const origWarn = console.warn;
+    let warned = 0;
+    console.warn = () => {
+      warned++;
+    };
+    try {
+      const error = await transport('https://api.fanbox.cc/post.info?postId=1', controller.signal).catch((e) => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(warned).toBe(0);
+      expect(fetchApiCalls).toBe(0);
+    } finally {
+      console.warn = origWarn;
+    }
   });
 
   test('429 以外のエラーは即時例外', async () => {
@@ -395,7 +453,13 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
   });
 });
 
-describe('Issue #14: エラー型の kind / status / fields', () => {
+/**
+ * 共有層 (download-helper/api-session) のエラー型は kind を持たない。Issue #14 で導入した
+ * e.kind による構造的な分岐は、失敗の種別をエラー型そのもので表す形に置き換わっている。
+ * status を持つのは HttpError だけで、枯渇系 (RateLimitExhaustedError /
+ * TransportExhaustedError) は「どの再試行枠を使い切ったか」を型で表す。
+ */
+describe('Issue #14: エラー型による失敗種別の識別', () => {
   const origSetTimeout = globalThis.setTimeout;
   const origClearTimeout = globalThis.clearTimeout;
   // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
@@ -443,48 +507,46 @@ describe('Issue #14: エラー型の kind / status / fields', () => {
     resetSharedBackoff();
   });
 
-  test('レート制限の枯渇は RateLimitExhaustedError (kind: rate-limit, status: 429) を投げる', async () => {
+  test('レート制限の枯渇は RateLimitExhaustedError を投げる', async () => {
     for (let i = 0; i < 4; i++) responders.push(() => tooManyRequests());
 
     const error = await api.fetchPostInfo('x').catch((e) => e);
     expect(error).toBeInstanceOf(RateLimitExhaustedError);
-    expect(error.kind).toBe('rate-limit');
-    expect(error.status).toBe(429);
+    // 通信の枯渇と取り違えない。呼び出し側は停止理由をこの型の違いから導く
+    expect(error).not.toBeInstanceOf(TransportExhaustedError);
   });
 
-  test('HTTP エラー (429 以外) は HttpError (kind: http) を投げ、status に実際のコードを持つ', async () => {
+  test('HTTP エラー (429 以外) は HttpError を投げ、status に実際のコードを持つ', async () => {
     responders.push(() => errorStatus(503));
 
     const error = await api.fetchPostInfo('w').catch((e) => e);
     expect(error).toBeInstanceOf(HttpError);
-    expect(error.kind).toBe('http');
     expect(error.status).toBe(503);
   });
 
-  test('通信失敗 (status 0) が再試行後も続くと HttpError (kind: network, status: 0) を投げる', async () => {
-    responders.push(() => ({ ok: false, status: 0, retryAfter: null, error: 'Failed to fetch' }));
-    responders.push(() => ({ ok: false, status: 0, retryAfter: null, error: 'Failed to fetch' }));
+  test('通信失敗 (status 0) が再試行後も続くと TransportExhaustedError を投げる', async () => {
+    for (let i = 0; i < 3; i++) {
+      responders.push(() => ({ ok: false, status: 0, retryAfter: null, error: 'Failed to fetch' }));
+    }
 
     const error = await api.fetchPostInfo('1').catch((e) => e);
-    expect(error).toBeInstanceOf(HttpError);
-    expect(error.kind).toBe('network');
-    expect(error.status).toBe(0);
-    expect(calls).toHaveLength(2);
+    expect(error).toBeInstanceOf(TransportExhaustedError);
+    // 観測できない失敗をレート制限として扱わない (再試行枠も待機時間も違う)
+    expect(error).not.toBeInstanceOf(RateLimitExhaustedError);
+    expect(calls).toHaveLength(3);
   });
 
-  test('sendMessage 自体の失敗が再試行後も続くと HttpError (kind: network, status: 0) を投げる', async () => {
+  test('sendMessage 自体の失敗が再試行後も続くと TransportExhaustedError を投げる', async () => {
     // proxyFetchApi (chrome.runtime.sendMessage) が例外で reject し続けるケース
-    responders.push(() => {
-      throw new Error('messaging failed');
-    });
-    responders.push(() => {
-      throw new Error('messaging failed');
-    });
+    for (let i = 0; i < 3; i++) {
+      responders.push(() => {
+        throw new Error('messaging failed');
+      });
+    }
 
     const error = await api.fetchPostInfo('1').catch((e) => e);
-    expect(error).toBeInstanceOf(HttpError);
-    expect(error.kind).toBe('network');
-    expect(error.status).toBe(0);
+    expect(error).toBeInstanceOf(TransportExhaustedError);
+    expect(calls).toHaveLength(3);
   });
 });
 
@@ -678,13 +740,15 @@ describe('Issue #14: ApiShapeError の fields (想定と違ったフィールド
     (globalThis as any).chrome = origChrome;
   });
 
-  test('JSON として読めないレスポンス (SyntaxError) は ApiShapeError (fields: ["json"]) になる', async () => {
-    // JSON.parse の SyntaxError をそのまま投げると instanceof ApiShapeError 判定を
-    // すり抜け、「未対応のレスポンス形式のため中断しました」に乗らない
+  test('JSON として読めないレスポンスは ResponseParseError になる', async () => {
+    // JSON.parse の SyntaxError をそのまま投げると、呼び出し側の型による判定を
+    // すり抜け、「未対応のレスポンス形式のため中断しました」に乗らない。
+    // 形状の不一致 (ApiShapeError) と型を分けているのは、本文を読めなかったのか
+    // 読めた本文が想定と違ったのかで原因の切り分け先が変わるため
     nextResponse = { ok: true, status: 200, retryAfter: null, body: '{ broken' };
     const error = await api.fetchPostInfo('1').catch((e) => e);
-    expect(error).toBeInstanceOf(ApiShapeError);
-    expect(error.fields).toEqual(['json']);
+    expect(error).toBeInstanceOf(ResponseParseError);
+    expect(error).not.toBeInstanceOf(SyntaxError);
   });
 
   test('body.post 自体が無ければ fields は ["body.post"]', async () => {

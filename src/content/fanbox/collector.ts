@@ -275,13 +275,13 @@ async function getItemsByCreator(
       // 形状の不一致は「このページだけ落ちた」ではなく API 仕様変更なので、
       // 失敗件数に丸めず中断する。丸めると投稿ゼロの ZIP を「完了 (1件失敗)」として
       // 出してしまい、ユーザーが取得漏れに気付けない
-      if (e instanceof ApiShapeError) throw e;
+      if (e instanceof ApiShapeError || e instanceof ResponseParseError) throw e;
       // 枯渇したらそこで打ち切るが、集計は返す。throw すると、それまでに
       // 数えた件数が呼び出し側に伝わらず、部分保存の可否も判断できない
       if (e instanceof RateLimitExhaustedError || e instanceof TransportExhaustedError) {
         return { ...counts(), stoppedBy: e };
       }
-      // FetchApiError (通信/HTTP の失敗) だけをページ単位の失敗として数える。
+      // HttpError (2xx 以外の応答) だけをページ単位の失敗として数える。
       // それ以外の想定外の例外を握りつぶすと、こちらのバグが「一覧ページの取得に
       // 失敗した」として静かに握り潰され、部分 ZIP がそのまま保存されてしまう
       if (!(e instanceof HttpError)) throw e;
@@ -295,11 +295,12 @@ async function getItemsByCreator(
     }
     console.log(`投稿の数:${postList.length}`);
 
-    // この try は投稿ループの中で RateLimitExhaustedError が起きた場合に限り、それまでの
-    // 集計 (counts()) を失わずに打ち切り扱いへ変換するためのものである。それ以外
-    // (ApiShapeError/PostBodyInvalidError、および想定外の例外) はここで丸めず、
-    // catch の中で明示的に再送出して未捕捉のまま呼び出し元へ伝播させる。
-    // 投稿単位の失敗 (FetchApiError) は下の内側の try で個別に処理して継続するので、
+    // この try は投稿ループの中で再試行枠の枯渇 (RateLimitExhaustedError /
+    // TransportExhaustedError) が起きた場合に限り、それまでの集計 (counts()) を失わずに
+    // 打ち切り扱いへ変換するためのものである。それ以外 (ApiShapeError/ResponseParseError/
+    // PostBodyInvalidError、および想定外の例外) はここで丸めず、catch の中で明示的に
+    // 再送出して未捕捉のまま呼び出し元へ伝播させる。
+    // 投稿単位の失敗 (HttpError) は下の内側の try で個別に処理して継続するので、
     // ここまで上がってくることはない。
     try {
       for (const post of postList) {
@@ -327,7 +328,13 @@ async function getItemsByCreator(
           // ずっと残りの投稿が 1 件ずつ順に失敗していく (レート制限)、または仕様変更を
           // 検知できないまま収集が続いてしまう (形状/本文の不一致)。ここで throw したものは
           // すぐ外側の try の catch (このブロックの外) が受け止める。
-          if (e instanceof ApiShapeError || e instanceof PostBodyInvalidError || e instanceof RateLimitExhaustedError) {
+          if (
+            e instanceof ApiShapeError ||
+            e instanceof ResponseParseError ||
+            e instanceof PostBodyInvalidError ||
+            e instanceof RateLimitExhaustedError ||
+            e instanceof TransportExhaustedError
+          ) {
             throw e;
           }
           // HttpError だけを投稿単位の失敗として数える (理由は上のページ単位の分岐と同じ)
@@ -341,13 +348,15 @@ async function getItemsByCreator(
     } catch (e) {
       if (signal.aborted) return counts();
       // 枯渇したらそこで打ち切るが、集計は返す。素通しすると、それまでに
-      // 数えた件数が呼び出し側に伝わらず、部分保存の可否も判断できない
-      if (e instanceof RateLimitExhaustedError) {
+      // 数えた件数が呼び出し側に伝わらず、部分保存の可否も判断できない。
+      // レート制限と通信の枯渇を分けないのは、どちらも「上限まで待った末に諦めた」で
+      // あって、それまでに取り込めた投稿の扱いは変わらないため
+      if (e instanceof RateLimitExhaustedError || e instanceof TransportExhaustedError) {
         return { ...counts(), stoppedBy: e };
       }
-      // ApiShapeError/PostBodyInvalidError (安全に取り込めない仕様変更) と、想定外の例外
-      // (onProgress のバグ、addByPostInfo の未検証例外など) はどちらも「一覧ページの取得に
-      // 失敗した」わけではないので、failedPageCount に丸めず素通しする
+      // ApiShapeError/ResponseParseError/PostBodyInvalidError (安全に取り込めない仕様変更) と、
+      // 想定外の例外 (onProgress のバグ、addByPostInfo の未検証例外など) はどちらも
+      // 「一覧ページの取得に失敗した」わけではないので、failedPageCount に丸めず素通しする
       throw e;
     }
   }

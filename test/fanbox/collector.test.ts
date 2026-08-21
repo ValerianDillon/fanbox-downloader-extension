@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { ApiSession, resetSharedBackoff } from '../../src/content/fanbox/api';
+import { ResponseParseError, resetSharedBackoff } from '../../src/content/fanbox/api';
 import { collect, PostBodyInvalidError, type ProgressCallback } from '../../src/content/fanbox/collector';
 
 const CREATOR_ID = 'testcreator';
@@ -52,6 +52,19 @@ function mockApi(responses: Record<string, unknown | (() => ProxyApiResponse)>) 
 }
 
 const SETTINGS = { isIgnoreFree: false, limit: null, apiIntervalMs: 50 };
+
+/**
+ * 待機を即時化する。観測できない失敗の再試行は 5 秒・15 秒の固定待機で、Retry-After のように
+ * テストから短くできないため、待機時間そのものが関心事でないテストではこれで実時間を待たない。
+ */
+function installImmediateTimers(): () => void {
+  const origSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((handler: TimerHandler) =>
+    origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
+  return () => {
+    globalThis.setTimeout = origSetTimeout;
+  };
+}
 
 /** 一覧レスポンスまでは正常形状で返す、共通のモック定義 */
 const BASE_RESPONSES = {
@@ -106,15 +119,14 @@ describe('collect', () => {
   });
 
   test('投稿詳細が JSON として読めない (壊れた本文) なら失敗件数に丸めず中断する', async () => {
-    // JSON.parse の SyntaxError が ApiShapeError に変換されず素通しされると、
-    // 「未対応のレスポンス形式のため中断しました」の経路に乗らず、想定外の例外として
-    // 収集全体が (理由不明のまま) 落ちるだけになってしまう
+    // 投稿単位の失敗として数えて続行すると、仕様変更で全投稿が読めなくなっても
+    // 「N 件失敗」の中身のない ZIP を完了として出してしまう
     mockApi({
       ...BASE_RESPONSES,
       [POST_INFO_URL]: () => ({ ok: true, status: 200, retryAfter: null, body: '{ broken' }),
     });
 
-    await expect(collectCreator()).rejects.toThrow(/形状が想定外/);
+    await expect(collectCreator()).rejects.toThrow(ResponseParseError);
   });
 
   test('ページ URL 一覧の形状が想定外なら中断する', async () => {
@@ -243,6 +255,36 @@ describe('collect', () => {
     expect(infoCalls).toBeGreaterThan(0);
     expect(result.addedPostCount).toBe(1);
     expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(1);
+  });
+
+  test('通信の枯渇で打ち切ったときも、そこまでに集めた投稿は捨てない', async () => {
+    // レート制限の枯渇と同じく、投稿ループの途中で枯渇しても集計を返さないと、
+    // 取り込めた投稿があるのに例外として扱われて部分保存の判断ができなくなる
+    const restoreTimers = installImmediateTimers();
+    try {
+      const second = { ...POST_STUB, id: '1002' };
+      let infoCalls = 0;
+      mockApi({
+        ...BASE_RESPONSES,
+        [LIST_PAGE_URL]: { body: { posts: [POST_STUB, second] } },
+        [POST_INFO_URL]: { body: { post: POST_FULL } },
+        'https://api.fanbox.cc/post.info?postId=1002': () => {
+          infoCalls++;
+          // service worker は fetch の失敗を reject せず status 0 で返す
+          return { ok: false, status: 0, retryAfter: null };
+        },
+      });
+
+      const result = await collectCreator();
+      // レート制限とは停止理由を分ける。時間を置けばよいのか環境側を確認すべきかが違う
+      expect(result.stoppedReason).toBe('transport-exhausted');
+      // 初回 + 再試行 2 回で枯渇する
+      expect(infoCalls).toBe(3);
+      expect(result.addedPostCount).toBe(1);
+      expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(1);
+    } finally {
+      restoreTimers();
+    }
   });
 
   test('投稿一覧ページの取得失敗は投稿件数と分けて数える', async () => {

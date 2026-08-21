@@ -22,25 +22,11 @@ import { sendMessageAbortable } from '../messaging';
 export { HttpError, RateLimitExhaustedError, ResponseParseError, TransportExhaustedError };
 
 export const DEFAULT_API_RATE_LIMIT_MS = 500;
-const RETRY_BACKOFF_MS = [5_000, 15_000, 45_000];
-const NETWORK_RETRY_BACKOFF_MS = 5_000;
-const MIN_RATE_LIMIT_MS = 50;
-const ADAPTIVE_THROTTLE_MULTIPLIER = 1.5;
-const ADAPTIVE_THROTTLE_CAP_MS = 3_000;
-/** 通信失敗そのものに対する再試行回数 (429 の再試行枠とは別に数える) */
-const MAX_NETWORK_RETRY = 1;
 /**
- * service worker 側の最終ゲートで拒否された (kind: 'backoff') ときの再試行回数の上限。
- * 通信していないので通常は 429 の再試行枠を消費させたくないが、無限ループの安全弁として
- * 429 の再試行枠とは別に上限を設ける。次の gate() は取り込み済みの最新の期限を見て
- * 適切な時間だけ待ってから再試行するため、通常はここに達する前に解消するはずである。
+ * 利用者が指定できる基準間隔の下限。再試行の待機やバックオフ、適応スロットルの
+ * パラメータは共有セッション (download-helper/api-session) が持つ。
  */
-const MAX_GATE_REJECTIONS = 10;
-/** 引き上げた間隔を戻すのに必要な連続成功数 */
-const DECAY_SUCCESS_STREAK = 20;
-/** 引き上げた間隔を戻すのに必要な、直近のレート制限からの経過時間 */
-const DECAY_QUIET_PERIOD_MS = 60_000;
-const DECAY_DIVISOR = 1.25;
+const MIN_RATE_LIMIT_MS = 50;
 
 export type PageType =
   | { type: 'creator'; creatorId: string }
@@ -76,27 +62,6 @@ export function detectPage(url: string): PageType {
   return null;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
-  if (ms <= 0) return Promise.resolve();
-  if (signal?.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-      reject(new DOMException('Aborted', 'AbortError'));
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
 type ApiFetchResponse = {
   ok: boolean;
   status: number;
@@ -124,21 +89,6 @@ type ApiFetchResponse = {
 async function proxyFetchApi(url: string, signal?: AbortSignal): Promise<ApiFetchResponse> {
   return sendMessageAbortable<ApiFetchResponse>({ type: 'fetchApi', url }, signal);
 }
-
-/**
- * fetchJson が投げるエラーの種別。'rate-limit' は RateLimitExhaustedError が、
- * 'network' / 'http' は FetchApiError が持つ。呼び出し側 (collector.ts) はこの kind を見て、
- * 「投稿単位の失敗として数えて続行してよい (network/http)」か「収集全体を止めるか
- * (rate-limit は枯渇時点で別途 throw/打ち切り判定)」かを区別する。
- *
- * RateLimitExhaustedError と FetchApiError を 1 クラスに統合しなかったのは、
- * RateLimitExhaustedError には「429 の再試行枠を使い切った」という固有の意味があり、
- * collector.ts 側で instanceof による絞り込み (打ち切り判定・再試行上限の伝播) を
- * 既に多用しているため。kind/status フィールドだけ両クラスに揃えることで、
- * 構造的なアクセス (e.kind / e.status) はどちらの型でも統一しつつ、型の絞り込みは
- * 既存の instanceof チェックのまま活かす。
- */
-export type FetchErrorKind = 'rate-limit' | 'network' | 'http';
 
 /**
  * API レスポンスの形状が想定と違うことを表すエラー。
@@ -408,5 +358,3 @@ export class ApiSession {
     );
   }
 }
-
-export { sleep };

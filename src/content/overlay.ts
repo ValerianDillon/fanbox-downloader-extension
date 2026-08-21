@@ -1,6 +1,6 @@
 import type { DownloadProgress, FileSystemFileHandle } from './downloader';
 import { downloadAsZip, pickSaveHandle } from './downloader';
-import { ApiShapeError, type PageType } from './fanbox/api';
+import { ApiShapeError, type PageType, ResponseParseError } from './fanbox/api';
 import type { CollectorSettings, PostFailureCounts } from './fanbox/collector';
 import { collect, PostBodyInvalidError } from './fanbox/collector';
 import css from './overlay.css' with { type: 'text' };
@@ -49,13 +49,29 @@ export const TRANSPORT_EXHAUSTED_HEADLINE = '通信に失敗したため途中�
 export const NOTHING_SAVED_HEADLINE = '保存できる投稿がなかったため ZIP を保存しませんでした';
 
 /**
- * 収集が「未対応のレスポンス形式」(ApiShapeError または PostBodyInvalidError) で
- * 中断した場合の完了画面の見出し (Issue #14)。
+ * 収集が「未対応のレスポンス形式」(ApiShapeError / ResponseParseError または
+ * PostBodyInvalidError) で中断した場合の完了画面の見出し (Issue #14)。
  *
  * この場合 collect() が例外を投げるため CompleteMessageParams を経由せず、
  * OverlayController.startCollecting の catch から直接この見出しで complete 状態に遷移する。
  */
 export const UNSUPPORTED_RESPONSE_HEADLINE = '未対応のレスポンス形式のため中断しました';
+
+/**
+ * 収集を止めた例外が「未対応のレスポンス形式」かを判定する。
+ *
+ * ApiShapeError は API 層のレスポンス形状違反、ResponseParseError は同じく API 層の
+ * 本文を JSON として読めなかったケース、PostBodyInvalidError はライブラリ層
+ * (addByPostInfo が読む本文フィールドの不一致) で、どれも「このバージョンでは安全に
+ * 取り込めない仕様変更」を意味するため同じ見出しで扱う。
+ *
+ * 判定を関数に切り出しているのは、この分岐が OverlayController の catch の中にあり
+ * DOM 無しでは検証できないため。収集の失敗のうちどれを仕様変更として扱うかは
+ * 見出しの分岐そのものなので、純粋関数として固定する。
+ */
+export function isUnsupportedResponseError(e: unknown): boolean {
+  return e instanceof ApiShapeError || e instanceof ResponseParseError || e instanceof PostBodyInvalidError;
+}
 
 export type CompleteMessageParams = {
   /** 「ここまでで終了」による中断か (content script 側の AbortSignal 由来) */
@@ -570,11 +586,8 @@ export class OverlayController {
         this.renderComplete(`エラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);
         return;
       }
-      if (e instanceof ApiShapeError || e instanceof PostBodyInvalidError) {
-        // 未対応のレスポンス形式による中断 (Issue #14)。ApiShapeError は API 層
-        // (fetchJson のレスポンス形状違反)、PostBodyInvalidError はライブラリ層
-        // (addByPostInfo が読む本文フィールドの不一致) だが、どちらも「このバージョンでは
-        // 安全に取り込めない仕様変更」を意味するため同じ見出しで扱う。
+      if (isUnsupportedResponseError(e)) {
+        // 未対応のレスポンス形式による中断 (Issue #14。内訳は isUnsupportedResponseError 参照)。
         // collect() が投稿を 1 件も返さないまま例外を投げるため、downloadAsZip は
         // 呼ばれておらず ZIP は保存されていない (NOTHING_SAVED_HEADLINE と同じ理由で、
         // showSaveFilePicker が作成済みの 0 バイトファイルはそのまま残る)。
