@@ -97,6 +97,25 @@ headless Chromium は UA が `HeadlessChrome/...` になり、Cloudflare のボ�
 
 ページ origin からの見え方を確認したいときは `page` ターゲットを使う: `bun scripts/live-cdp-eval.ts page '<expression>'`。第 1 引数が対象ターゲットで、`page` は `type === 'page'` の先頭、`sw` は service worker を選ぶ。
 
+## メディア取得の試行記録を読む (Issue #51 の観測)
+
+ZIP フェーズの取得試行は `chrome.storage.local` の `fbdlMediaAttempts` に蓄積される (ホスト / ステータス / `Retry-After` / 種別 / 時刻、上限 2000 件)。
+実機実行の後に取り出して、`downloads.fanbox.cc` や `*.pximg.net` で 429 が出ているかを見る。
+
+```
+bun scripts/live-cdp-eval.ts sw "chrome.storage.local.get('fbdlMediaAttempts')"
+```
+
+集計だけしたいときは service worker 側で絞ってから返す。
+
+```
+bun scripts/live-cdp-eval.ts sw "(async()=>{const r=await chrome.storage.local.get('fbdlMediaAttempts');const a=r.fbdlMediaAttempts??[];return {total:a.length, byStatus:a.reduce((m,x)=>(m[x.status]=(m[x.status]??0)+1,m),{}), hosts:[...new Set(a.map(x=>x.host))]};})()"
+```
+
+記録を消すときは `chrome.storage.local.remove('fbdlMediaAttempts')`。
+
+日常利用のブラウザ (実機テスト用プロファイルではない方) で貯めた記録を見る場合は、`chrome://extensions` の拡張の「Service Worker」から devtools を開き、同じ式をコンソールで実行する。
+
 ## 実機では再現できない経路 (バックオフ待機)
 
 service worker のバックオフ期限は `BackoffStore` のメモリキャッシュ越しに読まれ、キャッシュが未設定のときだけ `chrome.storage.session` を読む (`src/service-worker/backoff-store.ts` の `getLocked`)。

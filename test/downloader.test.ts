@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import type { DownloadProgress, FileSystemFileHandle, MediaFetchAttempt } from '../src/content/downloader';
 import { downloadAsZip, fetchWithRetry } from '../src/content/downloader';
+import { MEDIA_ATTEMPT_STORAGE_KEY } from '../src/content/media-attempt-log';
 import { installFakeMediaRuntime, simpleResponder } from './fake-media-port';
+// chrome.storage.local も get(key) / set(items) の契約は storage.session と同じなのでフェイクを流用する
+import { createFakeSessionStorage } from './service-worker/fake-storage';
 
 // ZipWriter が書き込む先のモック。write() で渡る Uint8Array を蓄積する。
 class MockWritableStream {
@@ -317,6 +320,46 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
     expect(attempts.every((a) => a.status === 200 && a.retryAfter === null && a.host === 'example.test')).toBe(true);
     // context.kind (download-helper から渡される取得対象の種別) が正しく attempts に伝わっている
     expect(attempts.map((a) => a.kind).sort()).toEqual(['cover', 'file']);
+  });
+
+  test('試行記録は chrome.storage.local にも残る (実行が失敗しても)', async () => {
+    // console.info への出力はページを閉じると消えるため、通常利用で 429 が出ているかを
+    // 後から判断できない (Issue #51 の観測)
+    restoreRuntime = installFakeMediaRuntime(simpleResponder(() => ({ status: 429, retryAfter: '3' }))).restore;
+    const backing = new Map<string, unknown>();
+    // biome-ignore lint/suspicious/noExplicitAny: chrome storage mock
+    (globalThis as any).chrome.storage = { local: createFakeSessionStorage(backing) };
+    const origSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((handler: TimerHandler) =>
+      origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
+
+    try {
+      const json = JSON.stringify({
+        id: 'u',
+        url: '#main',
+        tags: [],
+        postCount: 1,
+        fileCount: 1,
+        posts: [
+          {
+            originalName: 'p',
+            encodedName: 'p',
+            informationText: '{}',
+            htmlText: '<p></p>',
+            files: [{ url: 'https://example.test/f', originalName: 'f.bin', encodedName: 'f.bin' }],
+            tags: [],
+          },
+        ],
+      });
+      const { handle } = makeHandle();
+      const { attempts } = await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
+
+      const stored = backing.get(MEDIA_ATTEMPT_STORAGE_KEY) as typeof attempts;
+      expect(stored).toHaveLength(attempts.length);
+      expect(stored.every((a) => a.status === 429 && a.retryAfter === '3' && a.host === 'example.test')).toBe(true);
+    } finally {
+      globalThis.setTimeout = origSetTimeout;
+    }
   });
 
   test('取得に 2 回とも失敗 (429) すると zip.failedFileCount に反映され、attempts にも 2 回分の 429 が残る', async () => {
