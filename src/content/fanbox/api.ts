@@ -131,15 +131,21 @@ function unwrapArray<T>(value: unknown, url: string, fieldPath: string, isValidI
 }
 
 /**
- * 一覧要素のうち、収集の分岐に使う 2 つだけを検証する。
- * id は post.info の URL を組み立てるのに使い、isRestricted は投稿を飛ばすかの判断に使う。
- * 型が変わると前者は「取得失敗が N 件」、後者は「無言で全件スキップ」になるため、
- * ここで形状エラーとして止める。それ以外のフィールドは download-helper 側が
- * 欠損を許容するので検証しない。
+ * 一覧要素のうち、収集の分岐に使う 3 つだけを検証する。
+ * id は post.info の URL を組み立てるのに使い、isRestricted は投稿を飛ばすかの判断に使い、
+ * feeRequired は isIgnoreFree の判断に使う。
+ * 型が変わると id は「取得失敗が N 件」、isRestricted は「無言で全件スキップ」、
+ * feeRequired は「無料を省く指定が無言で効かない」になるため、ここで形状エラーとして止める。
+ * それ以外のフィールドは download-helper 側が欠損を許容するので検証しない。
  */
 function isValidPostListItem(item: unknown): boolean {
   const post = item as PostListItem | null;
-  return !!post && typeof post.id === 'string' && typeof post.isRestricted === 'boolean';
+  return (
+    !!post &&
+    typeof post.id === 'string' &&
+    typeof post.isRestricted === 'boolean' &&
+    typeof post.feeRequired === 'number'
+  );
 }
 
 /** 支援額タグの表示名の組み立てに使う 2 つを検証する */

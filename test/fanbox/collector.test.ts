@@ -341,8 +341,17 @@ describe('collect', () => {
     );
   });
 
-  test('isIgnoreFree で除外した無料投稿は失敗に数えない', async () => {
-    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+  test('isIgnoreFree で除外した無料投稿は post.info を叩かず、失敗にも数えない', async () => {
+    // 除外すると分かっている投稿に post.info を発行すると、レート制限の枠と待機時間を
+    // 無駄に使う (発行しても addByPostInfo が同じ条件で 'ignored' を返すだけ)
+    let postInfoCalls = 0;
+    mockApi({
+      ...BASE_RESPONSES,
+      [POST_INFO_URL]: () => {
+        postInfoCalls++;
+        return { ok: true, status: 200, retryAfter: null, body: JSON.stringify({ body: { post: POST_FULL } }) };
+      },
+    });
 
     const result = await collect(
       CREATOR_ID,
@@ -351,6 +360,7 @@ describe('collect', () => {
       () => {},
       new AbortController().signal,
     );
+    expect(postInfoCalls).toBe(0);
     expect(result.addedPostCount).toBe(0);
     expect(result.postFailures.unavailable).toBe(0);
     expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(0);

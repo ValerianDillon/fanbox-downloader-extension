@@ -642,10 +642,19 @@ describe('レスポンスのアンラップ', () => {
     await expect(api.fetchPaginatedPosts('c')).rejects.toThrow(/形状が想定外/);
   });
 
+  test('一覧要素の feeRequired が number でなければ形状エラーで中断する', async () => {
+    // feeRequired は「無料を省く」設定の判断に使う。欠けたまま続けると、利用者が指定した
+    // 除外が無言で効かなくなる (無料投稿まで ZIP に入る)
+    nextResponse = okJson({ body: { posts: [{ id: '1', isRestricted: false, feeRequired: '0' }] } });
+    const error = await api.fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c').catch((e) => e);
+    expect(error).toBeInstanceOf(ApiShapeError);
+    expect(error.fields).toEqual(['body.posts[]']);
+  });
+
   test('fetchPostList は body.posts を返す', async () => {
     const posts = [
-      { id: '1', isRestricted: false },
-      { id: '2', isRestricted: true },
+      { id: '1', isRestricted: false, feeRequired: 0 },
+      { id: '2', isRestricted: true, feeRequired: 500 },
     ];
     nextResponse = okJson({ body: { posts } });
     expect(await api.fetchPostList('https://api.fanbox.cc/post.listCreator?creatorId=c')).toEqual(posts as never);

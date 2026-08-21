@@ -306,14 +306,19 @@ async function getItemsByCreator(
       for (const post of postList) {
         if (signal.aborted) return counts();
         if (!downloadManage.isLimitValid()) break;
+        // isIgnoreFree で除外する無料投稿は利用者が意図した除外なので数えない。
+        // 一覧の時点で除外して post.info を発行しない: 発行しても addByPostInfo が同じ条件で
+        // 'ignored' を返すだけで、レート制限の枠と待機時間を無駄に使う
+        if (downloadManage.isIgnoreFree && post.feeRequired === 0) {
+          processed++;
+          onProgress(processed, totalEstimate);
+          continue;
+        }
         // 閲覧できない投稿も ZIP からは欠落するので数える。数えないと、一覧が全件
         // isRestricted になったときに空の ZIP を「失敗 0 件で完了」として出してしまう。
-        // isIgnoreFree で除外する無料投稿は利用者が意図した除外なので数えない。
         if (post.isRestricted) {
-          if (!(downloadManage.isIgnoreFree && post.feeRequired === 0)) {
-            postFailures.unavailable++;
-            postFailures.unavailableRestricted++;
-          }
+          postFailures.unavailable++;
+          postFailures.unavailableRestricted++;
           processed++;
           onProgress(processed, totalEstimate);
           continue;
