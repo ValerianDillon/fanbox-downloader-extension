@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { ApiSession } from '../src/content/fanbox/api';
+import { ApiSession, resetSharedBackoff } from '../src/content/fanbox/api';
 import { sendMessageAbortable } from '../src/content/messaging';
 import { BackoffStore } from '../src/service-worker/backoff-store';
 import { handleFetchApi, handleGetBackoffUntil } from '../src/service-worker/handlers';
@@ -13,7 +13,7 @@ import { createFakeSessionStorage } from './service-worker/fake-storage';
  * 「content script 側のゲート」を別の実行状態として扱っていなかった。
  * ここでは両者を意図的に分けて組み立て、境界をまたいだときの挙動を検証する。
  *
- * - content script 側の「別タブ・リロード」= ApiSession.resetSharedBackoff() で静的フィールドを
+ * - content script 側の「別タブ・リロード」= resetSharedBackoff() で静的フィールドを
  *   リセットしつつ、新しい ApiSession インスタンスに切り替えることで再現する
  * - service worker 側の「稼働中の共有」= 1 つの BackoffStore インスタンス (+ その裏の
  *   chrome.storage.session) を、複数の content script インスタンス (= sendMessage 経由の呼び出し)
@@ -81,7 +81,7 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
   }
 
   beforeEach(() => {
-    ApiSession.resetSharedBackoff();
+    resetSharedBackoff();
     installFakeTimers();
   });
 
@@ -92,7 +92,7 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
     globalThis.setTimeout = origSetTimeout;
     globalThis.clearTimeout = origClearTimeout;
     Date.now = origDateNow;
-    ApiSession.resetSharedBackoff();
+    resetSharedBackoff();
   });
 
   test('(a) 別タブ・リロード相当で content script 側の状態がリセットされても、service worker 側の記録が次のゲートに効く', async () => {
@@ -111,7 +111,7 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
 
     // "別タブを開く/リロードする": content script の静的な参照値だけがリセットされる。
     // 明示的な事前取得はしない。gate() が発行直前に自動で service worker へ問い合わせる
-    ApiSession.resetSharedBackoff();
+    resetSharedBackoff();
     const tab2 = new ApiSession(50);
     globalThis.fetch = (async () => fakeHttpResponse({ status: 200, body: okPostBody() })) as unknown as typeof fetch;
 
@@ -206,7 +206,7 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
     (globalThis as any).chrome.runtime.sendMessage = bridgeTo(storeAfterRestart);
 
     // content script 側 (別タブ相当) もリセットしておく
-    ApiSession.resetSharedBackoff();
+    resetSharedBackoff();
     const afterRestartSession = new ApiSession(50);
     globalThis.fetch = (async () => fakeHttpResponse({ status: 200, body: okPostBody() })) as unknown as typeof fetch;
 

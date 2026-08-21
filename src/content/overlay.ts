@@ -34,6 +34,7 @@ export const PARTIAL_FILE_FAILURE_HEADLINE = '一部取得できませんでし�
 
 /** 収集フェーズがレート制限で打ち切られた場合の完了画面の見出し */
 export const RATE_LIMIT_EXHAUSTED_HEADLINE = 'レート制限のため途中で打ち切りました (取得できた分のみ保存しています)';
+export const TRANSPORT_EXHAUSTED_HEADLINE = '通信に失敗したため途中で打ち切りました (取得できた分のみ保存しています)';
 
 /**
  * addByPostInfo が 'added' を返した投稿が 0 件だった場合の完了画面の見出し (Issue #14)。
@@ -70,8 +71,8 @@ export type CompleteMessageParams = {
   failedPageCount: number;
   /** ZIP フェーズでの対象単位の最終失敗数。カバー画像含み、中断由来は含まない (DownloadZipResult.failedFileCount) */
   failedFileCount: number;
-  /** 収集フェーズがレート制限で打ち切られた場合に 'rate-limit-exhausted' */
-  stoppedReason?: 'rate-limit-exhausted';
+  /** 収集フェーズが再試行の上限で打ち切られた場合、その理由 */
+  stoppedReason?: 'rate-limit-exhausted' | 'transport-exhausted';
 };
 
 /**
@@ -125,7 +126,7 @@ function buildFailureLines(params: CompleteMessageParams): string[] {
  * 1. addedPostCount === 0: NOTHING_SAVED_HEADLINE。ZIP を保存していない事実が最優先
  *    (addedPostCount === 0 かつ stoppedReason が同時に立つことは無い — collector.ts が
  *    その場合は打ち切りに変換せず例外にするため。念のため他の分岐より先に判定する)
- * 2. 収集フェーズの打ち切り (stoppedReason === 'rate-limit-exhausted'): RATE_LIMIT_EXHAUSTED_HEADLINE。
+ * 2. 収集フェーズの打ち切り (stoppedReason あり): 原因に応じた打ち切りの見出し。
  *    aborted かどうかに関わらず最優先 (非中断時と同じ見出し)。ZIP フェーズも中断していた場合は、
  *    その事実 (PARTIAL_DOWNLOAD_MESSAGE) を本文で併記する
  * 3. 単純な中断 (収集フェーズは打ち切りなく完了、ZIP フェーズのみ「ここまでで終了」): PARTIAL_DOWNLOAD_MESSAGE
@@ -145,9 +146,12 @@ export function buildCompleteMessage(params: CompleteMessageParams): string {
   if (params.addedPostCount === 0) {
     return `${NOTHING_SAVED_HEADLINE}${failedSuffix}`;
   }
-  if (params.stoppedReason === 'rate-limit-exhausted') {
+  if (params.stoppedReason) {
     const abortedNote = params.aborted ? `\n${PARTIAL_DOWNLOAD_MESSAGE}` : '';
-    return `${RATE_LIMIT_EXHAUSTED_HEADLINE}${abortedNote}${failedSuffix}`;
+    // 原因で文言を分ける。レート制限なら時間を置けばよいが、通信の失敗は環境側を確認する必要がある
+    const headline =
+      params.stoppedReason === 'rate-limit-exhausted' ? RATE_LIMIT_EXHAUSTED_HEADLINE : TRANSPORT_EXHAUSTED_HEADLINE;
+    return `${headline}${abortedNote}${failedSuffix}`;
   }
   if (params.aborted) {
     return `${PARTIAL_DOWNLOAD_MESSAGE}${failedSuffix}`;

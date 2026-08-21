@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { ApiSession } from '../../src/content/fanbox/api';
+import { ApiSession, resetSharedBackoff } from '../../src/content/fanbox/api';
 import { collect, PostBodyInvalidError, type ProgressCallback } from '../../src/content/fanbox/collector';
 
 const CREATOR_ID = 'testcreator';
@@ -76,7 +76,7 @@ describe('collect', () => {
   afterEach(() => {
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = origChrome;
-    ApiSession.resetSharedBackoff();
+    resetSharedBackoff();
   });
 
   test('新形状のレスポンスから投稿を収集できる', async () => {

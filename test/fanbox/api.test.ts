@@ -4,8 +4,9 @@ import {
   ApiShapeError,
   DEFAULT_API_RATE_LIMIT_MS,
   detectPage,
-  FetchApiError,
+  HttpError,
   RateLimitExhaustedError,
+  resetSharedBackoff,
 } from '../../src/content/fanbox/api';
 
 describe('detectPage', () => {
@@ -123,7 +124,7 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
   beforeEach(() => {
     calls = [];
     responders = [];
-    ApiSession.resetSharedBackoff();
+    resetSharedBackoff();
     api = new ApiSession(DEFAULT_API_RATE_LIMIT_MS);
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = {
@@ -148,7 +149,7 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = origChrome;
     restoreTimers();
-    ApiSession.resetSharedBackoff();
+    resetSharedBackoff();
   });
 
   test('429 + Retry-After (秒) を読んでリトライする', async () => {
@@ -417,7 +418,7 @@ describe('Issue #14: エラー型の kind / status / fields', () => {
   beforeEach(() => {
     calls = [];
     responders = [];
-    ApiSession.resetSharedBackoff();
+    resetSharedBackoff();
     api = new ApiSession(DEFAULT_API_RATE_LIMIT_MS);
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = {
@@ -439,7 +440,7 @@ describe('Issue #14: エラー型の kind / status / fields', () => {
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = origChrome;
     restoreTimers();
-    ApiSession.resetSharedBackoff();
+    resetSharedBackoff();
   });
 
   test('レート制限の枯渇は RateLimitExhaustedError (kind: rate-limit, status: 429) を投げる', async () => {
@@ -451,27 +452,27 @@ describe('Issue #14: エラー型の kind / status / fields', () => {
     expect(error.status).toBe(429);
   });
 
-  test('HTTP エラー (429 以外) は FetchApiError (kind: http) を投げ、status に実際のコードを持つ', async () => {
+  test('HTTP エラー (429 以外) は HttpError (kind: http) を投げ、status に実際のコードを持つ', async () => {
     responders.push(() => errorStatus(503));
 
     const error = await api.fetchPostInfo('w').catch((e) => e);
-    expect(error).toBeInstanceOf(FetchApiError);
+    expect(error).toBeInstanceOf(HttpError);
     expect(error.kind).toBe('http');
     expect(error.status).toBe(503);
   });
 
-  test('通信失敗 (status 0) が再試行後も続くと FetchApiError (kind: network, status: 0) を投げる', async () => {
+  test('通信失敗 (status 0) が再試行後も続くと HttpError (kind: network, status: 0) を投げる', async () => {
     responders.push(() => ({ ok: false, status: 0, retryAfter: null, error: 'Failed to fetch' }));
     responders.push(() => ({ ok: false, status: 0, retryAfter: null, error: 'Failed to fetch' }));
 
     const error = await api.fetchPostInfo('1').catch((e) => e);
-    expect(error).toBeInstanceOf(FetchApiError);
+    expect(error).toBeInstanceOf(HttpError);
     expect(error.kind).toBe('network');
     expect(error.status).toBe(0);
     expect(calls).toHaveLength(2);
   });
 
-  test('sendMessage 自体の失敗が再試行後も続くと FetchApiError (kind: network, status: 0) を投げる', async () => {
+  test('sendMessage 自体の失敗が再試行後も続くと HttpError (kind: network, status: 0) を投げる', async () => {
     // proxyFetchApi (chrome.runtime.sendMessage) が例外で reject し続けるケース
     responders.push(() => {
       throw new Error('messaging failed');
@@ -481,7 +482,7 @@ describe('Issue #14: エラー型の kind / status / fields', () => {
     });
 
     const error = await api.fetchPostInfo('1').catch((e) => e);
-    expect(error).toBeInstanceOf(FetchApiError);
+    expect(error).toBeInstanceOf(HttpError);
     expect(error.kind).toBe('network');
     expect(error.status).toBe(0);
   });
@@ -494,7 +495,7 @@ describe('レスポンスのアンラップ', () => {
   let api: ApiSession;
 
   beforeEach(() => {
-    ApiSession.resetSharedBackoff();
+    resetSharedBackoff();
     api = new ApiSession();
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = {
@@ -539,20 +540,20 @@ describe('レスポンスのアンラップ', () => {
     expect(await api.fetchTags('c')).toEqual([]);
   });
 
-  // プラン名・タグは表示の補助なので、通信/HTTP の失敗 (FetchApiError) も
+  // プラン名・タグは表示の補助なので、通信/HTTP の失敗 (HttpError) も
   // 形状不一致 (ApiShapeError) と同様に握りつぶして続行してよい
   // (CLAUDE.md 「プラン名とタグは表示の補助なので握りつぶして続行し」の方針)
-  test('fetchPlans は FetchApiError (HTTP 失敗) も握りつぶして空配列を返す', async () => {
+  test('fetchPlans は HttpError (HTTP 失敗) も握りつぶして空配列を返す', async () => {
     nextResponse = { ok: false, status: 500, retryAfter: null };
     expect(await api.fetchPlans('c')).toEqual([]);
   });
 
-  test('fetchTags は FetchApiError (HTTP 失敗) も握りつぶして空配列を返す', async () => {
+  test('fetchTags は HttpError (HTTP 失敗) も握りつぶして空配列を返す', async () => {
     nextResponse = { ok: false, status: 500, retryAfter: null };
     expect(await api.fetchTags('c')).toEqual([]);
   });
 
-  // FetchApiError / ApiShapeError / RateLimitExhaustedError のいずれでもない例外
+  // HttpError / ApiShapeError / RateLimitExhaustedError のいずれでもない例外
   // (validator や内部処理のバグ、あるいは互換性のない service worker が返す
   // 破損したレスポンス形状など) までは握りつぶさず再送出する。ここでは
   // sendMessage が応答オブジェクト自体を返さない (undefined) という壊れ方を模擬し、
@@ -664,7 +665,7 @@ describe('Issue #14: ApiShapeError の fields (想定と違ったフィールド
   let api: ApiSession;
 
   beforeEach(() => {
-    ApiSession.resetSharedBackoff();
+    resetSharedBackoff();
     api = new ApiSession();
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = {

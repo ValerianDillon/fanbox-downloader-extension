@@ -1,6 +1,14 @@
 import type { DownloadObject } from 'download-helper/download-helper';
 import { type AddPostResult, addByPostInfo, DownloadManage, type PostListItem } from 'download-helper/fanbox-collector';
-import { ApiSession, ApiShapeError, DEFAULT_API_RATE_LIMIT_MS, FetchApiError, RateLimitExhaustedError } from './api';
+import {
+  ApiSession,
+  ApiShapeError,
+  DEFAULT_API_RATE_LIMIT_MS,
+  HttpError,
+  RateLimitExhaustedError,
+  ResponseParseError,
+  TransportExhaustedError,
+} from './api';
 
 export type CollectorSettings = {
   isIgnoreFree: boolean;
@@ -54,7 +62,7 @@ export type CollectResult = {
    * 収集を最後まで走査せずに打ち切った理由。未設定なら全ページを走査した。
    * 打ち切った場合もそこまでに集めた分は捨てず、不完全と明示したうえで保存できるようにする。
    */
-  stoppedReason?: 'rate-limit-exhausted';
+  stoppedReason?: 'rate-limit-exhausted' | 'transport-exhausted';
 };
 
 export type ProgressCallback = (current: number, total: number) => void;
@@ -160,13 +168,20 @@ export async function collect(
       if (signal.aborted) throw e;
       // 単一投稿モードで枯渇したなら取り込めたものは無いので、打ち切りではなくエラーにする。
       // 形状/本文の不一致 (ApiShapeError/PostBodyInvalidError) も投稿単位の失敗に丸めない
-      if (e instanceof ApiShapeError || e instanceof PostBodyInvalidError || e instanceof RateLimitExhaustedError) {
+      if (
+        e instanceof ApiShapeError ||
+        e instanceof ResponseParseError ||
+        e instanceof PostBodyInvalidError ||
+        e instanceof RateLimitExhaustedError ||
+        e instanceof TransportExhaustedError
+      ) {
         throw e;
       }
-      // FetchApiError (通信/HTTP の失敗) だけを投稿単位の失敗として数える。それ以外
+      // HttpError だけを投稿単位の失敗として数える。通信の失敗は再試行を経て枯渇として
+      // 伝播し、そこで収集を止める (残りを要求し続けると、非可視の 429 だった場合に危険)。それ以外
       // (想定外の例外) を握りつぶすと、こちらのバグが「取得に失敗した投稿」として
       // 静かに握り潰されてしまう
-      if (!(e instanceof FetchApiError)) throw e;
+      if (!(e instanceof HttpError)) throw e;
       console.error(`投稿情報の取得に失敗 (postId: ${postId}):`, e);
       postFailures.apiFailed++;
     }
@@ -182,8 +197,9 @@ export async function collect(
       // 判定は失敗件数ではなく取り込めた件数で行う: 最初の投稿やページで枯渇した場合は
       // 失敗件数も 0 のままなので、失敗件数では区別できない
       if (collected.addedPostCount === 0) throw collected.stoppedBy;
-      console.error('レート制限のため収集を打ち切りました:', collected.stoppedBy);
-      stoppedReason = 'rate-limit-exhausted';
+      console.error('再試行の上限に達したため収集を打ち切りました:', collected.stoppedBy);
+      stoppedReason =
+        collected.stoppedBy instanceof RateLimitExhaustedError ? 'rate-limit-exhausted' : 'transport-exhausted';
     }
   }
 
@@ -202,7 +218,7 @@ type CreatorCollectCounts = {
   postFailures: PostFailureCounts;
   failedPageCount: number;
   /** レート制限の枯渇で全ページを走査せずに打ち切った場合、その原因 */
-  stoppedBy?: RateLimitExhaustedError;
+  stoppedBy?: RateLimitExhaustedError | TransportExhaustedError;
 };
 
 async function getItemsByCreator(
@@ -217,12 +233,19 @@ async function getItemsByCreator(
   } catch (e) {
     console.error('投稿一覧の取得に失敗:', e);
     // 形状エラーと枯渇は原因が特定できているので、汎用の文言に潰さずそのまま伝える
-    if (e instanceof ApiShapeError || e instanceof RateLimitExhaustedError) throw e;
-    // FetchApiError (通信/HTTP の失敗) だけを汎用の文言に変換する。それ以外の想定外の例外
+    if (
+      e instanceof ApiShapeError ||
+      e instanceof ResponseParseError ||
+      e instanceof RateLimitExhaustedError ||
+      e instanceof TransportExhaustedError
+    ) {
+      throw e;
+    }
+    // HttpError だけを汎用の文言に変換する。それ以外の想定外の例外
     // (abort、validator や内部処理のバグ等) まで丸めると、元の型・メッセージ・スタックが
     // 失われ、原因調査ができなくなる。他の経路 (getItemsByCreator 内の各 catch) で
     // 採用した陽性判定の方針とも矛盾する。
-    if (!(e instanceof FetchApiError)) throw e;
+    if (!(e instanceof HttpError)) throw e;
     throw new Error('投稿一覧の取得に失敗しました');
   }
 
@@ -255,13 +278,13 @@ async function getItemsByCreator(
       if (e instanceof ApiShapeError) throw e;
       // 枯渇したらそこで打ち切るが、集計は返す。throw すると、それまでに
       // 数えた件数が呼び出し側に伝わらず、部分保存の可否も判断できない
-      if (e instanceof RateLimitExhaustedError) {
+      if (e instanceof RateLimitExhaustedError || e instanceof TransportExhaustedError) {
         return { ...counts(), stoppedBy: e };
       }
       // FetchApiError (通信/HTTP の失敗) だけをページ単位の失敗として数える。
       // それ以外の想定外の例外を握りつぶすと、こちらのバグが「一覧ページの取得に
       // 失敗した」として静かに握り潰され、部分 ZIP がそのまま保存されてしまう
-      if (!(e instanceof FetchApiError)) throw e;
+      if (!(e instanceof HttpError)) throw e;
       console.error(`${i + 1}回目の投稿リスト取得に失敗:`, e);
       failedPageCount++;
       continue;
@@ -307,8 +330,8 @@ async function getItemsByCreator(
           if (e instanceof ApiShapeError || e instanceof PostBodyInvalidError || e instanceof RateLimitExhaustedError) {
             throw e;
           }
-          // FetchApiError だけを投稿単位の失敗として数える (理由は上のページ単位の分岐と同じ)
-          if (!(e instanceof FetchApiError)) throw e;
+          // HttpError だけを投稿単位の失敗として数える (理由は上のページ単位の分岐と同じ)
+          if (!(e instanceof HttpError)) throw e;
           console.error(`投稿情報の取得に失敗 (postId: ${post.id}):`, e);
           postFailures.apiFailed++;
         }
