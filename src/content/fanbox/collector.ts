@@ -1,5 +1,10 @@
 import type { DownloadObject } from 'download-helper/download-helper';
-import { type AddPostResult, addByPostInfo, DownloadManage, type PostListItem } from 'download-helper/fanbox-collector';
+import {
+  type AddPostResult,
+  addByPostInfo,
+  DownloadManage,
+  type PostListItemCandidate,
+} from 'download-helper/fanbox-collector';
 import {
   ApiSession,
   ApiShapeError,
@@ -267,7 +272,7 @@ async function getItemsByCreator(
     // 失敗した」に丸めて failedPageCount++ に吸収し、収集を継続してしまっていた。
     // 一覧取得の失敗だけをここで捕まえ、それ以外は下の投稿ループ側の try (または
     // 未捕捉のまま) に委ねる。
-    let postList: PostListItem[];
+    let postList: PostListItemCandidate[];
     try {
       postList = await api.fetchPostList(urls[i], signal);
     } catch (e) {
