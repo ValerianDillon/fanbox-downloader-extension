@@ -1,5 +1,5 @@
 import { MEDIA_PORT_NAME, type MediaStreamRequest } from '../media-stream-protocol';
-import { handleFetchApi, handleGetBackoffUntil } from './handlers';
+import { handleFetchApi } from './handlers';
 import { streamMedia } from './media-stream';
 import { trackMediaStreamForTest, wrapMediaStreamDepsForTest } from './test-hooks';
 
@@ -16,13 +16,13 @@ chrome.runtime.onInstalled.addListener(() => {
  *
  * service worker は拡張のオリジンで動作し host_permissions が適用されるため、これらを回避できる。
  *
- * fetchApi / getBackoffUntil の実処理は ./handlers.ts に、メディア取得 (Port による分割転送) の実処理は
+ * fetchApi の実処理は ./handlers.ts に、メディア取得 (Port による分割転送) の実処理は
  * ./media-stream.ts に切り出している (chrome.* への配線とロジックを分け、後者をユニットテストから
  * chrome のグローバルスタブなしに直接呼べるようにするため)。
  *
- * handleFetchApi / handleGetBackoffUntil は内部の失敗を自ら吸収して必ず
- * 応答オブジェクトを返す (total な関数) 設計にしているが、ここでも `.catch` で二重に防御する。
- * どちらかが想定外に reject すると sendResponse が呼ばれず、content script は応答なしで
+ * handleFetchApi は内部の失敗を自ら吸収して必ず応答オブジェクトを返す (total な関数)
+ * 設計にしているが、ここでも `.catch` で二重に防御する。
+ * 想定外に reject すると sendResponse が呼ばれず、content script は応答なしで
  * 待ち続けてしまう (chrome.runtime.sendMessage はタイムアウトしない) ため。
  */
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -30,12 +30,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     handleFetchApi(message.url)
       .then(sendResponse)
       .catch((e) => sendResponse({ ok: false, status: 0, retryAfter: null, error: String(e), backoffUntil: 0 }));
-    return true;
-  }
-  if (message.type === 'getBackoffUntil') {
-    handleGetBackoffUntil()
-      .then(sendResponse)
-      .catch(() => sendResponse({ backoffUntil: 0 }));
     return true;
   }
 });

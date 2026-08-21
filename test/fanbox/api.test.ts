@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   ApiSession,
   ApiShapeError,
-  createChromeProxyTransport,
   DEFAULT_API_RATE_LIMIT_MS,
   detectPage,
   HttpError,
@@ -175,7 +174,10 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     const result = await api.fetchPostInfo('1');
     expect(result).toEqual({ id: '1', title: 'x', type: 'image', isRestricted: false } as never);
     expect(calls).toHaveLength(2);
+    // 下限だけでは Retry-After を無視して固定バックオフ (5 秒) を使う実装も通ってしまう。
+    // サーバーの指示に従ったことを示すには、固定バックオフより短いことまで見る必要がある
     expect(virtualWaitMs).toBeGreaterThanOrEqual(2_000);
+    expect(virtualWaitMs).toBeLessThan(5_000);
   });
 
   test('429 + Retry-After (HTTP-date) を読んでリトライする', async () => {
@@ -186,6 +188,10 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     const result = await api.fetchPostInfo('2');
     expect(result).toEqual({ id: '2', type: 'image', isRestricted: false } as never);
     expect(calls).toHaveLength(2);
+    // 秒数形式と同じく、HTTP-date を読めたことは待機時間でしか確かめられない。
+    // toUTCString() は秒未満を切り捨てるので、待機は 3 秒ちょうどではなく (2秒, 3秒] に入る
+    expect(virtualWaitMs).toBeGreaterThan(2_000);
+    expect(virtualWaitMs).toBeLessThanOrEqual(3_000);
   });
 
   test('Retry-After 不在時は指数バックオフ (5s → 15s)', async () => {
@@ -195,7 +201,11 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
 
     await api.fetchPostInfo('3');
     expect(calls).toHaveLength(3);
+    // 上限も見る。下限だけでは「もっと長く待つ」誤りを検知できず、Retry-After を読めないときの
+    // 待機時間そのものが契約 (Issue #3 の再試行ポリシー) なので固定する。
+    // 基準間隔 (500ms) ぶんのゲート待機が乗るので、その分の余裕を見る
     expect(virtualWaitMs).toBeGreaterThanOrEqual(5_000 + 15_000);
+    expect(virtualWaitMs).toBeLessThan(5_000 + 15_000 + 2_000);
   });
 
   test('5s / 15s / 45s を実際に待って再試行し、4 回目で枯渇する', async () => {
@@ -205,6 +215,7 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     // 初回 + 再試行 3 回 = 4 リクエスト、累積待機 65 秒
     expect(calls).toHaveLength(4);
     expect(virtualWaitMs).toBeGreaterThanOrEqual(5_000 + 15_000 + 45_000);
+    expect(virtualWaitMs).toBeLessThan(5_000 + 15_000 + 45_000 + 2_000);
   });
 
   test('通信失敗は 429 の再試行枠を消費しない', async () => {
@@ -292,7 +303,9 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
 
     await expect(api.fetchPostInfo('1')).rejects.toThrow(TransportExhaustedError);
     expect(calls).toHaveLength(3);
+    // 429 の枠 (65 秒) ではなくこちらの枠 (20 秒) で見切ったことまで固定する
     expect(virtualWaitMs).toBeGreaterThanOrEqual(5_000 + 15_000);
+    expect(virtualWaitMs).toBeLessThan(5_000 + 15_000 + 2_000);
   });
 
   test('サーバー指定のバックオフは収集をまたいでも守る', async () => {
@@ -309,6 +322,45 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     const before = virtualWaitMs;
     await next.fetchPostInfo('1');
     expect(virtualWaitMs - before).toBeGreaterThanOrEqual(119_000);
+  });
+
+  test('発行前に別のメッセージ往復を挟んでも、実際の発行間隔は基準間隔を下回らない', async () => {
+    // セッションは transport を呼ぶ直前に発行時刻を記録する (api-session.ts の issuedAt)。
+    // transport が実際の fetch より前に待つと、その待ち時間ぶんだけ「発行済みの時刻」が
+    // 前倒しされ、次の要求のゲートが早く明ける。往復の所要時間が要求ごとに違えば、
+    // 実際の fetchApi が基準間隔を空けずに連続発行されうる。
+    // fetchApi 以外のメッセージに待ち時間を持たせ、発行前の往復が入り込んだら検知する
+    let extraRoundTripMs = 500;
+    const issuedAt: number[] = [];
+    const otherMessages: string[] = [];
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async (message: { type: string; url: string }) => {
+          if (message.type !== 'fetchApi') {
+            otherMessages.push(message.type);
+            await new Promise((resolve) => setTimeout(resolve, extraRoundTripMs));
+            // 最初の往復だけ遅い状況を作る (往復の所要時間が毎回同じなら間隔は縮まない)
+            extraRoundTripMs = 0;
+            return { backoffUntil: 0 };
+          }
+          issuedAt.push(Date.now());
+          return okPost();
+        },
+      },
+    };
+
+    api = new ApiSession(500);
+    await api.fetchPostInfo('1');
+    await api.fetchPostInfo('2');
+    await api.fetchPostInfo('3');
+
+    expect(issuedAt).toHaveLength(3);
+    for (let i = 1; i < issuedAt.length; i++) {
+      expect(issuedAt[i] - issuedAt[i - 1]).toBeGreaterThanOrEqual(500);
+    }
+    // 発行前の往復そのものが無いことも固定する (待ち時間が短ければ上の検査は通ってしまう)
+    expect(otherMessages).toEqual([]);
   });
 
   test('壊れたレスポンスは成功として数えない', async () => {
@@ -342,34 +394,16 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     expect(virtualWaitMs - before).toBeGreaterThanOrEqual(119_000);
   });
 
-  test('signal.abort() でリトライ中の待機を中断する', async () => {
+  test('signal.abort() でリトライ中の待機を中断し、追加の要求を出さない', async () => {
     responders.push(() => tooManyRequests('60'));
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 0);
-    await expect(api.fetchPostInfo('z', controller.signal)).rejects.toThrow();
-  });
-
-  test('発行前の事前確認 (getBackoffUntil) が失敗しても収集は続行する (fail-open)', async () => {
-    // 最終判定は service worker 側 (handleFetchApi) のゲートが持つため、gate() の発行直前の
-    // 事前確認はベストエフォートでよい。メッセージ不達や storage エラーで失敗しても、
-    // それだけで収集全体を止めてはいけない
-    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-    (globalThis as any).chrome = {
-      runtime: {
-        sendMessage: (message: { type: string; url: string }) => {
-          if (message.type === 'getBackoffUntil') return Promise.reject(new Error('getBackoffUntil failed'));
-          if (message.type !== 'fetchApi') return Promise.reject(new Error('unexpected message type'));
-          calls.push({ url: message.url });
-          const responder = responders.shift();
-          if (!responder) return Promise.reject(new Error(`unexpected fetch: ${message.url}`));
-          return Promise.resolve(responder());
-        },
-      },
-    };
-
-    responders.push(okPost);
-    const result = await api.fetchPostInfo('1');
-    expect(result).toEqual({ id: '1', type: 'image', isRestricted: false } as never);
+    const error = await api.fetchPostInfo('z', controller.signal).catch((e) => e);
+    // 任意の例外で通してしまうと、中断を無視して再要求し別の理由で失敗した場合も通る
+    expect((error as Error).name).toBe('AbortError');
+    // 中断後に再試行が発行されていないこと (初回の 1 回だけ)。中断を無視すれば待機を終えて
+    // 再要求するので 2 回になる。待機時間では判定できない: 仮想時間の setTimeout は
+    // 中断で捨てられた待機ぶんも積んでしまうため
     expect(calls).toHaveLength(1);
   });
 
@@ -384,46 +418,6 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     controller.abort();
     const error = await api.fetchPostInfo('1', controller.signal).catch((e) => e);
     expect((error as Error).name).toBe('AbortError');
-  });
-
-  test('中断中は事前確認 (getBackoffUntil) の失敗を握りつぶさず、中断として伝播する', async () => {
-    // fail-open にするのは通常の (中断ではない) 失敗だけ。中断まで fail-open に落とすと、
-    // 中断の理由が「続行してよい失敗」として握り潰される。
-    //
-    // transport を直に叩くのは、セッション経由では中断が先に検出されて adapter の
-    // 事前確認まで到達しないため。また fail-open か否かは警告ログでしか区別できない:
-    // 握りつぶした場合も直後の proxyFetchApi が中断済みの signal で reject するので、
-    // 呼び出し側から見た結果 (AbortError / fetchApi 未発行) は同じになる
-    const controller = new AbortController();
-    const transport = createChromeProxyTransport();
-    let fetchApiCalls = 0;
-    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
-    (globalThis as any).chrome = {
-      runtime: {
-        sendMessage: (message: { type: string }) => {
-          if (message.type === 'getBackoffUntil') {
-            // 事前確認の最中に中断された状況を作る
-            controller.abort();
-            return Promise.reject(new Error('getBackoffUntil failed'));
-          }
-          fetchApiCalls++;
-          return Promise.resolve(okPost());
-        },
-      },
-    };
-    const origWarn = console.warn;
-    let warned = 0;
-    console.warn = () => {
-      warned++;
-    };
-    try {
-      const error = await transport('https://api.fanbox.cc/post.info?postId=1', controller.signal).catch((e) => e);
-      expect(error).toBeInstanceOf(Error);
-      expect(warned).toBe(0);
-      expect(fetchApiCalls).toBe(0);
-    } finally {
-      console.warn = origWarn;
-    }
   });
 
   test('429 以外のエラーは即時例外', async () => {

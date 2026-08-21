@@ -33,7 +33,7 @@ export type PostFailureCounts = {
   unavailableMissingBody: number;
   /** 未知の投稿タイプ (収集は中断しないが取り込めない) */
   unsupported: number;
-  /** postInfo の取得自体が失敗した (レート制限の枯渇を除くネットワーク/HTTP エラー) */
+  /** postInfo の取得が HttpError (2xx 以外の応答) で終わった。再試行枠の枯渇はここに数えず収集を止める */
   apiFailed: number;
 };
 
@@ -217,7 +217,7 @@ type CreatorCollectCounts = {
   addedPostCount: number;
   postFailures: PostFailureCounts;
   failedPageCount: number;
-  /** レート制限の枯渇で全ページを走査せずに打ち切った場合、その原因 */
+  /** 再試行枠の枯渇 (レート制限または通信) で全ページを走査せずに打ち切った場合、その原因 */
   stoppedBy?: RateLimitExhaustedError | TransportExhaustedError;
 };
 

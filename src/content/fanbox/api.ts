@@ -149,20 +149,13 @@ function isValidPlan(item: unknown): boolean {
 }
 
 /**
- * 1 回の収集ぶんの API 呼び出しをまとめる。
- *
- * レート制限の状態 (最終リクエスト時刻、現在の間隔、バックオフ期限) は収集ごとに持つ。
- * モジュール変数にすると前回の収集で引き上がった間隔が次の収集に持ち越される。
- *
- * リクエストは 1 本ずつ直列に発行する。ゲートの待機だけを直列化しても、
- * 待ち明けに複数の呼び出しが同時に発行されてしまう。
- */
-/**
  * service worker が記録しているバックオフ期限のローカルな参照値。
  *
- * 適応スロットルの間隔はこちらの都合なので収集ごとに初期化してよいが、Retry-After は
- * サーバーが「いつまで待て」と言っている期限であり、収集を中断して再実行しても消えない。
+ * 発行間隔や適応スロットルはこちらの都合なので収集ごとに初期化してよいが (`ApiSession` を
+ * 収集ごとに作る)、Retry-After はサーバーが「いつまで待て」と言っている期限であり、収集を
+ * 中断して再実行しても消えない。そのためモジュール変数として収集をまたいで持つ。
  * SoT は service worker 側 (chrome.storage.session、Issue #16) で、ここはその参照値。
+ * 更新は fetchApi の応答からのみ行う (下の transport 参照)。
  */
 let sharedBackoffUntil = 0;
 
@@ -172,39 +165,22 @@ export function resetSharedBackoff(): void {
 }
 
 /**
- * service worker に記録されている現在のバックオフ期限を取り込む。
- *
- * 発行の直前に毎回呼ぶ。別タブ (別の JS 実行環境) がこちらの待機中に期限を延長していても、
- * その延長は自分が fetchApi の応答を受け取るまでローカルの参照値に反映されないため
- * (Issue #16「実行中タブ間で期限の延長が同期されない」問題)。
- *
- * 応答が欠けている/型が違う場合は無視する (Math.max に undefined を渡すと NaN で壊れる)。
- */
-async function syncBackoffUntil(signal?: AbortSignal): Promise<void> {
-  const response = await sendMessageAbortable<{ backoffUntil?: number }>({ type: 'getBackoffUntil' }, signal);
-  if (typeof response?.backoffUntil === 'number') {
-    sharedBackoffUntil = Math.max(sharedBackoffUntil, response.backoffUntil);
-  }
-}
-
-/**
  * 拡張の transport。service worker を fetch プロキシとして使う。
  *
  * バックオフ期限中は I/O を発行せず deferred を返す。adapter の内側で待って再要求すると、
  * セッションが実際の発行時刻を見失い、基準間隔と適応間隔が抜けるため
  * (待機と再発行はセッションが行う)。
+ *
+ * 同じ理由で、発行の前に service worker へ問い合わせて最新の期限を取り込むこともしない。
+ * セッションは transport を呼ぶ直前に発行時刻を記録するので、ここで往復を挟むと実際の
+ * fetch がその往復のぶん遅れ、往復の所要時間が要求ごとに違えば実発行間隔が基準間隔を
+ * 下回る。期限の最終的な判定は service worker 側のゲートが持ち (`handleFetchApi`)、
+ * そこで弾かれた応答 (`kind: 'backoff'`) が最新の期限を運んでくるので、
+ * ローカルの参照値は応答からの更新だけで足りる。
  */
 export function createChromeProxyTransport(): Transport {
   return async (url, signal) => {
-    // 発行の直前に最新の期限を取り込む。これはベストエフォートなので、失敗しても収集は続ける
-    // (期限を知らずに発行することはあっても、応答に乗る backoffUntil で次から追従できる)。
-    // ただし中断だけは握りつぶさず伝播する
-    try {
-      await syncBackoffUntil(signal);
-    } catch (e) {
-      if (signal?.aborted) throw e;
-      console.warn('バックオフ期限の事前確認に失敗 (続行):', e);
-    }
+    // 既知の期限内なら I/O を発行しない。ここはローカルの参照値だけを見る (往復を挟まない)
     if (sharedBackoffUntil > Date.now()) return { kind: 'deferred', until: sharedBackoffUntil };
     let response: ApiFetchResponse;
     try {
@@ -220,9 +196,8 @@ export function createChromeProxyTransport(): Transport {
       sharedBackoffUntil = Math.max(sharedBackoffUntil, response.backoffUntil);
     }
     if (response.kind === 'backoff') {
-      // service worker 側の最終ゲートで拒否された (fetch していない)。発行直前の事前確認は
-      // ベストエフォートなので、それから fetchApi が処理されるまでの間に別タブの 429 が
-      // 期限を延ばすと起こる (TOCTOU)
+      // service worker 側の最終ゲートで拒否された (fetch していない)。ローカルの参照値は
+      // 応答からしか更新されないので、別タブの 429 で期限が延びた直後はここに来る
       return { kind: 'deferred', until: sharedBackoffUntil };
     }
     // service worker は fetch の失敗を reject せず status 0 で返す
@@ -258,8 +233,15 @@ export class ApiSession {
 
   /**
    * プラン情報を取得する。支援額タグの表示名に使うだけなので、失敗しても収集は続ける。
-   * ただしレート制限の枯渇だけは再送出する。既に最大回数・累積待機を費やした後で
-   * 投稿取得を始めるのは、再試行上限を別のエンドポイントで実質的に延長することになる。
+   *
+   * ただし再試行枠の枯渇 (RateLimitExhaustedError / TransportExhaustedError) だけは再送出する。
+   * 既に最大回数・累積待機を費やした後で投稿取得を始めるのは、再試行上限を別のエンドポイントで
+   * 実質的に延長することになる。
+   *
+   * 形状の不一致 (ApiShapeError / ResponseParseError) を握りつぶすのはこの 2 つ
+   * (plan / tag) だけの例外である。表示の補助しか担っておらず、握りつぶしても ZIP の中身は
+   * 欠けないため。投稿一覧・投稿詳細で同じことをすると、仕様変更に気付かないまま
+   * 中身の無い ZIP を完了として出してしまう。
    */
   async fetchPlans(creatorId: string, signal?: AbortSignal): Promise<PlanInfo[]> {
     const url = `https://api.fanbox.cc/plan.listCreator?creatorId=${creatorId}`;

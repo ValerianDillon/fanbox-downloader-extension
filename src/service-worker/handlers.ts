@@ -16,8 +16,8 @@ const backoffStore = new BackoffStore();
 
 /**
  * store.get() を安全化する。BackoffStore の get()/record() は chrome.storage.session を
- * 叩くため失敗しうるが、期限を「知れなかった」ことが handleFetchApi / handleGetBackoffUntil
- * 全体を失敗させる理由にはならない (呼び出し元の message ハンドラは必ず応答を返す契約を
+ * 叩くため失敗しうるが、期限を「知れなかった」ことが handleFetchApi 全体を失敗させる
+ * 理由にはならない (呼び出し元の message ハンドラは必ず応答を返す契約を
  * 守る必要がある。応答を返し損なうと sendResponse が呼ばれず、content script は
  * 応答なしで待ち続けることになる)。失敗時は「未記録 (0)」に倒す。
  */
@@ -80,11 +80,10 @@ export async function handleFetchApi(url: string, store: BackoffStore = backoffS
   try {
     // fetch を発行する前に、既知の未経過期限がないか確認する (最終ゲート)。
     //
-    // content script 側にも発行直前の事前確認 (ApiSession.syncBackoffUntil) があるが、
-    // それは「ローカルで待ってから来る」ための最適化にすぎず、その確認が終わってから
-    // この fetchApi メッセージが実際にここで処理されるまでの間にも、別タブの 429 が
-    // 割り込んで期限を延ばしうる (TOCTOU)。すべての fetchApi がここを通る以上、
-    // fetch を発行する権限を最終的に持つのはここであるべきなので、ここでもう一度確認する。
+    // content script 側もローカルの参照値で既知の期限中は発行を控えるが、その値は自分が
+    // 受け取った応答からしか更新されないため、別タブの 429 による延長を知らないことがある。
+    // すべての fetchApi がここを通る以上、fetch を発行する権限を最終的に持つのはここである。
+    // 応答に backoffUntil を載せるので、弾かれた content script は最新の期限を学習して待てる。
     //
     // この判定が保証するのは「読み取れた既知の未経過期限があるときに fetch を開始しない」ことである。
     // if 判定と直後の fetch() 呼び出しの間には await が無いため、そこに他メッセージの処理は
@@ -127,9 +126,4 @@ export async function handleFetchApi(url: string, store: BackoffStore = backoffS
     // 報告することはない。
     return { ok: false, status: 0, retryAfter: null, error: String(e), backoffUntil: await safeGet(store) };
   }
-}
-
-/** 収集開始時など、まだ 1 度もリクエストしていない時点でバックオフ期限を知るための問い合わせ */
-export async function handleGetBackoffUntil(store: BackoffStore = backoffStore): Promise<{ backoffUntil: number }> {
-  return { backoffUntil: await safeGet(store) };
 }

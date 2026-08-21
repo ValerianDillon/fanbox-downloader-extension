@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { ApiSession, resetSharedBackoff } from '../src/content/fanbox/api';
 import { sendMessageAbortable } from '../src/content/messaging';
 import { BackoffStore } from '../src/service-worker/backoff-store';
-import { handleFetchApi, handleGetBackoffUntil } from '../src/service-worker/handlers';
+import { handleFetchApi } from '../src/service-worker/handlers';
 import { createFakeSessionStorage } from './service-worker/fake-storage';
 
 /**
@@ -22,9 +22,12 @@ import { createFakeSessionStorage } from './service-worker/fake-storage';
  *   新しい BackoffStore インスタンスに切り替えることで再現する
  *   (BackoffStore はインスタンスごとにメモリキャッシュを持ち、storage だけを共有するため)
  *
- * gate() は待機を終えて実際に発行する直前に毎回 service worker へ問い合わせる
- * (ApiSession.syncBackoffUntil()、Issue #16 の追加対応) ため、以下のテストは明示的な
- * 事前呼び出しをせず、この自動的な問い合わせだけに頼って検証している。
+ * content script 側のローカルな参照値 (sharedBackoffUntil) は fetchApi の応答からしか
+ * 更新されないため、別タブによる期限の延長を知らないまま発行しようとすることがある。
+ * それを最終的に弾くのは service worker 側のゲート (handleFetchApi) で、弾かれた応答
+ * (`kind: 'backoff'` + backoffUntil) が最新の期限を運んでくる。以下のテストは、その
+ * 「発行しようとして弾かれ、期限を学習して待つ」経路だけに頼って検証している
+ * (明示的な事前問い合わせはしない)。
  */
 
 function fakeHttpResponse(init: { status: number; retryAfter?: string | null; body?: string }): Response {
@@ -46,7 +49,6 @@ function okPostBody(): string {
 function bridgeTo(store: BackoffStore) {
   return (message: { type: string; url?: string }) => {
     if (message.type === 'fetchApi') return handleFetchApi(message.url as string, store);
-    if (message.type === 'getBackoffUntil') return handleGetBackoffUntil(store);
     return Promise.reject(new Error(`unexpected message type: ${message.type}`));
   };
 }
@@ -109,8 +111,9 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
     const tab1 = new ApiSession(50);
     await expect(tab1.fetchPostInfo('x')).rejects.toThrow();
 
-    // "別タブを開く/リロードする": content script の静的な参照値だけがリセットされる。
-    // 明示的な事前取得はしない。gate() が発行直前に自動で service worker へ問い合わせる
+    // "別タブを開く/リロードする": content script のモジュール変数の参照値だけがリセットされる。
+    // 明示的な事前取得はしない。発行しようとして service worker 側のゲートに弾かれ、
+    // その応答に乗る期限を学習して待つ経路だけで守られることを見る
     resetSharedBackoff();
     const tab2 = new ApiSession(50);
     globalThis.fetch = (async () => fakeHttpResponse({ status: 200, body: okPostBody() })) as unknown as typeof fetch;
@@ -147,11 +150,9 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
       storage: { session: createFakeSessionStorage(backing) },
       runtime: {
         sendMessage: (message: { type: string; url?: string }) => {
-          if (message.type === 'fetchApi') {
-            swProcessing = handleFetchApi(message.url as string, store);
-            return swProcessing;
-          }
-          return handleGetBackoffUntil(store);
+          if (message.type !== 'fetchApi') return Promise.reject(new Error(`unexpected message type: ${message.type}`));
+          swProcessing = handleFetchApi(message.url as string, store);
+          return swProcessing;
         },
       },
     };
@@ -217,7 +218,7 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
     expect(virtualWaitMs - before).toBeGreaterThanOrEqual(85_000);
   });
 
-  test('(d) 並行 2 タブ相当: 待機中に他方が延長した期限を、発行直前の問い合わせで拾う', async () => {
+  test('(d) 並行 2 タブ相当: 待機中に他方が延長した期限を、発行が弾かれた応答から拾う', async () => {
     const backing = new Map<string, unknown>();
     const store = new BackoffStore();
     // biome-ignore lint/suspicious/noExplicitAny: chrome mock
@@ -233,12 +234,11 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
     await expect(tabA.fetchPostInfo('x')).rejects.toThrow();
 
     // "タブ B" (別の JS 実行環境) が、タブ A の待機中に期限を 90 秒延長する記録を残す。
-    // ここを新しい ApiSession インスタンスで表現しない理由: ApiSession.sharedBackoffUntil は
-    // クラス全体で 1 つの static であり、同一プロセス内であればどのインスタンスからの
-    // 更新も即座に他のインスタンスから見えてしまう。それでは「別タブ (別プロセス)」を
-    // 再現したことにならず、gate() の発行直前の問い合わせ (今回の修正) を経由しなくても
-    // テストが通ってしまう。そのため、タブ B の更新は store.record() を直接叩くことで、
-    // タブ A の static に触れずに service worker 側の記録だけを進める
+    // ここを新しい ApiSession インスタンスで表現しない理由: sharedBackoffUntil はモジュール
+    // 変数で、同一プロセス内であればどのインスタンスからの更新も即座に他のインスタンスから
+    // 見えてしまう。それでは「別タブ (別プロセス)」を再現したことにならず、service worker
+    // 側のゲートを経由しなくてもテストが通ってしまう。そのため、タブ B の更新は
+    // store.record() を直接叩くことで、タブ A の参照値に触れずに記録だけを進める
     // (handleFetchApi 経由にしないのは、そちらは発行前に「既知の未経過期限」を見て
     // fetch 自体を止めてしまう新しい最終ゲートを持つため。ここで模したいのは、
     // 既に発生していた別タブの 429 応答が記録される場面であり、その 429 自体が
@@ -246,23 +246,22 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
     await store.record(Date.now() + 90_000);
 
     // タブ A が次のリクエストを発行しようとする。ローカルの参照値はまだ 30 秒分のままだが
-    // (自分の fetchApi 応答を経由していないので、タブ B の延長を知らない)、
-    // gate() が発行直前に service worker へ問い合わせるので、90 秒への延長を捕捉できるはず
+    // (自分の fetchApi 応答を経由していないので、タブ B の延長を知らない)、発行は service
+    // worker 側のゲートに弾かれ、その応答に乗る 90 秒への延長を学習して待ち直すはず
     globalThis.fetch = (async () => fakeHttpResponse({ status: 200, body: okPostBody() })) as unknown as typeof fetch;
     const before = virtualWaitMs;
     await tabA.fetchPostInfo('1');
-    // 発行直前の問い合わせが無ければ、タブ A は自分の知る 30 秒分しか待たずに発行してしまい
-    // (実際に旧コードではそうなる)、延長後の期限 (90 秒) を破ってしまう
+    // service worker 側のゲートが無ければ、タブ A は自分の知る 30 秒分しか待たずに発行してしまい、
+    // 延長後の期限 (90 秒) を破ってしまう
     expect(virtualWaitMs - before).toBeGreaterThanOrEqual(85_000);
   });
 
-  test('(e) getBackoffUntil 完了後・fetchApi 到達前に別タブの 429 が期限を延ばしても、service worker 側の最終ゲートが fetch 前に弾く', async () => {
-    // (d) は「gate() の発行直前の問い合わせ (ApiSession.syncBackoffUntil)」が拾う延長を検証した。
-    // ここで検証したいのはさらに狭い窓: その問い合わせ (getBackoffUntil) が完了した*後*、
-    // 実際の fetchApi メッセージが service worker で処理される*前*に割り込む延長であり、
-    // これは content script 側のどんな事前確認でも原理的に拾えない (問い合わせと発行の間に
-    // 必ず隙間がある、いわゆる TOCTOU)。ここを最終的に塞ぐのは service worker 側の
-    // handleFetchApi が fetch 直前に行うゲートである。
+  test('(e) fetchApi 送信後・service worker 到達前に別タブの 429 が期限を延ばしても、最終ゲートが fetch 前に弾く', async () => {
+    // (d) は「発行しようとして弾かれ、応答から期限を学習する」経路を検証した。
+    // ここで検証したいのはさらに狭い窓: content script が fetchApi を送信した*後*、
+    // それが service worker で処理される*前*に割り込む延長であり、content script 側の
+    // どんな事前確認でも原理的に拾えない (確認と発行の間に必ず隙間がある、いわゆる TOCTOU)。
+    // ここを最終的に塞ぐのは handleFetchApi が fetch 直前に行うゲートである。
     const backing = new Map<string, unknown>();
     const store = new BackoffStore();
 
@@ -290,7 +289,6 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
       storage: { session: createFakeSessionStorage(backing) },
       runtime: {
         sendMessage: (message: { type: string; url?: string }) => {
-          if (message.type === 'getBackoffUntil') return handleGetBackoffUntil(store);
           if (message.type === 'fetchApi') {
             markReached?.();
             return (async () => {
@@ -306,9 +304,8 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
     const tabA = new ApiSession(50);
     const tabAPromise = tabA.fetchPostInfo('1');
 
-    // タブ A の getBackoffUntil (発行直前の事前確認) が完了し、fetchApi メッセージが
-    // service worker に届いた瞬間まで進める。この時点でタブ A は「期限は無い (0)」と
-    // 認識しているはず
+    // タブ A の fetchApi メッセージが service worker に届いた瞬間まで進める。
+    // この時点でタブ A は「期限は無い (0)」と認識しているはず
     await reached;
 
     // ここで「タブ B」が割り込み、期限を 60 秒延長する記録を残す。タブ A の fetchApi の
@@ -322,7 +319,7 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
 
     // service worker 側の最終ゲートが延長後の期限を見て fetch をブロックしたはずなので、
     // 実際の fetch は延長を織り込んだ待機の後に 1 回だけ発生する
-    // (このゲートが無ければ、タブ A は「期限は無い」という古い認識のまま即座に発行してしまう)
+    // (このゲートが無ければ、タブ A は「期限は無い」という古い認識のまま即座に fetch させてしまう)
     expect(fetchCalls).toHaveLength(1);
     expect(virtualWaitMs - before).toBeGreaterThanOrEqual(55_000);
   });

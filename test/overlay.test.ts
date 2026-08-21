@@ -6,7 +6,7 @@ import {
   ResponseParseError,
   TransportExhaustedError,
 } from '../src/content/fanbox/api';
-import { type PostFailureCounts, PostBodyInvalidError } from '../src/content/fanbox/collector';
+import { PostBodyInvalidError, type PostFailureCounts } from '../src/content/fanbox/collector';
 import {
   buildCompleteMessage,
   COMPLETE_HEADLINE,
@@ -146,7 +146,9 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
     expect(COMPLETE_HEADLINE).toBe('ダウンロードが完了しました');
     expect(PARTIAL_FILE_FAILURE_HEADLINE).toBe('一部取得できませんでした');
     expect(RATE_LIMIT_EXHAUSTED_HEADLINE).toBe('レート制限のため途中で打ち切りました (取得できた分のみ保存しています)');
-    expect(TRANSPORT_EXHAUSTED_HEADLINE).toBe('通信に失敗したため途中で打ち切りました (取得できた分のみ保存しています)');
+    expect(TRANSPORT_EXHAUSTED_HEADLINE).toBe(
+      '通信に失敗したため途中で打ち切りました (取得できた分のみ保存しています)',
+    );
     expect(NOTHING_SAVED_HEADLINE).toBe('保存できる投稿がなかったため ZIP を保存しませんでした');
     expect(UNSUPPORTED_RESPONSE_HEADLINE).toBe('未対応のレスポンス形式のため中断しました');
   });

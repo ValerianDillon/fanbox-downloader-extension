@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { BackoffStore } from '../../src/service-worker/backoff-store';
-import { handleFetchApi, handleGetBackoffUntil } from '../../src/service-worker/handlers';
+import { handleFetchApi } from '../../src/service-worker/handlers';
 import { createFakeSessionStorage } from './fake-storage';
 
 /**
  * fetch() の最小限のフェイク応答。BackoffStore はここでは直接使わず、
- * handleFetchApi / handleGetBackoffUntil に明示的に渡すインスタンスを都度作る
+ * handleFetchApi に明示的に渡すインスタンスを都度作る
  * (service-worker.ts のモジュール共有 singleton に依存すると、同じプロセス内で動く他の
  * テストと状態が混ざってしまうため)。
  */
@@ -20,7 +20,7 @@ function fakeResponse(init: { status: number; retryAfter?: string | null; body?:
   } as Response;
 }
 
-describe('handleFetchApi / handleGetBackoffUntil', () => {
+describe('handleFetchApi', () => {
   const origFetch = globalThis.fetch;
   let backing: Map<string, unknown>;
   let store: BackoffStore;
@@ -139,7 +139,7 @@ describe('handleFetchApi / handleGetBackoffUntil', () => {
     expect(backing.size).toBe(0);
   });
 
-  test('storage.session.get が失敗しても、fetchApi / getBackoffUntil は必ず応答を返す (未応答にならない)', async () => {
+  test('storage.session.get が失敗しても、fetchApi は必ず応答を返す (未応答にならない)', async () => {
     // store.get()/record() が reject すると、外側の catch 内で再度呼ぶ store.get() も
     // reject して handler 自体が never-resolve になりうる。呼び出し元の message ハンドラは
     // 必ず応答を返す契約を守る必要がある (でないと content script は応答なしで待ち続ける)
@@ -162,9 +162,6 @@ describe('handleFetchApi / handleGetBackoffUntil', () => {
     expect(fetchRes.ok).toBe(true);
     expect(fetchRes.backoffUntil).toBe(0);
 
-    const getRes = await handleGetBackoffUntil(store);
-    expect(getRes).toEqual({ backoffUntil: 0 });
-
     // fetch 自体が例外を投げる経路 (外側の catch) でも、その中の store.get() が
     // 失敗して二重に落ちることはない
     globalThis.fetch = (async () => {
@@ -174,12 +171,6 @@ describe('handleFetchApi / handleGetBackoffUntil', () => {
     expect(networkFailRes.status).toBe(0);
     expect(networkFailRes.error).toContain('network down');
     expect(networkFailRes.backoffUntil).toBe(0);
-  });
-
-  test('getBackoffUntil はそのときの記録をそのまま返す', async () => {
-    await store.record(Date.now() + 99_999);
-    const result = await handleGetBackoffUntil(store);
-    expect(result).toEqual({ backoffUntil: await store.get() });
   });
 
   test('content script 側が中断していても handleFetchApi 自体は完走して 429 を記録する', async () => {
