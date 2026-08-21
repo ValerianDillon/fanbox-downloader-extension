@@ -1,4 +1,4 @@
-import { parseRetryAfter } from '../retry-after';
+import { parseRetryAfterMs } from 'download-helper/api-session';
 import { BackoffStore } from './backoff-store';
 
 /**
@@ -102,7 +102,11 @@ export async function handleFetchApi(url: string, store: BackoffStore = backoffS
     const r = await fetch(url, { credentials: 'include' });
     const retryAfter = r.headers.get('Retry-After');
     if (r.status === 429) {
-      const waitMs = parseRetryAfter(retryAfter);
+      // 解釈は共有セッションと同じ実装 (download-helper/api-session) を使う。別実装にすると
+      // 解釈が食い違い、セッションが「読めない値なので固定バックオフ」と判断した Retry-After を
+      // service worker 側が期限として記録してしまう。記録はタブと収集をまたいで共有され、
+      // 次の発行はその期限まで deferred で待たされるので、食い違いはそのまま長すぎる待機になる。
+      const waitMs = parseRetryAfterMs(retryAfter, Date.now()) ?? null;
       // Retry-After が読めないときは新たな期限を主張しない (現在の記録をそのまま返す)。
       // 何秒待てばよいかの推測はサーバーの指示ではなく content script 側のポリシーなので、
       // ここで決め打ちにしない。

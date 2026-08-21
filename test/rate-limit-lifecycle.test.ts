@@ -267,7 +267,7 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
 
     // タブ A の fetchApi メッセージが service worker に「届いた」ことを合図する Promise と、
     // そこから実際の処理 (handleFetchApi の呼び出し) を再開させる Promise を用意する。
-    // これにより「getBackoffUntil 完了後、fetchApi の実処理が始まる前」という狭い窓を
+    // これにより「fetchApi の送信後、その実処理が始まる前」という狭い窓を
     // 厳密に (実行タイミングを勘に頼らず) 再現できる。
     let markReached: (() => void) | undefined;
     const reached = new Promise<void>((resolve) => {
@@ -322,5 +322,40 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
     // (このゲートが無ければ、タブ A は「期限は無い」という古い認識のまま即座に fetch させてしまう)
     expect(fetchCalls).toHaveLength(1);
     expect(virtualWaitMs - before).toBeGreaterThanOrEqual(55_000);
+  });
+
+  test('(f) Retry-After の解釈が content script 側と食い違わない (読めない値を期限として記録しない)', async () => {
+    // 期限の記録 (service worker) と待機時間の決定 (共有セッション) で Retry-After の解釈が
+    // 違うと、セッションが「読めないので固定バックオフ」と判断した値を service worker が
+    // 期限として記録してしまう。記録はタブと収集をまたいで共有され、次の発行はその期限まで
+    // deferred で待たされるので、食い違いはそのまま長すぎる待機になる。
+    // ここでは RFC 9110 が送信側に要求する IMF-fixdate ではないが Date.parse は解釈できてしまう
+    // 値を使う (緩い実装なら 2027 年までの期限になる)
+    const backing = new Map<string, unknown>();
+    const store = new BackoffStore();
+    // biome-ignore lint/suspicious/noExplicitAny: chrome mock
+    (globalThis as any).chrome = {
+      storage: { session: createFakeSessionStorage(backing) },
+      runtime: { sendMessage: bridgeTo(store) },
+    };
+
+    let fetchCount = 0;
+    globalThis.fetch = (async () => {
+      fetchCount++;
+      return fetchCount === 1
+        ? fakeHttpResponse({ status: 429, retryAfter: '1 Jan 2027' })
+        : fakeHttpResponse({ status: 200, body: okPostBody() });
+    }) as unknown as typeof fetch;
+
+    const session = new ApiSession(50);
+    const before = virtualWaitMs;
+    await session.fetchPostInfo('1');
+
+    expect(fetchCount).toBe(2);
+    // 読めない値なので新たな期限を主張しない (未記録のまま)
+    expect(await store.get()).toBe(0);
+    // 再試行までの待機は共有セッションの固定バックオフ (5 秒) であって、2027 年までではない
+    expect(virtualWaitMs - before).toBeGreaterThanOrEqual(5_000);
+    expect(virtualWaitMs - before).toBeLessThan(60_000);
   });
 });

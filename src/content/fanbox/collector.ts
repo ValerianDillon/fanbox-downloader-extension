@@ -131,9 +131,9 @@ export async function collect(
   // レート制限の状態は収集ごとに持つ。前回引き上がった間隔を次の収集に持ち越さない
   const api = new ApiSession(settings.apiIntervalMs ?? DEFAULT_API_RATE_LIMIT_MS);
 
-  // 別タブや直前のリロードで service worker 側に記録が残っていても、ApiSession の
-  // gate() が実際にリクエストを発行する直前に毎回 service worker へ問い合わせるため、
-  // ここで明示的に事前取得する必要はない (最初のリクエストも含めて gate() 側で守られる)。
+  // 別タブや直前のリロードで service worker 側に記録が残っていても、ここで明示的に
+  // 事前取得する必要はない。最初のリクエストは service worker 側のゲートに弾かれ、
+  // その応答に乗る期限を学習して待ち直す (最初のリクエストも含めて守られる)。
 
   const plans = await api.fetchPlans(creatorId, signal);
   const feeMapper = new Map<number, string>();

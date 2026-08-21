@@ -29,12 +29,14 @@ fanbox-downloader のブックマークレット版を Chrome 拡張に移行し
   - MV3 の service worker はいつでも停止しうる (30 秒無活動 / 5 分上限 / fetch 応答 30 秒)。転送途中で Port が切れたら受信済みバイト数を offset にした `Range` 要求で新しい Port を張って再開する。Range を無視して 200 が返ったら先頭から受け直し、切断が続けば `MAX_RESUMES` 回で諦めて上位の再試行に委ねる。実測 (2026-08-16) では `downloads.fanbox.cc` は Range に対応する (206 + `Accept-Ranges: bytes`) が ETag / Last-Modified を返さないため、実サイトでは validator 無しの分岐 (`src/content/media-stream.ts:142`) に入り Range 再開は行われず先頭からの取り直しになる (正しさは保たれ、切断時の効率のみ下がる)
   - 低速回線で `CHUNK_BYTES` が 30 秒以内に溜まらないと転送中に service worker が停止するため、chunk が満たなくても `FLUSH_INTERVAL_MS` ごとに送って idle timer をリセットする (Chrome 114 以降、Port は開くだけでなくメッセージ送受信でリセットされる)
   - 本文全体を JS ヒープに保持しない。受信合計を `Content-Length` と各 Port の終端メッセージのバイト数に突き合わせ、一致しなければ成功にしない (欠けたファイルを ZIP に入れないため)
-  - API 取得 (`fetchApi` / `getBackoffUntil`) は単発の `sendMessage` のまま (JSON はサイズ上限に達しない)
+  - API 取得 (`fetchApi`) は単発の `sendMessage` のまま (JSON はサイズ上限に達しない)
 - **API のレート制御は共有層に委譲する (ValerianDillon/fanbox-downloader#3)。** ゲート・再試行・適応スロットル・直列化・エラー型は `download-helper/api-session` の `ApiSession` が持ち、拡張側 (`src/content/fanbox/api.ts`) は `Transport` の実装 (`createChromeProxyTransport`) と FANBOX 固有の URL 組み立て・レスポンス検証だけを持つ。ブックマークレット版と同じ契約・同じテストを通すため
   - transport は 3 系統を返す。`{kind:'response', status, body, retryAfter}` / 応答を得られなかった `{kind:'unobservable-failure'}` / I/O を発行しなかった `{kind:'deferred', until}`。observable な 429 と「429 かもしれない失敗」を型で分け、後者から status を推測しない
   - service worker が既知のバックオフ期限中で fetch を発行しなかった応答 (`kind: 'backoff'`) は adapter が `deferred` へ変換する。adapter の内側で待って再要求すると、セッションが実際の発行時刻を見失って基準間隔と適応間隔が抜けるため、待機と再発行はセッションが行う
   - 再試行ポリシーはセッション側にある。exact 429 は `Retry-After` を優先し、無ければ 5 / 15 / 45 秒の 3 回。観測できない失敗は 5 / 15 秒の 2 回 (レート制限以外が多く含まれるので 429 と同じ 65 秒は待たない)。429 以外の HTTP エラーは再試行しない。abort は再試行枠を消費せず即座に伝播する
-  - 状態のスコープは 2 つに分かれる。基準間隔・適応間隔・再試行回数・連続成功数は収集ごと (`ApiSession` を収集ごとに作る)。サーバー指定のバックオフ期限は service worker (`chrome.storage.session`) が SoT で、タブと収集をまたぐ (Issue #16)。`api.ts` の `sharedBackoffUntil` はその参照値で、発行の直前に毎回問い合わせて取り込む (事前確認の失敗は fail-open、中断だけ伝播する)
+  - 状態のスコープは 2 つに分かれる。基準間隔・適応間隔・再試行回数・連続成功数は収集ごと (`ApiSession` を収集ごとに作る)。サーバー指定のバックオフ期限は service worker (`chrome.storage.session`) が SoT で、タブと収集をまたぐ (Issue #16)。`api.ts` の `sharedBackoffUntil` はその参照値で、更新は `fetchApi` の応答からのみ行う。発行の前に問い合わせて取り込むことはしない (往復のぶん実際の発行が遅れ、往復の所要時間が要求ごとに違うと実発行間隔が基準間隔を下回るため)。期限の最終判定は service worker 側のゲートが持ち、そこで弾かれた応答が最新の期限を運んでくる
+  - `Retry-After` の解釈は共有層の `parseRetryAfterMs` に一本化する。期限を記録する service worker と待機時間を決める共有セッションで解釈が違うと、セッションが「読めないので固定バックオフ」と判断した値を service worker が期限として記録し、その記録がタブと収集をまたいで長すぎる待機になる
+  - 残る限界として、`sendMessage` の配送遅延 (service worker の起動待ちなど) は実発行間隔に反映されない。セッションが記録する発行時刻は `sendMessage` の直前で、実際の `fetch` は service worker 側で起きるため、配送が遅かった要求の次だけ実間隔が基準間隔を下回りうる (`main` の自前実装も同じ基準点だったので、共有層への移行で変わった点ではない)
 - **キャンセルは AbortController。** メディア転送では content script が Port を切断し、service worker がそれを受けて進行中の fetch を abort する。`sendMessage` 経路は signal と競争させて待ちを打ち切る (送信済みリクエスト自体は取り消せない)
 
 ## FANBOX API の扱い (落とし穴)
