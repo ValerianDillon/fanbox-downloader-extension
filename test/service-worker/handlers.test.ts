@@ -173,6 +173,67 @@ describe('handleFetchApi', () => {
     expect(networkFailRes.backoffUntil).toBe(0);
   });
 
+  test('fetch を発行した応答には実際に発行した時刻を添える', async () => {
+    // content script 側のレート制御セッションはこの時刻を発行時刻として記録する (Issue #46)
+    const before = Date.now();
+    globalThis.fetch = (async () => fakeResponse({ status: 200, body: '{"ok":true}' })) as unknown as typeof fetch;
+    const res = await handleFetchApi('https://api.fanbox.cc/x', store);
+    expect(res.issuedAt).toBeGreaterThanOrEqual(before);
+    expect(res.issuedAt).toBeLessThanOrEqual(Date.now());
+  });
+
+  test('fetch が例外を投げた応答にも実際に発行した時刻を添える', async () => {
+    // 発行そのものは起きているので、次の発行はこの時刻から間隔を空けるのが正しい
+    const before = Date.now();
+    globalThis.fetch = (async () => {
+      throw new Error('network down');
+    }) as unknown as typeof fetch;
+    const res = await handleFetchApi('https://api.fanbox.cc/x', store);
+    expect(res.status).toBe(0);
+    expect(res.issuedAt).toBeGreaterThanOrEqual(before);
+    expect(res.issuedAt).toBeLessThanOrEqual(Date.now());
+  });
+
+  test('実発行時刻はバックオフ期限の読み取りが終わった後、fetch の直前に採る', async () => {
+    // 期限の読み取り (safeGet) より前で採時すると、その所要時間ぶん実発行より前の時刻を
+    // 報告することになり、content script 側のゲートがその分早く明ける
+    let gateResolvedAt = 0;
+    // biome-ignore lint/suspicious/noExplicitAny: chrome storage mock
+    (globalThis as any).chrome = {
+      storage: {
+        session: {
+          get: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            // 記録の読み取りは fetch 後にもう一度呼ばれる。ゲートの読み取りだけを見る
+            if (gateResolvedAt === 0) gateResolvedAt = Date.now();
+            return {};
+          },
+          set: async () => {},
+        },
+      },
+    };
+    let fetchCalledAt = 0;
+    globalThis.fetch = (async () => {
+      fetchCalledAt = Date.now();
+      return fakeResponse({ status: 200, body: '{"ok":true}' });
+    }) as unknown as typeof fetch;
+
+    const res = await handleFetchApi('https://api.fanbox.cc/x', new BackoffStore());
+    expect(res.issuedAt).toBeGreaterThanOrEqual(gateResolvedAt);
+    expect(res.issuedAt).toBeLessThanOrEqual(fetchCalledAt);
+  });
+
+  test('発行前ゲートで弾いた応答には実発行時刻を添えない', async () => {
+    backing.set('fbdlBackoffUntil', Date.now() + 60_000);
+    globalThis.fetch = (async () => {
+      throw new Error('ゲートで弾かれるべき fetch が発行された');
+    }) as unknown as typeof fetch;
+    const res = await handleFetchApi('https://api.fanbox.cc/x', store);
+    expect(res.kind).toBe('backoff');
+    // 発行していない時刻を報告すると、セッションが実発行の間隔を誤って広く見積もる
+    expect(res.issuedAt).toBeUndefined();
+  });
+
   test('content script 側が中断していても handleFetchApi 自体は完走して 429 を記録する', async () => {
     // sendMessageAbortable は呼び出し側 (content script) の Promise を reject するだけで、
     // service worker 側のこの関数は signal を一切受け取らないため中断されない
