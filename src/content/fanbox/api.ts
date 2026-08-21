@@ -9,9 +9,9 @@ import {
 import type {
   PlanInfo,
   PlansResponse,
-  PostInfo,
+  PostInfoCandidate,
   PostInfoResponse,
-  PostListItem,
+  PostListItemCandidate,
   PostListResponse,
   PostPaginationResponse,
   TagsResponse,
@@ -138,15 +138,16 @@ function unwrapArray<T>(value: unknown, url: string, fieldPath: string, isValidI
 }
 
 /**
- * 一覧要素のうち、収集の分岐に使う 3 つだけを検証する。
+ * 一覧要素のうち、収集の分岐に使う 3 つだけを検証する (PostListItemCandidate が保証する範囲)。
  * id は post.info の URL を組み立てるのに使い、isRestricted は投稿を飛ばすかの判断に使い、
  * feeRequired は isIgnoreFree の判断に使う。
  * 型が変わると id は「取得失敗が N 件」、isRestricted は「無言で全件スキップ」、
  * feeRequired は「無料を省く指定が無言で効かない」になるため、ここで形状エラーとして止める。
- * それ以外のフィールドは download-helper 側が欠損を許容するので検証しない。
+ * それ以外のフィールドは検証しない。本文の取り込みに必要な検証は download-helper の
+ * addByPostInfo が入口で行う (ValerianDillon/download-helper#30)。
  */
 function isValidPostListItem(item: unknown): boolean {
-  const post = item as PostListItem | null;
+  const post = item as PostListItemCandidate | null;
   return (
     !!post &&
     typeof post.id === 'string' &&
@@ -322,12 +323,12 @@ export class ApiSession {
    * (`isRestricted: true` / `type` / `coverImageUrl` / `tags` は通常どおり入る)。
    * addByPostInfo がこれを検出して投稿単位でスキップする。
    */
-  async fetchPostInfo(postId: string, signal?: AbortSignal): Promise<PostInfo> {
+  async fetchPostInfo(postId: string, signal?: AbortSignal): Promise<PostInfoCandidate> {
     const url = `https://api.fanbox.cc/post.info?postId=${postId}`;
-    return this.fetchJson<PostInfoResponse, PostInfo>(
+    return this.fetchJson<PostInfoResponse, PostInfoCandidate>(
       url,
       (result) => {
-        const post = result?.body?.post;
+        const post = result?.body?.post as Record<string, unknown> | null | undefined;
         if (!post) {
           throw new ApiShapeError(url, ['body.post']);
         }
@@ -338,7 +339,8 @@ export class ApiSession {
         if (fields.length > 0) {
           throw new ApiShapeError(url, fields);
         }
-        return post;
+        // 検証した 3 つだけを保証する型で返す。本文の検証は addByPostInfo の入口が行う
+        return post as unknown as PostInfoCandidate;
       },
       signal,
     );
@@ -353,10 +355,10 @@ export class ApiSession {
     );
   }
 
-  async fetchPostList(url: string, signal?: AbortSignal): Promise<PostListItem[]> {
-    return this.fetchJson<PostListResponse, PostListItem[]>(
+  async fetchPostList(url: string, signal?: AbortSignal): Promise<PostListItemCandidate[]> {
+    return this.fetchJson<PostListResponse, PostListItemCandidate[]>(
       url,
-      (result) => unwrapArray<PostListItem>(result?.body?.posts, url, 'body.posts', isValidPostListItem),
+      (result) => unwrapArray<PostListItemCandidate>(result?.body?.posts, url, 'body.posts', isValidPostListItem),
       signal,
     );
   }

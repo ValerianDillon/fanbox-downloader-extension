@@ -48,6 +48,8 @@ fanbox-downloader のブックマークレット版を Chrome 拡張に移行し
   - 安全に取り込めない仕様変更 (`ApiShapeError` / `ResponseParseError` / `PostBodyInvalidError`) は「未対応のレスポンス形式のため中断しました」で止める。判定は `overlay.ts` の `isUnsupportedResponseError` が SoT
   - 例外は `plan.listCreator` と `tag.getFeatured` の 2 つだけで、形状の不一致 (`ApiShapeError` / `ResponseParseError`) も HTTP エラーも握りつぶして続行する。表示の補助しか担っておらず、握りつぶしても ZIP の中身は欠けないため (枯渇だけは再送出する)
 - 取得できなかった投稿は失敗件数として報告する。投稿一覧ページの失敗は欠落した投稿数が不明なので、投稿単位の件数とは分けて数える
+- **検証境界は共有層の `addByPostInfo` の入口にある (ValerianDillon/download-helper#30)。** 拡張側の `fetchApi` 系が保証するのは、収集の分岐に使うフィールドだけである (`fetchPostInfo` は `id` / `type` / `isRestricted`、一覧要素は `id` / `isRestricted` / `feeRequired`)。返す型は `PostInfoCandidate` / `PostListItemCandidate` で、「検証済み」を名乗らない
+  - 本文の検証は `addByPostInfo` が入口で行い、収集が実際に読むフィールドだけを厳密に確かめる。情報 JSON に写すだけの付随メタデータは型を検証しない (`invalid` は収集全体の中断を意味するため、読まないフィールドの型変化で全件止めない)
 - `post.listCreator` の一覧レスポンスには本文が含まれないため、各投稿は `post.info` への追加リクエストを経て収集される
   - 一覧の時点で結果が決まる投稿 (`isRestricted`、および「無料を省く」指定に該当する `feeRequired === 0`) は `post.info` を発行せずに飛ばす。発行しても `addByPostInfo` が同じ条件で弾くだけで、レート制限の枠と待機時間を消費する。この判断に使う `id` / `isRestricted` / `feeRequired` は一覧要素の validator で検証する (欠けたまま続けると、利用者が指定した除外が無言で効かなくなる)
 
