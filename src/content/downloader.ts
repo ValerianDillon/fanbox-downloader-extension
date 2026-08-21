@@ -1,5 +1,6 @@
 import type { DownloadZipResult, FileSystemFileHandle } from 'download-helper/download-helper';
 import { DownloadHelper, DownloadUtils } from 'download-helper/download-helper';
+import { appendMediaAttempts } from './media-attempt-log';
 import { fetchMediaViaPort } from './media-stream';
 import { createTestSaveHandle, IS_TEST_BUILD, wrapFetchFileForTest } from './test-hooks';
 
@@ -129,12 +130,18 @@ export async function downloadAsZip(
   const fetchFile = wrapFetchFileForTest((url, name, context) =>
     fetchWithRetry(url, name, 1, signal, context.kind, attempts),
   );
-  const zip = await helper.downloadZip(downloadObj, progress.onProgress, progress.onLog, progress.onRemainTime, {
-    handle,
-    signal,
-    fetchFile,
-  });
-  return { zip, attempts };
+  try {
+    const zip = await helper.downloadZip(downloadObj, progress.onProgress, progress.onLog, progress.onRemainTime, {
+      handle,
+      signal,
+      fetchFile,
+    });
+    return { zip, attempts };
+  } finally {
+    // 例外や中断で終わった実行の記録も残す。観測したい 429 は失敗した実行にこそ現れるので、
+    // 成功時だけ保存すると最も見たい事象が落ちる (Issue #51)
+    await appendMediaAttempts(attempts);
+  }
 }
 
 declare function showSaveFilePicker(options?: {
