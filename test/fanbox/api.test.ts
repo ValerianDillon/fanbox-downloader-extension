@@ -360,6 +360,47 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     expect(otherMessages).toEqual([]);
   });
 
+  test('service worker への配送が遅れても、実際の fetch の間隔は基準間隔を下回らない', async () => {
+    // セッションは sendMessage を呼ぶ直前の時刻を発行時刻として記録するが、実際の fetch は
+    // service worker 側で起きる。起動待ちなどで配送が遅れた要求の次は、その遅延ぶんゲートが
+    // 早く明けてしまう (Issue #46)。応答が運ぶ issuedAt を発行時刻に採ることで防ぐ
+    let deliveryMs = 800;
+    const fetchedAt: number[] = [];
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async (message: { type: string; url: string }) => {
+          if (message.type !== 'fetchApi') throw new Error('unexpected message type');
+          // 最初の配送だけ遅い状況を作る (毎回同じだけ遅ければ間隔は縮まない)
+          await new Promise((resolve) => setTimeout(resolve, deliveryMs));
+          deliveryMs = 0;
+          const issuedAt = Date.now();
+          fetchedAt.push(issuedAt);
+          return { ...okPost(), issuedAt };
+        },
+      },
+    };
+
+    api = new ApiSession(500);
+    await api.fetchPostInfo('1');
+    await api.fetchPostInfo('2');
+
+    expect(fetchedAt).toHaveLength(2);
+    expect(fetchedAt[1] - fetchedAt[0]).toBeGreaterThanOrEqual(500);
+  });
+
+  test('service worker が実発行時刻を返さなくても収集は成立する', async () => {
+    // 旧バージョンの service worker と組み合わさった場合。セッションは sendMessage 直前の
+    // 時刻に落とすので、間隔は従来どおり保たれる (実発行とのずれは補正されない)
+    responders.push(okPost);
+    responders.push(okPost);
+    api = new ApiSession(500);
+    await api.fetchPostInfo('1');
+    const before = virtualWaitMs;
+    await api.fetchPostInfo('2');
+    expect(virtualWaitMs - before).toBeGreaterThanOrEqual(400);
+  });
+
   test('壊れたレスポンスは成功として数えない', async () => {
     api = new ApiSession(500);
     const escalated = await escalateThenSucceed(19);

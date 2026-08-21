@@ -56,6 +56,16 @@ export type ApiFetchResponse = {
   /** 記録されている現在のバックオフ期限 (epoch ms)。content script 側のゲートが参照する */
   backoffUntil: number;
   /**
+   * 実際に fetch を開始した時刻 (epoch ms)。content script 側のレート制御セッションが
+   * 発行時刻の記録に使う (Issue #46)。
+   *
+   * セッションは transport (= sendMessage) を呼ぶ直前の時刻を発行時刻として記録するが、
+   * 実際の fetch はここで起きるので、service worker の起動待ちなどで配送が遅れると
+   * 記録と実発行がずれ、次のゲートがその遅延ぶん早く明けてしまう。
+   * fetch を発行しなかった応答 (kind: 'backoff') では欠ける。
+   */
+  issuedAt?: number;
+  /**
    * service worker 側の最終ゲートで、fetch を発行せずに拒否したことを示す。
    * 'backoff' のときは fetch していないので status / retryAfter / body / error に意味はない。
    * content script 側はこれを通信失敗として数えず、429 の再試行枠も消費しない
@@ -77,6 +87,9 @@ export type ApiFetchResponse = {
  *   複数の「起動」を再現できる (BackoffStore のコメント参照)。
  */
 export async function handleFetchApi(url: string, store: BackoffStore = backoffStore): Promise<ApiFetchResponse> {
+  // fetch を発行できたときだけ値が入る。catch 側は「発行前に失敗したか」を判別できないと
+  // 実発行していない時刻を報告しかねないので、try の外で持つ
+  let issuedAt: number | undefined;
   try {
     // fetch を発行する前に、既知の未経過期限がないか確認する (最終ゲート)。
     //
@@ -99,6 +112,9 @@ export async function handleFetchApi(url: string, store: BackoffStore = backoffS
       return { ok: false, status: 0, retryAfter: null, backoffUntil: knownBackoffUntil, kind: 'backoff' };
     }
 
+    // 発行時刻の記録は fetch の直前で採る。ここより前 (safeGet の前) で採ると、
+    // 期限の読み取りに掛かった時間ぶん実発行より早い時刻を報告することになる
+    issuedAt = Date.now();
     const r = await fetch(url, { credentials: 'include' });
     const retryAfter = r.headers.get('Retry-After');
     if (r.status === 429) {
@@ -116,18 +132,18 @@ export async function handleFetchApi(url: string, store: BackoffStore = backoffS
       // catch が「通信障害 (status: 0)」にすり替えてしまい、content script は既知の
       // Retry-After を無視して短い間隔で再送してしまう。
       const backoffUntil = waitMs !== null ? await safeRecord(store, Date.now() + waitMs) : await safeGet(store);
-      return { ok: false, status: 429, retryAfter, backoffUntil };
+      return { ok: false, status: 429, retryAfter, backoffUntil, issuedAt };
     }
     const backoffUntil = await safeGet(store);
     if (!r.ok) {
-      return { ok: false, status: r.status, retryAfter, backoffUntil };
+      return { ok: false, status: r.status, retryAfter, backoffUntil, issuedAt };
     }
     const body = await r.text();
-    return { ok: true, status: r.status, retryAfter, body, backoffUntil };
+    return { ok: true, status: r.status, retryAfter, body, backoffUntil, issuedAt };
   } catch (e) {
     // ここに到達するのは fetch() 自体の失敗 (実際の通信障害) のみ。safeGet/safeRecord は
     // 例外を投げないので、store へのアクセス失敗がここに紛れ込んで「通信障害」を誤って
     // 報告することはない。
-    return { ok: false, status: 0, retryAfter: null, error: String(e), backoffUntil: await safeGet(store) };
+    return { ok: false, status: 0, retryAfter: null, error: String(e), backoffUntil: await safeGet(store), issuedAt };
   }
 }

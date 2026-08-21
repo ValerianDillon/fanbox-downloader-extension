@@ -79,6 +79,12 @@ type ApiFetchResponse = {
    * 'backoff' のときは status/retryAfter/body/error に意味はない (fetch していない)。
    */
   kind?: 'backoff';
+  /**
+   * service worker が実際に fetch を開始した時刻 (epoch ms、Issue #46)。
+   * fetch を発行しなかった応答では欠ける。旧バージョンの service worker との組み合わせでも
+   * 欠けうるので optional にし、欠けていればセッションが sendMessage 直前の時刻に落とす。
+   */
+  issuedAt?: number;
 };
 
 /**
@@ -174,6 +180,11 @@ export function resetSharedBackoff(): void {
 /**
  * 拡張の transport。service worker を fetch プロキシとして使う。
  *
+ * 実際の fetch は service worker 側で起きるので、応答が運んでくる実発行時刻をそのまま
+ * セッションへ渡す。セッションが記録するのは transport を呼ぶ直前の時刻なので、
+ * service worker の起動待ちなどで配送が遅れると、記録と実発行がその遅延ぶんずれ、
+ * 次のゲートが早く明けて実 fetch の間隔が発行間隔を下回りうる (Issue #46)。
+ *
  * バックオフ期限中は I/O を発行せず deferred を返す。adapter の内側で待って再要求すると、
  * セッションが実際の発行時刻を見失い、基準間隔と適応間隔が抜けるため
  * (待機と再発行はセッションが行う)。
@@ -208,12 +219,15 @@ export function createChromeProxyTransport(): Transport {
       return { kind: 'deferred', until: sharedBackoffUntil };
     }
     // service worker は fetch の失敗を reject せず status 0 で返す
-    if (response.status === 0) return { kind: 'unobservable-failure', cause: response.error };
+    if (response.status === 0) {
+      return { kind: 'unobservable-failure', cause: response.error, issuedAt: response.issuedAt };
+    }
     return {
       kind: 'response',
       status: response.status,
       body: response.body ?? '',
       retryAfter: response.retryAfter,
+      issuedAt: response.issuedAt,
     };
   };
 }
