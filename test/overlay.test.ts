@@ -1,13 +1,22 @@
 import { describe, expect, test } from 'bun:test';
-import type { PostFailureCounts } from '../src/content/fanbox/collector';
+import {
+  ApiShapeError,
+  HttpError,
+  RateLimitExhaustedError,
+  ResponseParseError,
+  TransportExhaustedError,
+} from '../src/content/fanbox/api';
+import { PostBodyInvalidError, type PostFailureCounts } from '../src/content/fanbox/collector';
 import {
   buildCompleteMessage,
   COMPLETE_HEADLINE,
   type CompleteMessageParams,
+  isUnsupportedResponseError,
   NOTHING_SAVED_HEADLINE,
   PARTIAL_DOWNLOAD_MESSAGE,
   PARTIAL_FILE_FAILURE_HEADLINE,
   RATE_LIMIT_EXHAUSTED_HEADLINE,
+  TRANSPORT_EXHAUSTED_HEADLINE,
   UNSUPPORTED_RESPONSE_HEADLINE,
 } from '../src/content/overlay';
 
@@ -23,9 +32,11 @@ const validTransitions: Record<OverlayState, OverlayState[]> = {
   // collecting → complete (downloading を経由しない) は startCollecting (src/content/overlay.ts)
   // の次の 3 箇所が使う。詳細は下の describe ブロックのコメントを参照。
   // 1. collect() が正常に返り、addedPostCount === 0 (Issue #14: 保存できる投稿が無い)
-  // 2. collect() が ApiShapeError / PostBodyInvalidError を投げる (Issue #14: 未対応のレスポンス形式)
+  // 2. collect() が ApiShapeError / ResponseParseError / PostBodyInvalidError を投げる
+  //    (Issue #14: 未対応のレスポンス形式。判定は isUnsupportedResponseError)
   // 3. collect() がそれ以外の例外を投げる (例: addedPostCount === 0 のまま枯渇した
-  //    RateLimitExhaustedError、または想定外のバグ) — catch の汎用フォールバックに落ちる
+  //    RateLimitExhaustedError / TransportExhaustedError、または想定外のバグ) —
+  //    catch の汎用フォールバックに落ちる
   collecting: ['downloading', 'settings', 'complete'],
   downloading: ['complete', 'settings'],
   complete: ['settings'],
@@ -137,6 +148,9 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
     expect(COMPLETE_HEADLINE).toBe('ダウンロードが完了しました');
     expect(PARTIAL_FILE_FAILURE_HEADLINE).toBe('一部取得できませんでした');
     expect(RATE_LIMIT_EXHAUSTED_HEADLINE).toBe('レート制限のため途中で打ち切りました (取得できた分のみ保存しています)');
+    expect(TRANSPORT_EXHAUSTED_HEADLINE).toBe(
+      '通信に失敗したため途中で打ち切りました (取得できた分のみ保存しています)',
+    );
     expect(NOTHING_SAVED_HEADLINE).toBe('保存できる投稿がなかったため ZIP を保存しませんでした');
     expect(UNSUPPORTED_RESPONSE_HEADLINE).toBe('未対応のレスポンス形式のため中断しました');
   });
@@ -216,6 +230,13 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
   test('レート制限による打ち切りが最優先 (ZIP フェーズの失敗が 0 でも見出しは打ち切り扱い)', () => {
     const message = buildCompleteMessage({ ...base, stoppedReason: 'rate-limit-exhausted' });
     expect(message).toBe(RATE_LIMIT_EXHAUSTED_HEADLINE);
+  });
+
+  test('通信の枯渇による打ち切りはレート制限とは別の見出しになる', () => {
+    // レート制限は時間を置けばよいが、通信の失敗は環境側の確認が要るので文言を分ける
+    const message = buildCompleteMessage({ ...base, stoppedReason: 'transport-exhausted' });
+    expect(message).toBe(TRANSPORT_EXHAUSTED_HEADLINE);
+    expect(message).not.toBe(RATE_LIMIT_EXHAUSTED_HEADLINE);
   });
 
   test('レート制限による打ち切りと ZIP フェーズの失敗が両方あっても見出しは打ち切りが勝ち、件数は併記する', () => {
@@ -342,5 +363,36 @@ describe('Issue #14: 登録できた投稿が 0 件の場合 (buildCompleteMessa
     });
     expect(message).not.toBe(NOTHING_SAVED_HEADLINE);
     expect(message).toBe(COMPLETE_HEADLINE);
+  });
+});
+
+/**
+ * 収集が「未対応のレスポンス形式」で中断したかの判定 (Issue #14)。
+ * OverlayController.startCollecting の catch はこの判定でのみ UNSUPPORTED_RESPONSE_HEADLINE に
+ * 分岐するため、ここが漏れると仕様変更が「エラーが発生しました: ...」に潰れて伝わらない。
+ */
+describe('Issue #14: 未対応のレスポンス形式の判定 (isUnsupportedResponseError)', () => {
+  const url = 'https://api.fanbox.cc/post.info?postId=1';
+
+  test('API 層の形状違反 (ApiShapeError) は未対応のレスポンス形式として扱う', () => {
+    expect(isUnsupportedResponseError(new ApiShapeError(url, ['body.post']))).toBe(true);
+  });
+
+  test('本文を JSON として読めなかった場合 (ResponseParseError) も未対応のレスポンス形式として扱う', () => {
+    // 共有セッションは JSON パース失敗を ResponseParseError で返す。ここが漏れると
+    // 「壊れた本文が返り続ける」仕様変更が汎用のエラー文言に潰れる
+    expect(isUnsupportedResponseError(new ResponseParseError(url))).toBe(true);
+  });
+
+  test('ライブラリ層の本文不一致 (PostBodyInvalidError) も未対応のレスポンス形式として扱う', () => {
+    expect(isUnsupportedResponseError(new PostBodyInvalidError('1', 'image', ['body.images']))).toBe(true);
+  });
+
+  test('通信・レート制限・HTTP エラーは未対応のレスポンス形式ではない', () => {
+    // これらは時間を置けば直りうる失敗であり、「拡張機能の更新が必要」とは意味が違う
+    expect(isUnsupportedResponseError(new RateLimitExhaustedError(url))).toBe(false);
+    expect(isUnsupportedResponseError(new TransportExhaustedError(url))).toBe(false);
+    expect(isUnsupportedResponseError(new HttpError(url, 500))).toBe(false);
+    expect(isUnsupportedResponseError(new Error('想定外のバグ'))).toBe(false);
   });
 });

@@ -18,6 +18,7 @@ fanbox-downloader のブックマークレット版を Chrome 拡張に移行し
 - 唯一の runtime 依存は `download-helper` (バージョンは package.json が SoT)
   - `download-helper/download-helper`: `DownloadHelper.downloadZip` (ZIP 生成本体), `DownloadUtils`, `ZipWriter`
   - `download-helper/fanbox-collector`: FANBOX API 型定義, `addByPostInfo` など FANBOX 固有の共通ロジック (ブックマークレット版 fanbox-downloader と共用)
+  - `download-helper/api-session`: API 呼び出しのレート制御セッション (`ApiSession`), `Transport` 契約, エラー型 (`HttpError` / `RateLimitExhaustedError` / `TransportExhaustedError` / `ResponseParseError`)
 - FANBOX 固有の収集ロジックと ZIP 生成本体は `download-helper` に集約されており、拡張側は service worker 経由の fetch 差し替えや FileSystemFileHandle 取得など拡張固有の処理のみを担う
 
 ## アーキテクチャ (非自明な設計判断)
@@ -28,12 +29,23 @@ fanbox-downloader のブックマークレット版を Chrome 拡張に移行し
   - MV3 の service worker はいつでも停止しうる (30 秒無活動 / 5 分上限 / fetch 応答 30 秒)。転送途中で Port が切れたら受信済みバイト数を offset にした `Range` 要求で新しい Port を張って再開する。Range を無視して 200 が返ったら先頭から受け直し、切断が続けば `MAX_RESUMES` 回で諦めて上位の再試行に委ねる。実測 (2026-08-16) では `downloads.fanbox.cc` は Range に対応する (206 + `Accept-Ranges: bytes`) が ETag / Last-Modified を返さないため、実サイトでは validator 無しの分岐 (`src/content/media-stream.ts:142`) に入り Range 再開は行われず先頭からの取り直しになる (正しさは保たれ、切断時の効率のみ下がる)
   - 低速回線で `CHUNK_BYTES` が 30 秒以内に溜まらないと転送中に service worker が停止するため、chunk が満たなくても `FLUSH_INTERVAL_MS` ごとに送って idle timer をリセットする (Chrome 114 以降、Port は開くだけでなくメッセージ送受信でリセットされる)
   - 本文全体を JS ヒープに保持しない。受信合計を `Content-Length` と各 Port の終端メッセージのバイト数に突き合わせ、一致しなければ成功にしない (欠けたファイルを ZIP に入れないため)
-  - API 取得 (`fetchApi` / `getBackoffUntil`) は単発の `sendMessage` のまま (JSON はサイズ上限に達しない)
+  - API 取得 (`fetchApi`) は単発の `sendMessage` のまま (JSON はサイズ上限に達しない)
+- **API のレート制御は共有層に委譲する (ValerianDillon/fanbox-downloader#3)。** ゲート・再試行・適応スロットル・直列化・エラー型は `download-helper/api-session` の `ApiSession` が持ち、拡張側 (`src/content/fanbox/api.ts`) は `Transport` の実装 (`createChromeProxyTransport`) と FANBOX 固有の URL 組み立て・レスポンス検証だけを持つ。ブックマークレット版と同じ契約・同じテストを通すため
+  - transport は 3 系統を返す。`{kind:'response', status, body, retryAfter}` / 応答を得られなかった `{kind:'unobservable-failure'}` / I/O を発行しなかった `{kind:'deferred', until}`。observable な 429 と「429 かもしれない失敗」を型で分け、後者から status を推測しない
+  - service worker が既知のバックオフ期限中で fetch を発行しなかった応答 (`kind: 'backoff'`) は adapter が `deferred` へ変換する。adapter の内側で待って再要求すると、セッションが実際の発行時刻を見失って基準間隔と適応間隔が抜けるため、待機と再発行はセッションが行う
+  - 再試行ポリシーはセッション側にある。exact 429 は `Retry-After` を優先し、無ければ 5 / 15 / 45 秒の 3 回。観測できない失敗は 5 / 15 秒の 2 回 (レート制限以外が多く含まれるので 429 と同じ 65 秒は待たない)。429 以外の HTTP エラーは再試行しない。abort は再試行枠を消費せず即座に伝播する
+  - 状態のスコープは 2 つに分かれる。基準間隔・適応間隔・再試行回数・連続成功数は収集ごと (`ApiSession` を収集ごとに作る)。サーバー指定のバックオフ期限は service worker (`chrome.storage.session`) が SoT で、タブと収集をまたぐ (Issue #16)。`api.ts` の `sharedBackoffUntil` はその参照値で、更新は `fetchApi` の応答からのみ行う。発行の前に問い合わせて取り込むことはしない (往復のぶん実際の発行が遅れ、往復の所要時間が要求ごとに違うと実発行間隔が基準間隔を下回るため)。期限の最終判定は service worker 側のゲートが持ち、そこで弾かれた応答が最新の期限を運んでくる
+  - `Retry-After` の解釈は共有層の `parseRetryAfterMs` に一本化する。期限を記録する service worker と待機時間を決める共有セッションで解釈が違うと、セッションが「読めないので固定バックオフ」と判断した値を service worker が期限として記録し、その記録がタブと収集をまたいで長すぎる待機になる
+  - 残る限界として、`sendMessage` の配送遅延 (service worker の起動待ちなど) は実発行間隔に反映されない。セッションが記録する発行時刻は `sendMessage` の直前で、実際の `fetch` は service worker 側で起きるため、配送が遅かった要求の次だけ実間隔が基準間隔を下回りうる (`main` の自前実装も同じ基準点だったので、共有層への移行で変わった点ではない)
 - **キャンセルは AbortController。** メディア転送では content script が Port を切断し、service worker がそれを受けて進行中の fetch を abort する。`sendMessage` 経路は signal と競争させて待ちを打ち切る (送信済みリクエスト自体は取り消せない)
 
 ## FANBOX API の扱い (落とし穴)
 
 - 配列レスポンスは `body` 直下ではなく `body.<キー>` に入る。形状が想定と違うとき、プラン名とタグは表示の補助なので握りつぶして続行し、投稿一覧と投稿詳細は `ApiShapeError` で中断する (空配列に落とすと「本当に 0 件」と区別が付かず、中身のない ZIP を完了として出してしまうため)
+- **失敗の扱いはエラー型で決まる。** 投稿単位・ページ単位の失敗として数えて続行してよいのは `HttpError` (2xx 以外の応答) だけで、それ以外を握りつぶすと実装上のバグまで通信障害として数えたまま収集が続く
+  - 再試行枠の枯渇 (`RateLimitExhaustedError` / `TransportExhaustedError`) は収集全体を止める。上限まで待った直後に別のエンドポイントへ要求を出すのは、再試行上限を実質的に延長することになるため、プラン名・タグの取得中でも握りつぶさない。それまでに取り込めた投稿があれば `stoppedReason` (`rate-limit-exhausted` / `transport-exhausted`) を付けて部分保存し、1 件も無ければ例外として扱う
+  - 安全に取り込めない仕様変更 (`ApiShapeError` / `ResponseParseError` / `PostBodyInvalidError`) は「未対応のレスポンス形式のため中断しました」で止める。判定は `overlay.ts` の `isUnsupportedResponseError` が SoT
+  - 例外は `plan.listCreator` と `tag.getFeatured` の 2 つだけで、形状の不一致は握りつぶして続行する。表示の補助しか担っておらず、握りつぶしても ZIP の中身は欠けないため (枯渇は例外扱いせず再送出する)
 - 取得できなかった投稿は失敗件数として報告する。投稿一覧ページの失敗は欠落した投稿数が不明なので、投稿単位の件数とは分けて数える
 - `post.listCreator` の一覧レスポンスには本文が含まれないため、各投稿は `post.info` への追加リクエストを経て収集される
 

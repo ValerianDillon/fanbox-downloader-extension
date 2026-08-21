@@ -1,6 +1,6 @@
 import type { DownloadProgress, FileSystemFileHandle } from './downloader';
 import { downloadAsZip, pickSaveHandle } from './downloader';
-import { ApiShapeError, type PageType } from './fanbox/api';
+import { ApiShapeError, type PageType, ResponseParseError } from './fanbox/api';
 import type { CollectorSettings, PostFailureCounts } from './fanbox/collector';
 import { collect, PostBodyInvalidError } from './fanbox/collector';
 import css from './overlay.css' with { type: 'text' };
@@ -34,6 +34,7 @@ export const PARTIAL_FILE_FAILURE_HEADLINE = '一部取得できませんでし�
 
 /** 収集フェーズがレート制限で打ち切られた場合の完了画面の見出し */
 export const RATE_LIMIT_EXHAUSTED_HEADLINE = 'レート制限のため途中で打ち切りました (取得できた分のみ保存しています)';
+export const TRANSPORT_EXHAUSTED_HEADLINE = '通信に失敗したため途中で打ち切りました (取得できた分のみ保存しています)';
 
 /**
  * addByPostInfo が 'added' を返した投稿が 0 件だった場合の完了画面の見出し (Issue #14)。
@@ -48,13 +49,29 @@ export const RATE_LIMIT_EXHAUSTED_HEADLINE = 'レート制限のため途中で�
 export const NOTHING_SAVED_HEADLINE = '保存できる投稿がなかったため ZIP を保存しませんでした';
 
 /**
- * 収集が「未対応のレスポンス形式」(ApiShapeError または PostBodyInvalidError) で
- * 中断した場合の完了画面の見出し (Issue #14)。
+ * 収集が「未対応のレスポンス形式」(ApiShapeError / ResponseParseError または
+ * PostBodyInvalidError) で中断した場合の完了画面の見出し (Issue #14)。
  *
  * この場合 collect() が例外を投げるため CompleteMessageParams を経由せず、
  * OverlayController.startCollecting の catch から直接この見出しで complete 状態に遷移する。
  */
 export const UNSUPPORTED_RESPONSE_HEADLINE = '未対応のレスポンス形式のため中断しました';
+
+/**
+ * 収集を止めた例外が「未対応のレスポンス形式」かを判定する。
+ *
+ * ApiShapeError は API 層のレスポンス形状違反、ResponseParseError は同じく API 層の
+ * 本文を JSON として読めなかったケース、PostBodyInvalidError はライブラリ層
+ * (addByPostInfo が読む本文フィールドの不一致) で、どれも「このバージョンでは安全に
+ * 取り込めない仕様変更」を意味するため同じ見出しで扱う。
+ *
+ * 判定を関数に切り出しているのは、この分岐が OverlayController の catch の中にあり
+ * DOM 無しでは検証できないため。収集の失敗のうちどれを仕様変更として扱うかは
+ * 見出しの分岐そのものなので、純粋関数として固定する。
+ */
+export function isUnsupportedResponseError(e: unknown): boolean {
+  return e instanceof ApiShapeError || e instanceof ResponseParseError || e instanceof PostBodyInvalidError;
+}
 
 export type CompleteMessageParams = {
   /** 「ここまでで終了」による中断か (content script 側の AbortSignal 由来) */
@@ -70,8 +87,8 @@ export type CompleteMessageParams = {
   failedPageCount: number;
   /** ZIP フェーズでの対象単位の最終失敗数。カバー画像含み、中断由来は含まない (DownloadZipResult.failedFileCount) */
   failedFileCount: number;
-  /** 収集フェーズがレート制限で打ち切られた場合に 'rate-limit-exhausted' */
-  stoppedReason?: 'rate-limit-exhausted';
+  /** 収集フェーズが再試行の上限で打ち切られた場合、その理由 */
+  stoppedReason?: 'rate-limit-exhausted' | 'transport-exhausted';
 };
 
 /**
@@ -125,7 +142,7 @@ function buildFailureLines(params: CompleteMessageParams): string[] {
  * 1. addedPostCount === 0: NOTHING_SAVED_HEADLINE。ZIP を保存していない事実が最優先
  *    (addedPostCount === 0 かつ stoppedReason が同時に立つことは無い — collector.ts が
  *    その場合は打ち切りに変換せず例外にするため。念のため他の分岐より先に判定する)
- * 2. 収集フェーズの打ち切り (stoppedReason === 'rate-limit-exhausted'): RATE_LIMIT_EXHAUSTED_HEADLINE。
+ * 2. 収集フェーズの打ち切り (stoppedReason あり): 原因に応じた打ち切りの見出し。
  *    aborted かどうかに関わらず最優先 (非中断時と同じ見出し)。ZIP フェーズも中断していた場合は、
  *    その事実 (PARTIAL_DOWNLOAD_MESSAGE) を本文で併記する
  * 3. 単純な中断 (収集フェーズは打ち切りなく完了、ZIP フェーズのみ「ここまでで終了」): PARTIAL_DOWNLOAD_MESSAGE
@@ -145,9 +162,12 @@ export function buildCompleteMessage(params: CompleteMessageParams): string {
   if (params.addedPostCount === 0) {
     return `${NOTHING_SAVED_HEADLINE}${failedSuffix}`;
   }
-  if (params.stoppedReason === 'rate-limit-exhausted') {
+  if (params.stoppedReason) {
     const abortedNote = params.aborted ? `\n${PARTIAL_DOWNLOAD_MESSAGE}` : '';
-    return `${RATE_LIMIT_EXHAUSTED_HEADLINE}${abortedNote}${failedSuffix}`;
+    // 原因で文言を分ける。レート制限なら時間を置けばよいが、通信の失敗は環境側を確認する必要がある
+    const headline =
+      params.stoppedReason === 'rate-limit-exhausted' ? RATE_LIMIT_EXHAUSTED_HEADLINE : TRANSPORT_EXHAUSTED_HEADLINE;
+    return `${headline}${abortedNote}${failedSuffix}`;
   }
   if (params.aborted) {
     return `${PARTIAL_DOWNLOAD_MESSAGE}${failedSuffix}`;
@@ -566,11 +586,8 @@ export class OverlayController {
         this.renderComplete(`エラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);
         return;
       }
-      if (e instanceof ApiShapeError || e instanceof PostBodyInvalidError) {
-        // 未対応のレスポンス形式による中断 (Issue #14)。ApiShapeError は API 層
-        // (fetchJson のレスポンス形状違反)、PostBodyInvalidError はライブラリ層
-        // (addByPostInfo が読む本文フィールドの不一致) だが、どちらも「このバージョンでは
-        // 安全に取り込めない仕様変更」を意味するため同じ見出しで扱う。
+      if (isUnsupportedResponseError(e)) {
+        // 未対応のレスポンス形式による中断 (Issue #14。内訳は isUnsupportedResponseError 参照)。
         // collect() が投稿を 1 件も返さないまま例外を投げるため、downloadAsZip は
         // 呼ばれておらず ZIP は保存されていない (NOTHING_SAVED_HEADLINE と同じ理由で、
         // showSaveFilePicker が作成済みの 0 バイトファイルはそのまま残る)。
