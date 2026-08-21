@@ -32,9 +32,11 @@ const validTransitions: Record<OverlayState, OverlayState[]> = {
   // collecting → complete (downloading を経由しない) は startCollecting (src/content/overlay.ts)
   // の次の 3 箇所が使う。詳細は下の describe ブロックのコメントを参照。
   // 1. collect() が正常に返り、addedPostCount === 0 (Issue #14: 保存できる投稿が無い)
-  // 2. collect() が ApiShapeError / PostBodyInvalidError を投げる (Issue #14: 未対応のレスポンス形式)
+  // 2. collect() が ApiShapeError / ResponseParseError / PostBodyInvalidError を投げる
+  //    (Issue #14: 未対応のレスポンス形式。判定は isUnsupportedResponseError)
   // 3. collect() がそれ以外の例外を投げる (例: addedPostCount === 0 のまま枯渇した
-  //    RateLimitExhaustedError、または想定外のバグ) — catch の汎用フォールバックに落ちる
+  //    RateLimitExhaustedError / TransportExhaustedError、または想定外のバグ) —
+  //    catch の汎用フォールバックに落ちる
   collecting: ['downloading', 'settings', 'complete'],
   downloading: ['complete', 'settings'],
   complete: ['settings'],

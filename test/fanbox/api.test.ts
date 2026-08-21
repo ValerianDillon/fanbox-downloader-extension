@@ -591,6 +591,16 @@ describe('レスポンスのアンラップ', () => {
     expect(await api.fetchTags('c')).toEqual([]);
   });
 
+  test('fetchPlans / fetchTags は本文を JSON として読めなくても空配列を返す', async () => {
+    // 形状の不一致 (ApiShapeError) と同じ理由で握りつぶす。この 2 つは表示の補助しか
+    // 担っておらず、握りつぶしても ZIP の中身は欠けない。投稿一覧・投稿詳細では
+    // 同じ ResponseParseError で収集を止める (経路ごとに扱いが違うので個別に固定する)
+    nextResponse = { ok: true, status: 200, retryAfter: null, body: '{ broken' };
+    expect(await api.fetchPlans('c')).toEqual([]);
+    nextResponse = { ok: true, status: 200, retryAfter: null, body: '{ broken' };
+    expect(await api.fetchTags('c')).toEqual([]);
+  });
+
   // プラン名・タグは表示の補助なので、通信/HTTP の失敗 (HttpError) も
   // 形状不一致 (ApiShapeError) と同様に握りつぶして続行してよい
   // (CLAUDE.md 「プラン名とタグは表示の補助なので握りつぶして続行し」の方針)

@@ -136,11 +136,11 @@ describe('collect', () => {
     await expect(collectCreator()).rejects.toThrow(/形状が想定外/);
   });
 
-  test('ページ URL 一覧の取得中の想定外の例外 (FetchApiError 以外) は汎用エラーに丸めず元のまま伝播する', async () => {
+  test('ページ URL 一覧の取得中の想定外の例外 (HttpError 以外) は汎用エラーに丸めず元のまま伝播する', async () => {
     // service worker からの応答オブジェクト自体が壊れている (undefined) ケースを模擬する。
     // fetchJson 内部で response.backoffUntil の参照時に TypeError が起きる
     // (test/fanbox/api.test.ts の「想定外の例外」テストと同じ技法)。TypeError は
-    // FetchApiError ではないので、「投稿一覧の取得に失敗しました」という汎用エラーに
+    // HttpError ではないので、「投稿一覧の取得に失敗しました」という汎用エラーに
     // 丸めず、型・メッセージ・スタックを保ったまま伝播すべき
     mockApi({
       ...BASE_RESPONSES,
@@ -279,6 +279,35 @@ describe('collect', () => {
       expect(infoCalls).toBe(3);
       expect(result.addedPostCount).toBe(1);
       expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(1);
+    } finally {
+      restoreTimers();
+    }
+  });
+
+  test('2 ページ目で枯渇しても 1 ページ目までに集めた投稿は捨てない', async () => {
+    // 一覧ページの境界での枯渇は、投稿詳細での枯渇とは別の分岐 (fetchPostList の catch) を通る。
+    // ここで集計を返さずに throw すると、2 ページ目の枯渇で 1 ページ目の取得結果ごと失われる
+    const secondPageUrl = `https://api.fanbox.cc/post.listCreator?creatorId=${CREATOR_ID}&cursor=2`;
+    const restoreTimers = installImmediateTimers();
+    try {
+      for (const [reason, failure] of [
+        ['rate-limit-exhausted', { ok: false, status: 429, retryAfter: '0' }],
+        ['transport-exhausted', { ok: false, status: 0, retryAfter: null }],
+      ] as const) {
+        mockApi({
+          ...BASE_RESPONSES,
+          [`https://api.fanbox.cc/post.paginateCreator?creatorId=${CREATOR_ID}`]: {
+            body: { pageUrls: [LIST_PAGE_URL, secondPageUrl] },
+          },
+          [POST_INFO_URL]: { body: { post: POST_FULL } },
+          [secondPageUrl]: () => failure,
+        });
+
+        const result = await collectCreator();
+        expect(result.stoppedReason).toBe(reason);
+        expect(result.addedPostCount).toBe(1);
+        expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(1);
+      }
     } finally {
       restoreTimers();
     }
