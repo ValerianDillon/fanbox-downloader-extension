@@ -185,8 +185,9 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
     expect(result).toEqual({ id: '2', type: 'image', isRestricted: false } as never);
     expect(calls).toHaveLength(2);
     // 秒数形式と同じく、HTTP-date を読めたことは待機時間でしか確かめられない。
-    // toUTCString() は秒未満を切り捨てるので、待機は 3 秒ちょうどではなく (2秒, 3秒] に入る
-    expect(virtualWaitMs).toBeGreaterThan(2_000);
+    // toUTCString() は秒未満を切り捨て、さらに生成から解析までの実経過ぶんも引かれるので、
+    // 待機は 3 秒ちょうどにはならず [2秒, 3秒] に入る。固定バックオフ (5 秒) との区別は上限が担う
+    expect(virtualWaitMs).toBeGreaterThanOrEqual(2_000);
     expect(virtualWaitMs).toBeLessThanOrEqual(3_000);
   });
 
