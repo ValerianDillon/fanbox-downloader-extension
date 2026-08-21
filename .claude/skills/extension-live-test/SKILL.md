@@ -1,6 +1,6 @@
 ---
 name: extension-live-test
-description: 実 FANBOX (https://www.fanbox.cc/) を相手に拡張を実ブラウザで動かし、chrome-devtools MCP から操作して実機テストを行う。fixture ベースの smoke test (e2e/) では検証できない実サイトでの挙動を確認したいときに使う。「実機テスト」「実ブラウザ」「live test」「FANBOX で実際に動かす」「本番相当で確認」といった依頼で使用する。
+description: 実 FANBOX (https://www.fanbox.cc/) を相手に拡張を実ブラウザで動かし、chrome-devtools MCP から操作して実機テストを行う。fixture ベースの smoke test (e2e/) では検証できない実サイトでの挙動を確認したいときに使う。「実機テスト」「実ブラウザ」「live test」「FANBOX で実際に動かす」「本番相当で確認」といった依頼で使用する。拡張がブラウザに蓄積した観測記録 (`chrome.storage.local` の `fbdlMediaAttempts`、メディア取得の試行記録) を読み出す・集計する・消す手順もここにある。「試行記録を見たい」「429 が出ているか確認したい」「fbdlMediaAttempts」といった依頼でも使用する (実機実行を伴わなくてよい)。
 ---
 
 # 拡張の実機テスト (実 FANBOX)
@@ -100,7 +100,10 @@ headless Chromium は UA が `HeadlessChrome/...` になり、Cloudflare のボ�
 ## メディア取得の試行記録を読む (Issue #51 の観測)
 
 ZIP フェーズの取得試行は `chrome.storage.local` の `fbdlMediaAttempts` に蓄積される (ホスト / ステータス / `Retry-After` / 種別 / 時刻、上限 2000 件)。
-実機実行の後に取り出して、`downloads.fanbox.cc` や `*.pximg.net` で 429 が出ているかを見る。
+`downloads.fanbox.cc` や `*.pximg.net` で 429 が出ているかを見るための観測データで、実機実行の直後だけでなく日常利用で貯まったぶんも同じ場所にある。
+
+読み出す先は 2 つある。**日常利用のブラウザ**なら `chrome://extensions` から拡張の「Service Worker」の devtools を開き、下の式をコンソールで実行する。
+**実機テスト用プロファイル** (このランチャーで起動した方) なら、下のコマンドで同じ式を service worker に送る (この節のためだけにランチャーを起動してもよい。ページ操作は不要)。
 
 ```
 bun scripts/live-cdp-eval.ts sw "chrome.storage.local.get('fbdlMediaAttempts')"
@@ -114,7 +117,7 @@ bun scripts/live-cdp-eval.ts sw "(async()=>{const r=await chrome.storage.local.g
 
 記録を消すときは `chrome.storage.local.remove('fbdlMediaAttempts')`。
 
-日常利用のブラウザ (実機テスト用プロファイルではない方) で貯めた記録を見る場合は、`chrome://extensions` の拡張の「Service Worker」から devtools を開き、同じ式をコンソールで実行する。
+記録は蓄積先も内容も拡張の実装 (`src/content/media-attempt-log.ts`) 側の契約なので、何を保存しているか・なぜそこに置くかは CLAUDE.md を参照する。
 
 ## 実機では再現できない経路 (バックオフ待機)
 
