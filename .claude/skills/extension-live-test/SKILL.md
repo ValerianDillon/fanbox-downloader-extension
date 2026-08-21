@@ -97,6 +97,17 @@ headless Chromium は UA が `HeadlessChrome/...` になり、Cloudflare のボ�
 
 ページ origin からの見え方を確認したいときは `page` ターゲットを使う: `bun scripts/live-cdp-eval.ts page '<expression>'`。第 1 引数が対象ターゲットで、`page` は `type === 'page'` の先頭、`sw` は service worker を選ぶ。
 
+## 実機では再現できない経路 (バックオフ待機)
+
+service worker のバックオフ期限は `BackoffStore` のメモリキャッシュ越しに読まれ、キャッシュが未設定のときだけ `chrome.storage.session` を読む (`src/service-worker/backoff-store.ts` の `getLocked`)。
+一度でも `fetchApi` を処理した service worker はキャッシュを持つため、**外から `chrome.storage.session` に期限を書いても反映されない**。
+書き込み自体は成功し、収集も待機せず完走するので、「バックオフが効いていない」という誤った観測に見える。
+
+回避策も無い。`chrome.runtime.reload()` で service worker を作り直すと、開いているタブへ content script が再注入されず FAB が出なくなる (ページをリロードしても戻らない)。
+キャッシュに載せる経路は実際に 429 を受けることだけで、それは実サービスへの濫用にあたるので行わない。
+
+したがって `deferred` (期限中は発行しない) の検証は実機テストの対象外とし、`test/rate-limit-lifecycle.test.ts` が実物の `handleFetchApi` / `BackoffStore` を fake storage 越しに通して担う。
+
 ## 生成した ZIP を実データで検証する
 
 テストビルドは `showSaveFilePicker` を stub し、生成した ZIP を base64 で `data-fbdl-zip-b64` に publish する。実データの ZIP を検証したいときはこれを取り出す。
