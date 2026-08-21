@@ -83,8 +83,9 @@ type ApiFetchResponse = {
 
 /**
  * service worker 経由で JSON API を叩く。
- * content script から直接 fetch するとページオリジンとして扱われ、
- * 429 のような CORS ヘッダ無しレスポンスを JS から読めないため。
+ * content script から直接 fetch するとページオリジンとして扱われ、読めるヘッダが CORS の
+ * セーフリストに限られる。`Retry-After` はセーフリスト外なので、429 を受けてもサーバーの
+ * 指示を読めない (ValerianDillon/fanbox-downloader#3 の 2026-08-20 の実測)。
  */
 async function proxyFetchApi(url: string, signal?: AbortSignal): Promise<ApiFetchResponse> {
   return sendMessageAbortable<ApiFetchResponse>({ type: 'fetchApi', url }, signal);

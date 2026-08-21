@@ -12,9 +12,12 @@ chrome.runtime.onInstalled.addListener(() => {
  *
  * Manifest V3 では content script の fetch はページのオリジンとして扱われるため、
  * - downloads.fanbox.cc / *.pximg.net への fetch は CORS でブロックされる
- * - api.fanbox.cc の 429 レスポンスは CORS ヘッダが無く、JS が status / Retry-After を読めない
+ * - api.fanbox.cc の応答は読めるヘッダが CORS のセーフリストに限られ、セーフリスト外の
+ *   `Retry-After` を読めない (429 を受けてもサーバーの指示に従えない)
  *
  * service worker は拡張のオリジンで動作し host_permissions が適用されるため、これらを回避できる。
+ * ページ origin からもステータス自体は読める応答があることは実測済みで、読めないのはヘッダである
+ * (ValerianDillon/fanbox-downloader#3 の 2026-08-20 の実測。エッジ生成 429 の扱いは未確認)。
  *
  * fetchApi の実処理は ./handlers.ts に、メディア取得 (Port による分割転送) の実処理は
  * ./media-stream.ts に切り出している (chrome.* への配線とロジックを分け、後者をユニットテストから
