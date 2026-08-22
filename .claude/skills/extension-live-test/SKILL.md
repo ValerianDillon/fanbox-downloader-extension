@@ -29,7 +29,7 @@ description: 実 FANBOX (https://www.fanbox.cc/) を相手に拡張を実ブラ�
 3. chrome-devtools MCP のツールで操作する
    - MCP が `http://127.0.0.1:9222` に未接続の場合は、ランチャーが起動中であることを確認した上で MCP 側を再接続する (「MCP 接続確認」参照)
    - 収集対象は 1〜2 投稿など最小限に絞る (「安全上の注意」参照)
-4. 終了する: ランチャーのプロセスに SIGINT または SIGTERM を送る (`kill <pid>`)。`context.close()` が実行されプロファイルに状態が保存されてから終了する
+4. 終了する: ランチャーのプロセスに SIGINT または SIGTERM を送る (`pgrep -af "[l]ive-browser.ts"` で PID を確認してから `kill <pid>`)。`context.close()` が実行されプロファイルに状態が保存されてから終了する
    - 終了後、`curl -s http://127.0.0.1:9222/json/version` が応答しなくなることで停止を確認できる
 
 ## 拡張の操作レシピ
@@ -51,8 +51,8 @@ description: 実 FANBOX (https://www.fanbox.cc/) を相手に拡張を実ブラ�
 ## 診断 (CDP が応答しない・操作できない場合)
 
 - ランチャーが `dist/ が見つかりません` と出力して終了した → `bun run build` を先に実行する (自動ビルドはしない設計)
-- `--remote-debugging-port` のポートが既に使用中 (bind エラー) → 前回のランチャーが残っていないか `pgrep -af live-browser.ts` で確認し、残っていれば SIGTERM で止める。無関係なプロセスが占有している場合は勝手に kill せず、「ポートを変更する場合」(下記 MCP 接続確認の節) に従って別ポートで起動する
-- 同じ `--profile` を指す別プロセスが起動している → Chrome の profile ロックにより起動に失敗することがある。`pgrep -af live-browser.ts` で他のプロセスが同じ profile を使っていないか確認してから再起動する
+- `--remote-debugging-port` のポートが既に使用中 (bind エラー) → 前回のランチャーが残っていないか `pgrep -af "[l]ive-browser.ts"` で確認し (ブラケットを外すと呼び出し元のシェル自身の argv にマッチして偽陽性になる)、残っていれば SIGTERM で止める。無関係なプロセスが占有している場合は勝手に kill せず、「ポートを変更する場合」(下記 MCP 接続確認の節) に従って別ポートで起動する
+- 同じ `--profile` を指す別プロセスが起動している → Chrome の profile ロックにより起動に失敗することがある。`pgrep -af "[l]ive-browser.ts"` で他のプロセスが同じ profile を使っていないか確認してから再起動する
 - メディア取得だけが全件 `status 0` で失敗し、ページ console に `Unchecked runtime.lastError: Could not establish connection. Receiving end does not exist.` が並ぶ → 旧版の service worker がキャッシュされて起きる症状。ランチャーが起動時に `Default/Service Worker` を自動削除するため通常は起きない。`--keep-sw-cache` を付けた場合のみ発生し得るので、その場合は手動で削除して再起動する。確認は `bun scripts/live-cdp-eval.ts sw 'chrome.runtime.onConnect.hasListeners()'` (新版なら `true`)
 - CDP (`/json/version`) には応答するが拡張が見当たらない → `curl -s http://127.0.0.1:<port>/json/list` を見て `"type": "service_worker"` のエントリ (`chrome-extension://.../service-worker.js`) があるか確認する。無ければ拡張の読み込み自体に失敗しているので `dist/` の中身 (`manifest.json` の有無など) を確認する
 
