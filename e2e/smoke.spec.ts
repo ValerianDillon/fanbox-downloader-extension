@@ -1,6 +1,7 @@
 import { rm } from 'node:fs/promises';
 import { expect, test } from '@playwright/test';
 import {
+  CREATOR_ID,
   EXPECTED_FETCHED_URLS,
   EXPECTED_ZIP_ENTRIES,
   LIST_PAGE_RESPONSE,
@@ -83,6 +84,41 @@ test('FANBOX creator ページ: 収集から ZIP 生成まで完走する', asyn
     const parsed = parseZip(zipBytes);
     const entryNames = [...parsed.entries.map((e) => e.name)].sort();
     expect(entryNames).toEqual(EXPECTED_ZIP_ENTRIES);
+
+    // Issue #56: 収集と ZIP の結果が実際に履歴として書かれるところまでを見る。
+    // 差分の組み立て (test/history-update.ts) と送信の判断 (test/overlay.test.ts) を
+    // 個別に固定しても、overlay からの呼び出しを消した退行は検出できない。
+    // service worker 側の storage を直接読むことで、収集 → overlay → service worker →
+    // storage の配線全体を一度に確かめる
+    const history = await session.serviceWorker.evaluate(async (creatorId: string) => {
+      const key = `fbdlHistory:${creatorId}`;
+      const stored = await chrome.storage.local.get(key);
+      const record = stored[key] as
+        | { catalog?: unknown[]; saved?: { assets?: { outcome?: string }[] }[]; scan?: { completedFullScan?: boolean } }
+        | undefined;
+      return {
+        catalogCount: record?.catalog?.length ?? 0,
+        savedCount: record?.saved?.length ?? 0,
+        writtenCount:
+          record?.saved?.reduce(
+            (total, post) => total + (post.assets ?? []).filter((asset) => asset.outcome === 'written').length,
+            0,
+          ) ?? 0,
+        completedFullScan: record?.scan?.completedFullScan ?? null,
+      };
+    }, CREATOR_ID);
+
+    expect(history).toEqual({
+      catalogCount: 2,
+      savedCount: 2,
+      // 取得系のエントリ (カバー + 本文アセット) の数。投稿ディレクトリ直下の生成物
+      // (index.html / info.json / info.txt) とルートの固定ファイルは含めない
+      writtenCount: EXPECTED_ZIP_ENTRIES.filter(
+        (name) =>
+          name.split('/').length === 3 && !name.endsWith('/') && !/\/(index\.html|info\.json|info\.txt)$/.test(name),
+      ).length,
+      completedFullScan: true,
+    });
   } finally {
     await context.close();
     await rm(userDataDir, { recursive: true, force: true });

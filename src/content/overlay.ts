@@ -421,6 +421,15 @@ export class OverlayController {
    */
   private readonly deletingCreators = new Set<string>();
   /**
+   * 進行中の履歴の読み込み。収集を始める前にこれを待つ。
+   *
+   * 待たずに始めると、読み込みが終わる前に押された収集が履歴なしで走る。差分にならないだけでなく
+   * **凍結名も使われない**ので、タイトルやアセット名が変わっていれば archive 名が付け替わる。
+   */
+  private historyLoad: Promise<void> = Promise.resolve();
+  /** 履歴を一度でも読み終えたか。設定画面の表示を「確認中」と分けるために持つ */
+  private historyLoaded = false;
+  /**
    * 収集フェーズ用と ZIP フェーズ用で AbortController を分ける (Issue #55)。
    *
    * 選択の確定を待つ区間 (review) を 1 つの controller で覆うと、「キャンセル」の意味が
@@ -508,6 +517,7 @@ export class OverlayController {
     // 残すと別の creator の保存実績を根拠に post.info を省きうる (Issue #56)
     if (pageType?.creatorId !== this.pageType?.creatorId) {
       this.history = null;
+      this.historyLoaded = false;
       this.historyGeneration++;
     }
     this.pageType = pageType;
@@ -518,7 +528,7 @@ export class OverlayController {
     this.renderPanel();
     // 履歴の読み出しは storage への往復なので、画面を出してから追いつかせる。
     // 待ってから描画すると、パネルが開くまでに間が空く
-    void this.loadHistory();
+    this.historyLoad = this.loadHistory();
   }
 
   /**
@@ -529,7 +539,11 @@ export class OverlayController {
    */
   private async loadHistory() {
     const creatorId = this.pageType?.creatorId;
-    if (creatorId === undefined) return;
+    if (creatorId === undefined) {
+      this.historyLoaded = true;
+      return;
+    }
+    this.historyLoaded = false;
     const generation = ++this.historyGeneration;
     const history = await readCreatorHistory(creatorId);
     // 世代だけでなく creator も突き合わせる。世代を上げずに creator が戻ってくる経路
@@ -538,6 +552,7 @@ export class OverlayController {
     // 削除の応答を待っている間に読んだ値は、消える前の storage のものである
     if (this.deletingCreators.has(creatorId)) return;
     this.history = history;
+    this.historyLoaded = true;
     if (this.state === 'settings') this.renderHistoryRow();
   }
 
@@ -691,6 +706,10 @@ export class OverlayController {
     const row = this.shadowRoot.getElementById('history-row');
     if (!row) return;
     row.innerHTML = '';
+    if (!this.historyLoaded) {
+      row.textContent = '前回保存済みの記録を確認中...';
+      return;
+    }
     const savedCount = this.history?.saved.length ?? 0;
     if (savedCount === 0) {
       row.textContent = '前回保存済みの記録はありません (全件を取得します)';
@@ -747,9 +766,15 @@ export class OverlayController {
     // 削除を待つ間に別の creator へ移っていたら、こちらの状態には触らない
     if (this.pageType?.creatorId !== creatorId) return;
     if (!response.ok) {
-      // 消せていないので元に戻す。戻さないと、履歴があるのに全件取得になる。
-      // 世代が進んでいれば、そちらの読み込みが正しい値を入れるので戻さない
-      if (this.historyGeneration === generation) this.history = previous;
+      if (this.historyGeneration === generation) {
+        // 消せていないので元に戻す。戻さないと、履歴があるのに全件取得になる
+        this.history = previous;
+      } else {
+        // 世代が進んでいる = この削除の間に読み込みが走っており、その結果は
+        // `deletingCreators` で捨てられている。放っておくと storage には履歴があるのに
+        // 画面もメモリも「履歴なし」のままになるので、読み直す
+        this.historyLoad = this.loadHistory();
+      }
       if (this.state === 'settings') {
         button.disabled = false;
         button.textContent = `削除できません: ${response.error ?? '不明な理由'}`;
@@ -1260,6 +1285,11 @@ export class OverlayController {
     this.guardUnload();
 
     try {
+      // 履歴の読み込みが終わるまで待つ。待たずに始めると、履歴なしで収集が走って
+      // 凍結名が使われず archive 名が付け替わる。保存先の確保は review の確定時なので、
+      // ここで待ってもユーザアクティベーションは失効しない
+      await this.historyLoad;
+      if (!this.isCurrentCollect(signal)) return;
       const creatorId = this.pageType.creatorId;
       const postId = this.pageType.type === 'post' ? this.pageType.postId : undefined;
 
@@ -1418,13 +1448,10 @@ export class OverlayController {
       );
       // 履歴の記録は現行かの判定より前に行う。ZIP を書けたという事実は、その実行が
       // 今の画面のものかどうかに依らない (Issue #56)
-      const historyError = await recordHistory(
-        ctx,
-        prepared.manifest,
-        zip,
-        zipNameOf(saveHandle, ctx.creatorId),
-        signal,
-      );
+      const saveError = await recordHistory(ctx, prepared.manifest, zip, zipNameOf(saveHandle, ctx.creatorId), signal);
+      // 収集時の観測の失敗も併せて出す。どちらが落ちても次回は差分にならないので、
+      // 保存実績が書けたことだけを見て「記録は正常」と読ませない
+      const historyError = ctx.observationError ?? saveError;
       // 状態を触る前に現行の実行かを見る。旧実行の遅延解決が新実行の画面と観測状態を
       // 上書きするのを防ぐ (中断してすぐ再実行したときに起こりうる)
       if (this.downloadRunId !== runId || !this.isCurrentDownload(signal)) return;
