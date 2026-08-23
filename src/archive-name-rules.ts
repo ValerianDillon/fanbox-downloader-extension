@@ -77,3 +77,23 @@ export function describeUnusableSegment(name: string): string | null {
  * 共有層が対象を増やしたらそこが落ちる。
  */
 const ENCODED_BY_SHARED_LAYER = /[/\\,:*"<>|]/;
+
+/**
+ * 名前が同じパスとして扱われるかを比べるための正規化。
+ *
+ * Windows と既定の macOS は大文字小文字を区別せず、Windows は末尾の空白とピリオドを取り除いて
+ * 解釈する。完全一致だけで比べると、`a.bin` と `A.BIN` を別の名前として通してしまい、
+ * 展開時に一方が上書きされる。共有層が予約名の比較に使っているのと同じ畳み方である。
+ *
+ * allocator の重複検査と履歴の復号が同じ畳み方を使う。食い違うと、復号を通った凍結名の組が
+ * allocator で衝突と判定され、次のダウンロードごと止まる。
+ * @param name 比較する名前
+ */
+export function toCollisionKey(name: string): string {
+  // 合成済みへ寄せる。macOS の APFS は正規化を区別しないので、'é' と 'e\u0301' は
+  // 同じディレクトリに共存できない
+  return name
+    .normalize('NFC')
+    .replace(/[ .]+$/u, '')
+    .toLowerCase();
+}

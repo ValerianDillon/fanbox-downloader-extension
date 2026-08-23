@@ -155,7 +155,9 @@ describe('履歴のマージ', () => {
 
   test('revision が変わった保存実績は投稿ごと置換する (編集前のアセットを編集後の投稿へ持ち越さないため)。', () => {
     const existing = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written')], { revision: 'revision-old' });
-    const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written')], { revision: 'revision-new' });
+    const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 300)], {
+      revision: 'revision-new',
+    });
     const current = mergeCreatorHistory(null, makeUpdate({ saved: [existing] }));
 
     const result = mergeCreatorHistory(current, makeUpdate({ saved: [updated] }));
@@ -165,7 +167,9 @@ describe('履歴のマージ', () => {
 
   test('archiveFormatVersion が変わった保存実績は投稿ごと置換する (旧形式の ZIP の実績を新形式へ持ち越さないため)。', () => {
     const existing = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written')], { archiveFormatVersion: 1 });
-    const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written')], { archiveFormatVersion: 2 });
+    const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 300)], {
+      archiveFormatVersion: 2,
+    });
     const current = mergeCreatorHistory(null, makeUpdate({ saved: [existing] }));
 
     const result = mergeCreatorHistory(current, makeUpdate({ saved: [updated] }));
@@ -255,7 +259,9 @@ describe('履歴のマージ', () => {
 
   test('archiveDirectory が変わった保存実績は投稿ごと置換する (別のディレクトリへ書いた ZIP の実績を混ぜないため)。', () => {
     const existing = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written')], { archiveDirectory: 'dir-a' });
-    const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written')], { archiveDirectory: 'dir-b' });
+    const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 300)], {
+      archiveDirectory: 'dir-b',
+    });
     const current = mergeCreatorHistory(null, makeUpdate({ saved: [existing] }));
 
     const result = mergeCreatorHistory(current, makeUpdate({ saved: [updated] }));
@@ -305,6 +311,54 @@ describe('履歴のマージ', () => {
     const result = mergeCreatorHistory(current, makeUpdate({ catalog: [reversed] }));
 
     expect(result.catalog[0].complete).toBe(true);
+  });
+
+  test('衝突で complete を false にした後に同じ差分を再送しても true に戻らない (応答を受け取れず再送しただけで欠けたカタログを完全と扱わないため)。', () => {
+    const withA = makeCatalogPost('post-1', [makeHistoryAsset('asset-a')], 100);
+    const withB = makeCatalogPost('post-1', [makeHistoryAsset('asset-b')], 100);
+    const conflicted = mergeCreatorHistory(
+      mergeCreatorHistory(null, makeUpdate({ catalog: [withA] })),
+      makeUpdate({ catalog: [withB] }),
+    );
+
+    const resent = mergeCreatorHistory(conflicted, makeUpdate({ catalog: [withB] }));
+
+    expect([conflicted.catalog[0].complete, resent.catalog[0].complete]).toEqual([false, false]);
+  });
+
+  test('世代が違い savedAt が同値なら後から適用した差分で置き換えない (到着順で保存実績が入れ替わらないようにするため)。', () => {
+    const first = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'written', 100)], { revision: 'r1' });
+    const second = makeSavedPost('post-1', [makeSavedAsset('asset-2', 'written', 100)], { revision: 'r2' });
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [first] }));
+
+    const afterSecond = mergeCreatorHistory(current, makeUpdate({ saved: [second] }));
+    const resent = mergeCreatorHistory(afterSecond, makeUpdate({ saved: [first] }));
+
+    expect([afterSecond.saved, resent.saved]).toEqual([[first], [first]]);
+  });
+
+  test('大文字小文字だけが違う凍結名の組は例外にする (allocator が衝突と判定して次のダウンロードごと止まるのを防ぐため)。', () => {
+    const post = makeSavedPost('post-1', [
+      { ...makeSavedAsset('asset-1', 'written'), archiveName: 'same.png' },
+      { ...makeSavedAsset('asset-2', 'written'), archiveName: 'SAME.PNG' },
+    ]);
+
+    expect(() => mergeCreatorHistory(null, makeUpdate({ saved: [post] }))).toThrow();
+  });
+
+  test('別々の差分がマージされて初めて衝突する凍結名も例外にする (更新のたびに組全体を確かめないと衝突を作れるため)。', () => {
+    const first = makeSavedPost('post-1', [{ ...makeSavedAsset('asset-1', 'written'), archiveName: 'same.png' }]);
+    const second = makeSavedPost('post-1', [{ ...makeSavedAsset('asset-2', 'written'), archiveName: 'SAME.PNG' }]);
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [first] }));
+
+    expect(() => mergeCreatorHistory(current, makeUpdate({ saved: [second] }))).toThrow();
+  });
+
+  test('大文字小文字だけが違う投稿ディレクトリの組も例外にする (展開時に一方が他方を上書きするため)。', () => {
+    const first = makeSavedPost('post-1', [], { archiveDirectory: 'same' });
+    const second = makeSavedPost('post-2', [], { archiveDirectory: 'SAME' });
+
+    expect(() => mergeCreatorHistory(null, makeUpdate({ saved: [first, second] }))).toThrow();
   });
 
   test('世代の違う保存実績は新しい方だけを残す (遅れて届いた古い差分で新しい世代の実績を消さないため)。', () => {
@@ -526,6 +580,32 @@ describe('履歴レコードの復号', () => {
       expect(decodeCreatorHistory(withBadAsset, 'creator-1')).toBeNull();
       expect(decodeCreatorHistory(withBadDirectory, 'creator-1')).toBeNull();
     }
+  });
+
+  test('空文字や空白だけの updatedDatetime と revision は null を返す (壊れた値を既知の世代として突き合わせないため)。', () => {
+    const history = makeRichHistory();
+    for (const bad of ['', '   ']) {
+      expect(
+        decodeCreatorHistory({ ...history, catalog: [{ ...history.catalog[0], updatedDatetime: bad }] }, 'creator-1'),
+      ).toBeNull();
+      expect(
+        decodeCreatorHistory({ ...history, saved: [{ ...history.saved[0], revision: bad }] }, 'creator-1'),
+      ).toBeNull();
+    }
+  });
+
+  test('凍結名が組として衝突するレコードは null を返す (allocator を止める履歴を読み込まないため)。', () => {
+    const history = makeRichHistory();
+    const post = history.saved[0];
+    const value = {
+      ...history,
+      saved: [
+        { ...post, assets: [{ ...post.assets[0], archiveName: 'same.png' }] },
+        { ...post, postId: 'post-2', archiveDirectory: `${post.archiveDirectory.toUpperCase()}` },
+      ],
+    };
+
+    expect(decodeCreatorHistory(value, 'creator-1')).toBeNull();
   });
 
   test('observedAt を欠いたカタログは null を返す (観測の新旧を決められない履歴で古い値を採らないため)。', () => {

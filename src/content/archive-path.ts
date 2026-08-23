@@ -5,7 +5,13 @@ import type {
   ReadonlyPostObj,
 } from 'download-helper/download-helper';
 import { assetKeyToString } from 'download-helper/download-helper';
-import { byteLength, describeUnusableSegment, SEGMENT_MAX_BYTES, toWellFormed } from '../archive-name-rules';
+import {
+  byteLength,
+  describeUnusableSegment,
+  SEGMENT_MAX_BYTES,
+  toCollisionKey,
+  toWellFormed,
+} from '../archive-name-rules';
 
 /**
  * ZIP の出力形式のバージョン (Issue #56)。
@@ -137,23 +143,6 @@ function assertUniqueNames(names: readonly string[], context: string): void {
     }
     seen.add(key);
   }
-}
-
-/**
- * 名前が同じパスとして扱われるかを比べるための正規化。
- *
- * Windows と既定の macOS は大文字小文字を区別せず、Windows は末尾の空白とピリオドを取り除いて
- * 解釈する。完全一致だけで比べると、`a.bin` と `A.BIN` を別の名前として通してしまい、
- * 展開時に一方が上書きされる。共有層が予約名の比較に使っているのと同じ畳み方である。
- * @param name 比較する名前
- */
-function toCollisionKey(name: string): string {
-  // 合成済みへ寄せる。macOS の APFS は正規化を区別しないので、'é' と 'e\u0301' は
-  // 同じディレクトリに共存できない
-  return name
-    .normalize('NFC')
-    .replace(/[ .]+$/u, '')
-    .toLowerCase();
 }
 
 /**

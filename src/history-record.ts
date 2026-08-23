@@ -1,4 +1,4 @@
-import { describeUnusableSegment } from './archive-name-rules';
+import { describeUnusableSegment, toCollisionKey } from './archive-name-rules';
 
 /**
  * 差分ダウンロードの履歴レコード (Issue #56)。
@@ -200,6 +200,38 @@ function assetIdentity(asset: { readonly kind: HistoryAssetKind; readonly assetI
   return asset.kind === 'cover' ? 'cover' : `${asset.kind}:${asset.assetId ?? ''}`;
 }
 
+/**
+ * 凍結名として使ったときに衝突する組が無いことを確かめる。
+ *
+ * **単体で使える名前でも、組にすると衝突する。** `same.png` と `SAME.PNG` はどちらも
+ * パスセグメントとして正しいが、Windows と既定の macOS では同じファイルを指す。
+ * allocator は凍結名を受け取った時点でこれを例外にするので、通してしまうと
+ * **破損した履歴が次のダウンロードごと止める**。
+ *
+ * 別々の差分がマージされて初めて衝突する組もあるため、復号時とマージ後の両方で確かめる。
+ * @throws {Error} 衝突する組がある場合
+ */
+function assertNoArchiveNameCollision(saved: readonly SavedPost[]): void {
+  const directories = new Set<string>();
+  for (const post of saved) {
+    const directoryKey = toCollisionKey(post.archiveDirectory);
+    if (directories.has(directoryKey)) {
+      throw new Error(`凍結名の投稿ディレクトリが衝突しています (${JSON.stringify(post.archiveDirectory)})`);
+    }
+    directories.add(directoryKey);
+    const names = new Set<string>();
+    for (const asset of post.assets) {
+      const nameKey = toCollisionKey(asset.archiveName);
+      if (names.has(nameKey)) {
+        throw new Error(
+          `凍結名のアセットが投稿の中で衝突しています (${post.postId}: ${JSON.stringify(asset.archiveName)})`,
+        );
+      }
+      names.add(nameKey);
+    }
+  }
+}
+
 /** 同じ鍵が 2 度現れるか */
 function hasDuplicate<T>(items: readonly T[], keyOf: (item: T) => string): boolean {
   const seen = new Set<string>();
@@ -309,7 +341,11 @@ function latestSavedAt(post: SavedPost): number {
  */
 function mergeCatalogPost(existing: CatalogPost, next: CatalogPost): CatalogPost {
   if (next.observedAt !== existing.observedAt) return next.observedAt > existing.observedAt ? next : existing;
-  if (catalogFingerprint(existing) === catalogFingerprint(next)) return next;
+  // 内容が同じでも `complete` は論理積にする。`next` をそのまま返すと、衝突で false に倒した
+  // 直後に同じ差分を再送しただけで `complete: true` が復活する (冪等でなくなる)
+  if (catalogFingerprint(existing) === catalogFingerprint(next)) {
+    return { ...next, complete: existing.complete && next.complete };
+  }
   // 同時刻に別の内容が観測されている。どちらが正しいか決められないので、`post.info` を
   // 取り直させる。`complete` を両方の論理積にするだけでは足りない — 両方が complete でも
   // アセットの構成が違えば、片方を採った時点で存在するアセットを見失う
@@ -371,7 +407,9 @@ function mergeSavedPost(existing: SavedPost, next: SavedPost): SavedPost {
   if (!isSameGeneration(existing, next)) {
     // 世代が違えばマージできない。どちらを残すかは新しい方で決める。到着順で決めると、
     // 遅れて届いた古い差分が新しい世代の保存実績を丸ごと消す
-    return latestSavedAt(next) >= latestSavedAt(existing) ? next : existing;
+    // 同値では既存を残す。`>=` にすると、同じミリ秒に終わった別世代の古い差分を再送しただけで
+    // 新しい世代の保存実績が消える
+    return latestSavedAt(next) > latestSavedAt(existing) ? next : existing;
   }
   const byIdentity = new Map(next.assets.map((asset) => [assetIdentity(asset), asset]));
   const assets: SavedAsset[] = [];
@@ -405,12 +443,16 @@ function mergeSavedPost(existing: SavedPost, next: SavedPost): SavedPost {
 export function mergeCreatorHistory(current: CreatorHistory | null, update: CreatorHistoryUpdate): CreatorHistory {
   assertNoDuplicates(update);
   const base = current ?? emptyCreatorHistory(update.creatorId, update.at);
+  const saved = upsertByPostId(base.saved, update.saved ?? [], mergeSavedPost);
+  // マージで初めて衝突する組があるので、ここでも確かめる。例外にすれば書き込みが失敗し、
+  // 既存の履歴はそのまま残る (壊れた組を保存して次回を止めるより良い)
+  assertNoArchiveNameCollision(saved);
   return {
     schemaVersion: HISTORY_SCHEMA_VERSION,
     creatorId: update.creatorId,
     lastUsedAt: Math.max(base.lastUsedAt, update.at),
     catalog: upsertByPostId(base.catalog, update.catalog ?? [], mergeCatalogPost),
-    saved: upsertByPostId(base.saved, update.saved ?? [], mergeSavedPost),
+    saved,
     scan: pickScan(base.scan, update.scan),
   };
 }
@@ -422,6 +464,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function optionalString(value: unknown): string | null | undefined {
   if (value === null) return null;
   return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * `updatedDatetime` と、それを写した `revision` を復号する。
+ *
+ * **空文字と空白だけの文字列は `null` ではなく復号失敗にする。** `null` (取得できなかった) として
+ * 通すと安全側に見えるが、それでは「値が壊れている」ことに気付けない。失敗にすれば履歴ごと
+ * 捨てられ、再ダウンロードになる。
+ * そのまま既知の revision として通してはいけない — 編集の前後がどちらも空文字なら
+ * `isSameGeneration` が同じ世代と判定し、`revision` が `null` 同士を別世代にした意味が失われる。
+ *
+ * 日時としての形式までは検証しない。値は突き合わせにしか使わない不透明な文字列であり
+ * (Issue #56)、FANBOX が形式を変えたときに全 creator の履歴が一斉に読めなくなる代償に見合わない。
+ */
+function decodeRevision(value: unknown): string | null | undefined {
+  const decoded = optionalString(value);
+  if (decoded === undefined) return undefined;
+  if (decoded === null) return null;
+  return decoded.trim() === '' ? undefined : decoded;
 }
 
 /** 非負の安全な整数か */
@@ -458,7 +519,7 @@ function decodeHistoryAsset(value: unknown): HistoryAsset | null {
 function decodeCatalogPost(value: unknown): CatalogPost | null {
   if (!isRecord(value)) return null;
   if (typeof value.postId !== 'string' || value.postId === '') return null;
-  const updatedDatetime = optionalString(value.updatedDatetime);
+  const updatedDatetime = decodeRevision(value.updatedDatetime);
   const publishedDatetime = optionalString(value.publishedDatetime);
   if (updatedDatetime === undefined || publishedDatetime === undefined) return null;
   if (typeof value.title !== 'string' || typeof value.complete !== 'boolean') return null;
@@ -497,7 +558,7 @@ function decodeSavedPost(value: unknown): SavedPost | null {
   if (typeof value.archiveDirectory !== 'string' || describeUnusableSegment(value.archiveDirectory) !== null) {
     return null;
   }
-  const revision = optionalString(value.revision);
+  const revision = decodeRevision(value.revision);
   if (revision === undefined) return null;
   if (!isCount(value.archiveFormatVersion)) return null;
   const assets = decodeArray(value.assets, decodeSavedAsset);
@@ -571,6 +632,13 @@ export function decodeCreatorHistory(value: unknown, expectedCreatorId: string):
   const saved = decodeArray(value.saved, decodeSavedPost);
   if (catalog === null || saved === null) return null;
   if (hasDuplicate(catalog, (post) => post.postId) || hasDuplicate(saved, (post) => post.postId)) return null;
+  // 凍結名として使えない組は履歴ごと捨てる。復号は「読めなければ履歴が無い」に倒す契約なので、
+  // ここでは例外にしない
+  try {
+    assertNoArchiveNameCollision(saved);
+  } catch {
+    return null;
+  }
   const scan = value.scan === null ? null : decodeScanRecord(value.scan);
   if (value.scan !== null && scan === null) return null;
   return {
