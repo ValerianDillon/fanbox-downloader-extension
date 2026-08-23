@@ -10,7 +10,7 @@ import {
   TAGS_RESPONSE,
   TAGS_URL,
 } from './fixtures';
-import { closeSession, launchAndStartDownload, readTestState } from './harness';
+import { closeSession, confirmReview, launchAndStartCollecting, readTestState } from './harness';
 
 /**
  * Issue #22: 大きいファイルの分割転送 (Port 経由の chunk 転送) の smoke test。
@@ -209,7 +209,7 @@ test.describe('Issue #22: 大きいファイルの分割転送', () => {
       [URL_65]: { body: big65, supportsRange: false },
     });
 
-    const session = await launchAndStartDownload(
+    const session = await launchAndStartCollecting(
       {
         [PLANS_URL]: PLANS_RESPONSE,
         [TAGS_URL]: TAGS_RESPONSE,
@@ -222,6 +222,8 @@ test.describe('Issue #22: 大きいファイルの分割転送', () => {
     );
     const { page, serviceWorker, unexpectedRequests } = session;
     try {
+      // 収集後は review で止まる。全件選択のまま確定して ZIP 生成へ進める (Issue #55)
+      await confirmReview(session);
       await expect
         .poll(() => page.evaluate(readTestState), { timeout: 180_000 })
         .toMatchObject({ overlayState: 'complete', zipDone: '1' });
@@ -278,7 +280,7 @@ test.describe('Issue #22: 大きいファイルの分割転送', () => {
       [URL_NORANGE]: { body: noRange, supportsRange: false },
     });
 
-    const session = await launchAndStartDownload(
+    const session = await launchAndStartCollecting(
       {
         [PLANS_URL]: PLANS_RESPONSE,
         [TAGS_URL]: TAGS_RESPONSE,
@@ -291,6 +293,8 @@ test.describe('Issue #22: 大きいファイルの分割転送', () => {
     );
     const { page, serviceWorker, unexpectedRequests } = session;
     try {
+      // 収集後は review で止まる。全件選択のまま確定して ZIP 生成へ進める (Issue #55)
+      await confirmReview(session);
       await expect
         .poll(() => page.evaluate(readTestState), { timeout: 120_000 })
         .toMatchObject({ overlayState: 'complete', zipDone: '1' });
@@ -350,7 +354,7 @@ test.describe('Issue #22: 大きいファイルの分割転送', () => {
       return true;
     };
 
-    const session = await launchAndStartDownload(
+    const session = await launchAndStartCollecting(
       {
         [PLANS_URL]: PLANS_RESPONSE,
         [TAGS_URL]: TAGS_RESPONSE,
@@ -363,6 +367,8 @@ test.describe('Issue #22: 大きいファイルの分割転送', () => {
     );
     const { page, overlay, serviceWorker } = session;
     try {
+      // 収集後は review で止まる。全件選択のまま確定して ZIP 生成へ進める (Issue #55)
+      await confirmReview(session);
       // ZIP フェーズに入り、service worker 側で fetch が進行中 (応答ヘッダ待ち) になるまで待つ
       await expect
         .poll(() => page.evaluate(readTestState), { timeout: 30_000 })

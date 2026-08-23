@@ -163,3 +163,126 @@
   font-size: 14px;
   white-space: pre-line;
 }
+
+/* review 画面 (収集後の選択)。投稿一覧を並べるため設定画面より広げる */
+.overlay-panel-wide {
+  width: min(720px, 92vw);
+}
+
+.overlay-panel h3 {
+  margin: 20px 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1a1a1a;
+}
+
+.review-counts {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.review-note {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: #666;
+}
+
+.review-error {
+  margin: 8px 0;
+  padding: 8px;
+  border-radius: 4px;
+  background: #fdecea;
+  color: #b3261e;
+  font-size: 13px;
+  white-space: pre-line;
+}
+
+.review-section {
+  border-top: 1px solid #eee;
+}
+
+.review-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.review-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  padding: 4px 10px;
+  border: 1px solid #ddd;
+  border-radius: 999px;
+  font-size: 13px;
+}
+
+.review-search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+.review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 8px 0 4px;
+}
+
+.btn-link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: #1976d2;
+  cursor: pointer;
+  font-size: 13px;
+  text-decoration: underline;
+}
+
+.btn-link:disabled {
+  color: #aaa;
+  cursor: not-allowed;
+}
+
+.review-post-list {
+  margin: 0;
+  padding: 0;
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+  list-style: none;
+}
+
+.review-post-list li {
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.review-post-list li:last-child {
+  border-bottom: none;
+}
+
+.review-post-list label {
+  margin: 0;
+  padding: 6px 8px;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.review-post-title {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.review-post-meta {
+  flex: none;
+  font-size: 12px;
+  color: #888;
+}

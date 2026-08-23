@@ -44,7 +44,7 @@ const POST_A_COMMON = {
 
 // 投稿B: file type、有料
 const POST_B_COVER_URL = 'https://i.pximg.net/c/testcreator/cover-b.png';
-const POST_B_FILE_URL = 'https://downloads.fanbox.cc/files/1002/document.pdf';
+export const POST_B_FILE_URL = 'https://downloads.fanbox.cc/files/1002/document.pdf';
 
 const POST_B_COMMON = {
   id: '1002',

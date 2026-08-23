@@ -1,4 +1,4 @@
-import type { DownloadZipResult, FileSystemFileHandle } from 'download-helper/download-helper';
+import type { DownloadJsonObj, DownloadZipResult, FileSystemFileHandle } from 'download-helper/download-helper';
 import { DownloadHelper, DownloadUtils } from 'download-helper/download-helper';
 import { appendMediaAttempts } from './media-attempt-log';
 import { fetchMediaViaPort } from './media-stream';
@@ -100,35 +100,67 @@ export type DownloadProgress = {
 };
 
 /**
- * 「ダウンロード開始」直後のユーザジェスチャー有効中に呼ぶ。
- * 収集処理が長引いてジェスチャーが失効する前にファイルハンドルを確保する。
+ * ZIP 入力として受け付けられるかを、保存先を確保する前に確かめる。
+ *
+ * **`showSaveFilePicker` は解決した時点で対象ファイルの中身を空にする。** 新規なら 0 バイトで
+ * 作成し、既存ファイルを選べばその内容を消す (File System Access 仕様 3.4)。picker の後で
+ * 入力の不備が見つかると、書くものが無いまま利用者のファイルだけが空になる。
+ *
+ * `isDownloadJsonObj` だけでは足りない。`downloadZip` は型検証の後にも投稿ディレクトリ名の重複や
+ * 予約名との衝突を見ており、そちらは型検証を通る入力でも落ちうる (legacy allocator は投稿名が
+ * `a` / `a` / `a_1` のとき `a_1` を 2 回割り当てる)。共有層の `preflight` は picker より前に
+ * 走る検証をすべて持つので、それをそのまま呼ぶ。
+ * @param value `DownloadObject.project()` の出力
+ * @throws {Error} ZIP 入力として受け付けられない場合
  */
-export async function pickSaveHandle(suggestedBaseName: string): Promise<FileSystemFileHandle> {
+export function assertDownloadable(value: unknown): asserts value is DownloadJsonObj {
+  helper.preflight(value);
+}
+
+/**
+ * review 画面の確定ボタンのクリック中 (ユーザアクティベーション有効中) に呼ぶ。
+ *
+ * 以前は「ダウンロード開始」のクリック時に呼んでいた。収集が長引くとその間にアクティベーションが
+ * 失効するため、収集より前に保存先を確保しておく必要があったからである。確定ボタンのクリック自体が
+ * 新しいアクティベーションになるので、review 画面での操作が何分続いても保存先を確保できる (Issue #55)。
+ * @param suggestedBaseName 既定のファイル名 (拡張子を除く)
+ * @param shouldPublish テストビルドで観測状態を publish してよいかの判定 (通常ビルドでは使わない)
+ */
+export async function pickSaveHandle(
+  suggestedBaseName: string,
+  shouldPublish?: () => boolean,
+): Promise<FileSystemFileHandle> {
   if (IS_TEST_BUILD) {
-    return createTestSaveHandle();
+    return createTestSaveHandle(shouldPublish);
   }
   const safeName = utils.encodeFileName(suggestedBaseName);
   return showSaveFilePicker({ suggestedName: `${safeName}.zip` });
 }
 
 /**
- * DownloadObject を ZIP ファイルとして書き出す
+ * projection の結果を ZIP ファイルとして書き出す
+ *
+ * 受け取るのは `DownloadObject.project()` の出力そのもので、文字列を経由しない。呼び出し側は
+ * picker を開く前に `assertDownloadable` で検証済みなので、ここで再び文字列に落として読み直すと
+ * 検証した値と書き出す値が別のオブジェクトになる。
  *
  * 戻り値の `zip` (DownloadZipResult) が対象単位の最終的な失敗集計 (カバー画像含む、中断由来は
  * 含まない) であり、`attempts` が試行単位の観測記録である。1 対象につき最大 2 回試行するため、
  * 初回 429 → 再試行 200 で成功しても、初回の 429 は attempts に残る (呼び出し元の完了画面は
  * zip 側の対象単位集計を見るべきで、attempts の件数と混同しないこと)。
+ * @param shouldPublish テストビルドで観測状態を publish してよいかの判定 (通常ビルドでは使わない)
  */
 export async function downloadAsZip(
   handle: FileSystemFileHandle,
-  downloadObjJson: string,
+  downloadObj: DownloadJsonObj,
   progress: DownloadProgress,
   signal: AbortSignal,
+  shouldPublish?: () => boolean,
 ): Promise<DownloadAsZipResult> {
-  const downloadObj: unknown = JSON.parse(downloadObjJson);
   const attempts: MediaFetchAttempt[] = [];
-  const fetchFile = wrapFetchFileForTest((url, name, context) =>
-    fetchWithRetry(url, name, 1, signal, context.kind, attempts),
+  const fetchFile = wrapFetchFileForTest(
+    (url, name, context) => fetchWithRetry(url, name, 1, signal, context.kind, attempts),
+    shouldPublish,
   );
   try {
     const zip = await helper.downloadZip(downloadObj, progress.onProgress, progress.onLog, progress.onRemainTime, {

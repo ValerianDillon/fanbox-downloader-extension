@@ -9,7 +9,9 @@ import {
   PAGINATE_URL,
   PLANS_RESPONSE,
   PLANS_URL,
+  POST_A_FULL,
   POST_A_STUB,
+  POST_B_FILE_URL,
   POST_B_STUB,
   POST_INFO_RESPONSE_A,
   POST_INFO_RESPONSE_B,
@@ -18,7 +20,7 @@ import {
   TAGS_RESPONSE,
   TAGS_URL,
 } from './fixtures';
-import { launchAndStartDownload, readTestState } from './harness';
+import { confirmReview, launchAndStartCollecting, readTestState } from './harness';
 import { decodeBase64ToBytes, hasLocalFileHeaderSignature, parseZip } from './zip-util';
 
 /**
@@ -45,10 +47,13 @@ const JSON_RESPONSES: Record<string, unknown> = {
 };
 
 test('FANBOX creator ページ: 収集から ZIP 生成まで完走する', async () => {
-  const session = await launchAndStartDownload(JSON_RESPONSES, 'ok');
+  const session = await launchAndStartCollecting(JSON_RESPONSES, 'ok');
   const { context, page, userDataDir, unexpectedRequests } = session;
 
   try {
+    // 収集後は review で止まる。全件選択のまま確定して ZIP 生成へ進める (Issue #55)
+    await confirmReview(session);
+
     await expect
       .poll(() => page.evaluate(readTestState), { timeout: 30_000 })
       .toMatchObject({ overlayState: 'complete', zipDone: '1' });
@@ -116,7 +121,7 @@ test('登録できた投稿が 0 件のとき ZIP を生成せず保存しない
     // unexpectedRequests (fail-closed) で検出される。
   };
 
-  const session = await launchAndStartDownload(allRestrictedResponses, 'nosave');
+  const session = await launchAndStartCollecting(allRestrictedResponses, 'nosave');
   const { context, page, overlay, userDataDir, unexpectedRequests } = session;
 
   try {
@@ -141,6 +146,170 @@ test('登録できた投稿が 0 件のとき ZIP を生成せず保存しない
 
     const resultText = await overlay.locator('.result-text').textContent();
     expect(resultText, '完了画面に非保存の理由が表示されていない').toBeTruthy();
+
+    expect(unexpectedRequests, `予期しないリクエストが発生した: ${unexpectedRequests.join(', ')}`).toEqual([]);
+  } finally {
+    await context.close();
+    await rm(userDataDir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Issue #55: review 画面での選択が ZIP の中身と ZIP フェーズの取得要求の両方に届くこと。
+ *
+ * 「選択できる UI がある」ことと「選択が実際に効く」ことは別の懸念である。UI の状態だけを
+ * 見るテストでは、選択条件を projection へ渡し忘れても通ってしまう。ここでは投稿 A (リンゴ) と
+ * カバーを外し、ZIP に投稿 B (バナナ) のディレクトリしか無いこと、および外した対象の URL を
+ * 一度も要求していないことを確かめる。
+ */
+test('review で外した投稿とカバーは ZIP にも取得要求にも現れない (Issue #55)', async () => {
+  const session = await launchAndStartCollecting(JSON_RESPONSES, 'select');
+  const { context, page, overlay, userDataDir, unexpectedRequests } = session;
+
+  try {
+    await expect
+      .poll(() => page.evaluate(readTestState), { timeout: 30_000 })
+      .toMatchObject({ overlayState: 'review' });
+
+    await overlay.locator('#review-cover').uncheck();
+    await overlay.locator('.review-post-list li', { hasText: 'リンゴ' }).locator('input[type="checkbox"]').uncheck();
+
+    // 選択の集計が UI に反映されてから確定する (確定前の表示と ZIP の中身が一致することの確認)
+    await expect
+      .poll(() => page.evaluate(readTestState), { timeout: 10_000 })
+      .toMatchObject({ selectedPostCount: '1', selectedFileCount: '1', selectedCoverCount: '0' });
+
+    await confirmReview(session);
+
+    await expect
+      .poll(() => page.evaluate(readTestState), { timeout: 30_000 })
+      .toMatchObject({ overlayState: 'complete', zipDone: '1' });
+
+    const state = await page.evaluate(readTestState);
+    expect(state.error, 'startCollecting でエラーが発生した').toBeNull();
+    expect(state.aborted, 'ダウンロードが中断された').toBeNull();
+    expect(state.failedFileCount).toBe('0');
+
+    // 外した対象は ZIP フェーズで一度も要求されない (カバー 2 件と投稿 A の画像が消える)
+    const fetchedUrls = JSON.parse(state.fetchedUrls ?? '[]') as string[];
+    expect(fetchedUrls).toEqual([POST_B_FILE_URL]);
+
+    const zipBytes = decodeBase64ToBytes(state.zipB64 ?? '');
+    const parsed = parseZip(zipBytes);
+    expect([...parsed.entries.map((e) => e.name)].sort()).toEqual(
+      [
+        'testcreator/',
+        'testcreator/index.html',
+        'testcreator/download-manifest.json',
+        'testcreator/バナナ/',
+        'testcreator/バナナ/info.json',
+        'testcreator/バナナ/index.html',
+        'testcreator/バナナ/資料.pdf',
+      ].sort(),
+    );
+
+    expect(unexpectedRequests, `予期しないリクエストが発生した: ${unexpectedRequests.join(', ')}`).toEqual([]);
+  } finally {
+    await context.close();
+    await rm(userDataDir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Issue #55: 拡張子の選択が ZIP と ZIP フェーズの取得要求に届くこと。
+ *
+ * 投稿とカバーだけを外すテストでは、`Selection` 全体を渡し忘れて全件相当に戻る退行は
+ * 検出できても、**拡張子の軸だけが効かない退行**は検出できない (拡張子のチェックが選択の
+ * SoT を更新しない、`toSelection` が extensions を落とす、など)。ここでは投稿もカバーも
+ * 残したまま `.pdf` だけを外し、その添付だけが消えることを確かめる。
+ */
+test('review で外した拡張子の添付だけが ZIP から消える (Issue #55)', async () => {
+  const session = await launchAndStartCollecting(JSON_RESPONSES, 'ext');
+  const { context, page, overlay, userDataDir, unexpectedRequests } = session;
+
+  try {
+    await expect
+      .poll(() => page.evaluate(readTestState), { timeout: 30_000 })
+      .toMatchObject({ overlayState: 'review' });
+
+    await overlay.locator('.review-chip', { hasText: '.pdf' }).locator('input[type="checkbox"]').uncheck();
+
+    // 投稿とカバーは全件のまま、添付だけが 2 件から 1 件に減る
+    await expect
+      .poll(() => page.evaluate(readTestState), { timeout: 10_000 })
+      .toMatchObject({ selectedPostCount: '2', selectedFileCount: '1', selectedCoverCount: '2' });
+
+    await confirmReview(session);
+
+    await expect
+      .poll(() => page.evaluate(readTestState), { timeout: 30_000 })
+      .toMatchObject({ overlayState: 'complete', zipDone: '1' });
+
+    const state = await page.evaluate(readTestState);
+    expect(state.error, 'startCollecting でエラーが発生した').toBeNull();
+    expect(state.failedFileCount).toBe('0');
+
+    const fetchedUrls = JSON.parse(state.fetchedUrls ?? '[]') as string[];
+    expect([...fetchedUrls].sort()).toEqual([...EXPECTED_FETCHED_URLS].filter((url) => url !== POST_B_FILE_URL).sort());
+
+    const parsed = parseZip(decodeBase64ToBytes(state.zipB64 ?? ''));
+    expect([...parsed.entries.map((e) => e.name)].sort()).toEqual(
+      EXPECTED_ZIP_ENTRIES.filter((name) => name !== 'testcreator/バナナ/資料.pdf'),
+    );
+
+    expect(unexpectedRequests, `予期しないリクエストが発生した: ${unexpectedRequests.join(', ')}`).toEqual([]);
+  } finally {
+    await context.close();
+    await rm(userDataDir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Issue #55 / ValerianDillon/download-helper#52: 保存先を確保する前に入力の不備を検出すること。
+ *
+ * `showSaveFilePicker` は解決した時点で対象ファイルの中身を空にする (新規なら 0 バイトで作成し、
+ * 既存ファイルを選べばその内容を消す)。picker の後で ZIP 生成が入力の不備で落ちると、書くものが
+ * 無いまま利用者のファイルだけが空になる。
+ *
+ * legacy allocator は投稿タイトルが a / a / a_1 のとき a_2 / a_1 / a_1 を割り当てる。
+ * 型検証 (`isDownloadJsonObj`) はこれを通すので、共有層の `preflight` まで通していないと
+ * picker の後で初めて落ちる。ここでは確定ボタンが押せないまま review に留まることを確かめる。
+ */
+test('投稿ディレクトリ名が衝突する収集結果は、保存先を確保する前に確定できなくなる (Issue #55)', async () => {
+  const collidingTitles = ['a', 'a', 'a_1'];
+  const collidingIds = ['2001', '2002', '2003'];
+  const collidingResponses: Record<string, unknown> = {
+    [PLANS_URL]: PLANS_RESPONSE,
+    [TAGS_URL]: TAGS_RESPONSE,
+    [PAGINATE_URL]: PAGINATE_RESPONSE,
+    [LIST_PAGE_URL]: {
+      body: { posts: collidingIds.map((id, i) => ({ ...POST_A_STUB, id, title: collidingTitles[i] })) },
+    },
+    ...Object.fromEntries(
+      collidingIds.map((id, i) => [
+        `https://api.fanbox.cc/post.info?postId=${id}`,
+        { body: { post: { ...POST_A_FULL, id, title: collidingTitles[i] } } },
+      ]),
+    ),
+  };
+
+  const session = await launchAndStartCollecting(collidingResponses, 'collide');
+  const { context, page, overlay, userDataDir, unexpectedRequests } = session;
+
+  try {
+    await expect
+      .poll(() => page.evaluate(readTestState), { timeout: 30_000 })
+      .toMatchObject({ overlayState: 'review' });
+
+    // 導出は選択の変更から少し待って走るので、エラーが出るまで待つ
+    await expect(overlay.locator('#review-error')).toContainText('重複', { timeout: 10_000 });
+    await expect(overlay.locator('#review-confirm')).toBeDisabled();
+
+    const state = await page.evaluate(readTestState);
+    expect(state.overlayState, 'review に留まっていない').toBe('review');
+    // 保存先を確保していないことの証拠。テストビルドのハンドルは close() で zip-done を publish する
+    expect(state.zipDone, '保存先を確保して ZIP を書いてしまった').toBeNull();
+    expect(state.fetchedUrls, 'ZIP フェーズのファイル取得が発生した').toBeNull();
 
     expect(unexpectedRequests, `予期しないリクエストが発生した: ${unexpectedRequests.join(', ')}`).toEqual([]);
   } finally {

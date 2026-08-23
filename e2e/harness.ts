@@ -93,6 +93,10 @@ export type TestState = {
   apiFailedPostCount: string | null;
   failedPageCount: string | null;
   failedFileCount: string | null;
+  /** review 画面で選択されている投稿 / 添付 / カバーの件数 (Issue #55) */
+  selectedPostCount: string | null;
+  selectedFileCount: string | null;
+  selectedCoverCount: string | null;
   fetchedUrls: string | null;
   zipB64: string | null;
   /** ZIP 全体の Blob URL (Issue #22。大きい ZIP は zipB64 が publish されないので、こちらを fetch して検証する) */
@@ -114,6 +118,9 @@ export function readTestState(): TestState {
     apiFailedPostCount: el.getAttribute('data-fbdl-api-failed-post-count'),
     failedPageCount: el.getAttribute('data-fbdl-failed-page-count'),
     failedFileCount: el.getAttribute('data-fbdl-failed-file-count'),
+    selectedPostCount: el.getAttribute('data-fbdl-selected-post-count'),
+    selectedFileCount: el.getAttribute('data-fbdl-selected-file-count'),
+    selectedCoverCount: el.getAttribute('data-fbdl-selected-cover-count'),
     fetchedUrls: el.getAttribute('data-fbdl-fetched-urls'),
     zipB64: el.getAttribute('data-fbdl-zip-b64'),
     zipUrl: el.getAttribute('data-fbdl-zip-url'),
@@ -132,7 +139,7 @@ export type ExtensionSession = {
 };
 
 /**
- * launchAndStartDownload の追加オプション。
+ * launchAndStartCollecting の追加オプション。
  * - routeOverride: http(s) リクエストを既定の fixture 処理より先に処理する。true を返したら処理済み。
  *   大きい本文・Range 応答・遅延など、FILE_BODIES の固定 fixture で表せない応答を返すために使う
  * - apiIntervalMs: overlay の API 間隔 (ms) 入力に入れる値 (既定 50)
@@ -144,13 +151,17 @@ export type LaunchOptions = {
 
 /**
  * dist-test/ を読み込んだ拡張プロファイルを起動し、FANBOX API を jsonResponses でモックした上で
- * FAB クリック → 「ダウンロード開始」まで進める共通セットアップ。
+ * FAB クリック → 「投稿を収集」まで進める共通セットアップ。
+ *
+ * 収集が終わると overlay は review 状態で止まる (Issue #55)。ZIP 生成まで進めたいテストは
+ * 続けて confirmReview() を呼ぶこと。収集が review に到達しないケース (登録できた投稿が 0 件、
+ * 未対応のレスポンス形式) を検証するテストは呼ばない。
  *
  * 個々のテストは戻り値の page/overlay を使って、そこから先 (完了までの待機や状態の検証) だけを書く。
  * 呼び出し側は必ず finally で context.close() / rm(userDataDir, ...) を行うこと
  * (このヘルパー自体は後始末をしない)。
  */
-export async function launchAndStartDownload(
+export async function launchAndStartCollecting(
   jsonResponses: Record<string, unknown>,
   namePrefix: string,
   options: LaunchOptions = {},
@@ -254,12 +265,28 @@ export async function launchAndStartDownload(
   // renderSettings(): 1つ目の number input が取得件数上限、2つ目が API 間隔(ms)
   const intervalInput = overlay.locator('.setting-row input[type="number"]').nth(1);
   await intervalInput.fill(String(options.apiIntervalMs ?? 50));
-  await overlay.getByRole('button', { name: 'ダウンロード開始' }).click();
+  await overlay.getByRole('button', { name: '投稿を収集' }).click();
 
   return { context, page, overlay, serviceWorker, userDataDir, unexpectedRequests };
 }
 
-/** launchAndStartDownload で起動したセッションの後始末 (finally から呼ぶ) */
+/**
+ * review 画面 (Issue #55) で全件選択のまま確定し、ZIP 生成へ進める。
+ *
+ * 確定ボタンは選択の導出と検証が終わるまで無効なので、有効になるのを待ってから押す。
+ * ここで押すクリックが showSaveFilePicker のユーザアクティベーションになる
+ * (テストビルドでは in-memory のスタブに差し替わる)。
+ */
+export async function confirmReview(session: ExtensionSession): Promise<void> {
+  await expect
+    .poll(() => session.page.evaluate(readTestState), { timeout: 30_000 })
+    .toMatchObject({ overlayState: 'review' });
+  const confirm = session.overlay.locator('#review-confirm');
+  await expect(confirm).toBeEnabled({ timeout: 10_000 });
+  await confirm.click();
+}
+
+/** launchAndStartCollecting で起動したセッションの後始末 (finally から呼ぶ) */
 export async function closeSession(session: ExtensionSession): Promise<void> {
   await session.context.close();
   await rm(session.userDataDir, { recursive: true, force: true });

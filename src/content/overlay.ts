@@ -1,12 +1,54 @@
+import type { DownloadJsonObj, PostSummary } from 'download-helper/download-helper';
 import type { DownloadProgress, FileSystemFileHandle } from './downloader';
-import { downloadAsZip, pickSaveHandle } from './downloader';
+import { assertDownloadable, downloadAsZip, pickSaveHandle } from './downloader';
 import { ApiShapeError, type PageType, ResponseParseError } from './fanbox/api';
-import type { CollectorSettings, PostFailureCounts } from './fanbox/collector';
+import type { CollectorSettings, CollectResult, PostFailureCounts } from './fanbox/collector';
 import { collect, PostBodyInvalidError } from './fanbox/collector';
 import css from './overlay.css' with { type: 'text' };
-import { publishTestState, resetTestState, SHADOW_ROOT_MODE } from './test-hooks';
+import {
+  countSelection,
+  createInitialSelection,
+  describeRenderedRange,
+  describeSelectionCounts,
+  describeSizeEstimate,
+  type ExtensionOption,
+  filterPosts,
+  listExtensionOptions,
+  POST_LIST_RENDER_LIMIT,
+  type ReviewSelection,
+  toSelection,
+} from './review-model';
+import { assertAllowedTransitionForTest, publishTestState, resetTestState, SHADOW_ROOT_MODE } from './test-hooks';
 
-export type OverlayState = 'settings' | 'collecting' | 'downloading' | 'complete';
+/**
+ * オーバーレイの状態。
+ *
+ * `review` は収集が終わってからダウンロード対象の選択を確定するまでの区間である (Issue #55)。
+ * 収集用と ZIP 用の AbortController の切り替わりもここで起きる。
+ */
+export type OverlayState = 'settings' | 'collecting' | 'review' | 'downloading' | 'complete';
+
+/**
+ * 許される状態遷移。
+ *
+ * ここが遷移の SoT で、テストビルドの `setState` がこの表に照らして検証する。
+ * 表をテスト側に手で持つと、実装が表に無い遷移をするようになってもテストは通ってしまう。
+ *
+ * - `collecting → complete` (review / downloading を経由しない) は 3 経路が使う。
+ *   collect() が正常に返って `addedPostCount === 0` (Issue #14)、未対応のレスポンス形式で例外、
+ *   それ以外の例外 (枯渇や想定外のバグ) の catch。いずれも保存すべき ZIP が無いと分かった時点で着地する
+ * - `review → complete` は無い。確定は必ず `downloading` を経由する。保存先の取得に失敗しても
+ *   review に留まる (Issue #55)
+ * - `downloading → settings` はパネルの再オープン等による全破棄で、部分保存を活かす
+ *   「ここまでで終了」(→ complete) とは別物である
+ */
+export const OVERLAY_TRANSITIONS: Readonly<Record<OverlayState, readonly OverlayState[]>> = {
+  settings: ['collecting'],
+  collecting: ['review', 'settings', 'complete'],
+  review: ['downloading', 'settings'],
+  downloading: ['complete', 'settings'],
+  complete: ['settings'],
+};
 
 /**
  * ダウンロード中に「ここまでで終了」が押されて中断した場合の完了画面の文言。
@@ -39,12 +81,11 @@ export const TRANSPORT_EXHAUSTED_HEADLINE = '通信に失敗したため途中�
 /**
  * addByPostInfo が 'added' を返した投稿が 0 件だった場合の完了画面の見出し (Issue #14)。
  *
- * この場合 ZIP を保存しない (startCollecting 側で downloadAsZip 自体を呼ばない)。
- * showSaveFilePicker は「ダウンロード開始」直後に既にハンドルを確保済み (ジェスチャー失効対策)
- * のため、ファイル自体は既に (0 バイトで) 作成されている。書き込みを一切行わないことで
- * その 0 バイトのまま残す。ハンドルからは新規作成か上書き対象の既存ファイルかを区別できず、
- * 無条件に削除すると利用者が残したいファイルを消しかねないため、削除は行わない
- * (Issue #17 の「showSaveFilePicker が返る前に空ファイルを作る」と同じ理由・同じ結論)。
+ * この場合 review へ進まず ZIP も保存しない。保存先の確保は review の確定時に初めて行うので、
+ * **この経路では showSaveFilePicker を呼ばず、0 バイトのファイルも残らない** (Issue #55)。
+ * 以前は収集より前に picker を呼んでいたため、書き込みを一切しなくても 0 バイトのファイルが
+ * 残っていた (ハンドルからは新規作成か上書き対象の既存ファイルかを区別できず、無条件に削除すると
+ * 利用者が残したいファイルを消しかねないので、削除もできなかった)。
  */
 export const NOTHING_SAVED_HEADLINE = '保存できる投稿がなかったため ZIP を保存しませんでした';
 
@@ -71,6 +112,42 @@ export const UNSUPPORTED_RESPONSE_HEADLINE = '未対応のレスポンス形式�
  */
 export function isUnsupportedResponseError(e: unknown): boolean {
   return e instanceof ApiShapeError || e instanceof ResponseParseError || e instanceof PostBodyInvalidError;
+}
+
+/**
+ * review 画面で保存先 (`showSaveFilePicker`) を確保できなかった場合の文言 (Issue #55)。
+ *
+ * 利用者が選択をやめた `AbortError` はエラーにせず review へ戻すので、この文言は出さない。
+ */
+export const PICKER_FAILED_MESSAGE = 'ファイル保存先を取得できませんでした';
+
+/** review 画面でダウンロード対象を導出できなかった場合の文言 (Issue #55) */
+export const PROJECTION_FAILED_MESSAGE = 'ダウンロード対象を組み立てられませんでした';
+
+/** 拡張子を持たないアセットの選択肢に付ける表示名 */
+export const NO_EXTENSION_LABEL = '(拡張子なし)';
+
+/**
+ * 選択が変わってから導出 (`project`) を走らせるまでの静穏時間 (ms)。
+ *
+ * 1000 投稿規模では `project()` だけで 100 ms 近くかかる。チェックのたびに走らせると
+ * 連続操作でメインスレッドが目に見えて止まる。
+ */
+export const PROJECTION_DEBOUNCE_MS = 200;
+
+/**
+ * 保存先の取得に失敗したときに review 画面へ出す文言を返す。出さない場合は null。
+ *
+ * `AbortError` は「保存先を選ばずに閉じた」という正常な操作なので、エラーとして見せない。
+ * それ以外 (`SecurityError` / `NotAllowedError` / 書き込み不能など) は理由を添えて出す。
+ *
+ * 分岐を純粋関数に切り出しているのは、`showSaveFilePicker` がネイティブダイアログを要求するため
+ * ブラウザ自動化では失敗経路を再現できず、DOM 無しで検証するしかないためである。
+ * @param e picker が投げた値
+ */
+export function describePickerFailure(e: unknown): string | null {
+  if (e instanceof DOMException && e.name === 'AbortError') return null;
+  return `${PICKER_FAILED_MESSAGE}: ${e instanceof Error ? e.message : String(e)}`;
 }
 
 export type CompleteMessageParams = {
@@ -180,9 +257,56 @@ export function buildCompleteMessage(params: CompleteMessageParams): string {
   return `${headline}${failedSuffix}`;
 }
 
+/**
+ * review 画面 (収集完了からダウンロード対象の確定まで) が保持する状態 (Issue #55)。
+ *
+ * 収集結果 (`result`) は確定後も保持する。完了画面は収集フェーズの失敗件数も併記するため、
+ * ZIP フェーズが終わった時点でも必要になる。
+ */
+type ReviewContext = {
+  readonly creatorId: string;
+  readonly result: CollectResult;
+  readonly posts: PostSummary[];
+  readonly extensionOptions: ExtensionOption[];
+  readonly selection: ReviewSelection;
+  /** 投稿リストの検索語 */
+  query: string;
+  /**
+   * 選択から導出済みかつ検証済みのダウンロード対象。導出が終わっていなければ null。
+   *
+   * 確定ボタンのハンドラで導出すると、`showSaveFilePicker` を呼ぶまでに重い処理を挟むことになる。
+   * ユーザアクティベーションは時間で失効するので、選択が変わるたびに先に済ませておき、
+   * ハンドラは読むだけにする。
+   */
+  prepared: DownloadJsonObj | null;
+  /** 導出待ちのタイマー。連続した操作で導出が何度も走るのを 1 回にまとめる */
+  prepareTimer: ReturnType<typeof setTimeout> | null;
+  /** review 画面に表示するエラー。選択状態は保ったまま出す */
+  errorMessage: string | null;
+};
+
 export class OverlayController {
   private state: OverlayState = 'settings';
-  private abortController: AbortController | null = null;
+  /**
+   * 収集フェーズ用と ZIP フェーズ用で AbortController を分ける (Issue #55)。
+   *
+   * 選択の確定を待つ区間 (review) を 1 つの controller で覆うと、「キャンセル」の意味が
+   * 段階ごとに変わってしまう。収集用は collect() が返った時点で役目を終え、ZIP 用は
+   * 確定時に新しく作る。
+   */
+  private collectAbort: AbortController | null = null;
+  private downloadAbort: AbortController | null = null;
+  /**
+   * ZIP フェーズの実行世代。
+   *
+   * `AbortController` は確定の後 (`startDownloading`) に作られるので、確定の時点で確保する
+   * 保存先ハンドルからは参照できない。ZIP の書き込みは中断されても最後まで走るため、
+   * パネルを閉じて別の収集を始めた後に旧実行の書き込み完了が届きうる。その時点で「まだ現行か」を
+   * 判定できるよう、確定時に採番して以降の判定に使う。
+   */
+  private downloadRunId = 0;
+  private review: ReviewContext | null = null;
+  private beforeUnload: ((e: BeforeUnloadEvent) => void) | null = null;
   private shadowRoot: ShadowRoot;
   private panelEl: HTMLElement | null = null;
   private backdropEl: HTMLElement | null = null;
@@ -200,24 +324,50 @@ export class OverlayController {
   }
 
   private setState(state: OverlayState) {
+    assertAllowedTransitionForTest(this.state, state, OVERLAY_TRANSITIONS[this.state]);
     this.state = state;
     publishTestState({ 'overlay-state': state });
   }
 
   /**
-   * signal がまだ「現行の」実行 (this.abortController) のものである場合に限り
-   * data-fbdl-aborted を publish する。
+   * signal がまだ「現行の」実行のものかを返す。
    *
-   * startCollecting は連続で呼ばれ得る (キャンセル直後に再度「ダウンロード開始」を押す等)。
-   * この時、旧実行の非同期処理 (collect/downloadAsZip 内の Promise) が abort による reject
-   * で遅れて解決すると、旧実行のクロージャが持つ signal はまだ aborted のままだが、
-   * this.abortController は既に新しい実行のものに差し替わっている。
-   * この判定なしに publish すると、旧実行の遅延 publish が新実行の状態を上書きしうる。
+   * startCollecting / startDownloading は連続で呼ばれ得る (キャンセル直後に再度開始する等)。
+   * この時、旧実行の非同期処理 (collect / downloadAsZip 内の Promise) が abort による reject で
+   * 遅れて解決すると、旧実行のクロージャが持つ signal はまだ aborted のままだが、controller は
+   * 既に新しい実行のものに差し替わっている。
+   *
+   * **画面の更新も観測状態の publish も、これを確かめてから行う。** 判定を後回しにすると、
+   * 旧実行の集計やエラー表示が新実行のものを上書きする。
+   * @param signal 判定対象の signal
    */
-  private publishAbortedIfCurrent(signal: AbortSignal) {
-    if (signal === this.abortController?.signal) {
-      publishTestState({ aborted: '1' });
-    }
+  private isCurrentCollect(signal: AbortSignal): boolean {
+    return signal === this.collectAbort?.signal;
+  }
+
+  /** signal がまだ現行の ZIP フェーズのものかを返す。判定の理由は isCurrentCollect を参照 */
+  private isCurrentDownload(signal: AbortSignal): boolean {
+    return signal === this.downloadAbort?.signal;
+  }
+
+  /**
+   * 収集結果を失う遷移 (リロード・ページ遷移) を警告する。
+   *
+   * 収集の開始から完了画面までの全区間で維持する。review 画面で失われるのも実害は同じで、
+   * 選択に時間をかけている間ほど失うものが大きい (Issue #55 の要検討事項をここで決めている)。
+   */
+  private guardUnload() {
+    if (this.beforeUnload) return;
+    this.beforeUnload = (e: BeforeUnloadEvent) => {
+      e.returnValue = 'downloading';
+    };
+    window.addEventListener('beforeunload', this.beforeUnload);
+  }
+
+  private releaseUnloadGuard() {
+    if (!this.beforeUnload) return;
+    window.removeEventListener('beforeunload', this.beforeUnload);
+    this.beforeUnload = null;
   }
 
   setPageType(pageType: PageType) {
@@ -230,16 +380,33 @@ export class OverlayController {
   }
 
   hidePanel() {
-    if (this.abortController) {
-      this.abortController.abort();
-      this.abortController = null;
-    }
+    // 進行中の ZIP フェーズはここで無効になる。以降その実行が届けても状態を触らせない
+    this.downloadRunId++;
+    this.collectAbort?.abort();
+    this.collectAbort = null;
+    this.downloadAbort?.abort();
+    this.downloadAbort = null;
+    this.discardReview();
+    this.releaseUnloadGuard();
     if (this.backdropEl) {
       this.backdropEl.remove();
       this.backdropEl = null;
       this.panelEl = null;
     }
     this.setState('settings');
+  }
+
+  /** review 状態を破棄する。導出待ちのタイマーが残ると、既に閉じた画面に向けて publish が走る */
+  private discardReview() {
+    this.cancelPreparation();
+    this.review = null;
+  }
+
+  private cancelPreparation() {
+    const timer = this.review?.prepareTimer;
+    if (timer === null || timer === undefined) return;
+    clearTimeout(timer);
+    if (this.review) this.review.prepareTimer = null;
   }
 
   private renderPanel() {
@@ -264,6 +431,7 @@ export class OverlayController {
   private renderSettings() {
     if (!this.panelEl || !this.pageType) return;
     const isCreator = this.pageType.type === 'creator';
+    this.panelEl.className = 'overlay-panel';
     this.panelEl.innerHTML = '';
 
     const h2 = document.createElement('h2');
@@ -272,8 +440,8 @@ export class OverlayController {
 
     const desc = document.createElement('p');
     desc.textContent = isCreator
-      ? `@${this.pageType.creatorId} の全投稿をダウンロード`
-      : `投稿 #${this.pageType.type === 'post' ? this.pageType.postId : ''} をダウンロード`;
+      ? `@${this.pageType.creatorId} の全投稿を収集`
+      : `投稿 #${this.pageType.type === 'post' ? this.pageType.postId : ''} を収集`;
     this.panelEl.appendChild(desc);
 
     let ignoreFreeCheckbox: HTMLInputElement | undefined;
@@ -317,29 +485,20 @@ export class OverlayController {
 
     const btnRow = document.createElement('div');
     btnRow.className = 'btn-row';
-    const dlBtn = document.createElement('button');
-    dlBtn.className = 'btn-primary';
-    dlBtn.textContent = 'ダウンロード開始';
-    dlBtn.addEventListener('click', async () => {
+    const collectBtn = document.createElement('button');
+    collectBtn.className = 'btn-primary';
+    // 保存先の確保はここではなく review 画面の確定時に行うので、この操作は収集までしか進めない
+    collectBtn.textContent = '投稿を収集';
+    collectBtn.addEventListener('click', () => {
       if (!this.pageType) return;
       const settings: CollectorSettings = {
         isIgnoreFree: ignoreFreeCheckbox?.checked ?? false,
         limit: limitInput?.value ? Number.parseInt(limitInput.value, 10) : null,
         apiIntervalMs: intervalInput?.value ? Number.parseInt(intervalInput.value, 10) : null,
       };
-      // ジェスチャー有効中にファイル保存先を確保する
-      // (収集に時間がかかると transient activation が失効するため)
-      let handle: Awaited<ReturnType<typeof pickSaveHandle>>;
-      try {
-        handle = await pickSaveHandle(this.pageType.creatorId);
-      } catch (e) {
-        if (e instanceof DOMException && e.name === 'AbortError') return;
-        console.error('ファイル保存先の取得に失敗:', e);
-        return;
-      }
-      this.startCollecting(settings, handle);
+      this.startCollecting(settings);
     });
-    btnRow.appendChild(dlBtn);
+    btnRow.appendChild(collectBtn);
 
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'btn-secondary';
@@ -352,6 +511,7 @@ export class OverlayController {
 
   private renderCollecting() {
     if (!this.panelEl) return;
+    this.panelEl.className = 'overlay-panel';
     this.panelEl.innerHTML = '';
 
     const h2 = document.createElement('h2');
@@ -370,15 +530,374 @@ export class OverlayController {
     cancelBtn.className = 'btn-secondary';
     cancelBtn.textContent = 'キャンセル';
     cancelBtn.addEventListener('click', () => {
-      this.abortController?.abort();
+      this.collectAbort?.abort();
       this.hidePanel();
     });
     btnRow.appendChild(cancelBtn);
     this.panelEl.appendChild(btnRow);
   }
 
+  /**
+   * review 画面を組み立てる (Issue #55)。
+   *
+   * 選択の SoT は `ReviewContext.selection` であり、チェックボックスの状態ではない。
+   * 検索や再描画でチェックボックスの要素は入れ替わるため、DOM を SoT にすると絞り込みの
+   * 操作だけで選択が変わってしまう。
+   */
+  private renderReview() {
+    const ctx = this.review;
+    if (!this.panelEl || !ctx) return;
+    this.panelEl.className = 'overlay-panel overlay-panel-wide';
+    this.panelEl.innerHTML = '';
+
+    const h2 = document.createElement('h2');
+    h2.textContent = 'ダウンロード対象を選択';
+    this.panelEl.appendChild(h2);
+
+    const counts = document.createElement('p');
+    counts.className = 'review-counts';
+    counts.id = 'review-counts';
+    this.panelEl.appendChild(counts);
+
+    const size = document.createElement('p');
+    size.className = 'progress-text';
+    size.id = 'review-size';
+    this.panelEl.appendChild(size);
+
+    const error = document.createElement('p');
+    error.className = 'review-error';
+    error.id = 'review-error';
+    error.hidden = true;
+    this.panelEl.appendChild(error);
+
+    this.panelEl.appendChild(this.buildExtensionSection(ctx));
+    this.panelEl.appendChild(this.buildPostSection(ctx));
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'btn-row';
+    const confirmBtn = document.createElement('button');
+    confirmBtn.className = 'btn-primary';
+    confirmBtn.id = 'review-confirm';
+    confirmBtn.textContent = 'ダウンロード開始';
+    confirmBtn.addEventListener('click', () => this.confirmReview(confirmBtn));
+    btnRow.appendChild(confirmBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn-secondary';
+    cancelBtn.textContent = '閉じる';
+    cancelBtn.addEventListener('click', () => this.hidePanel());
+    btnRow.appendChild(cancelBtn);
+    this.panelEl.appendChild(btnRow);
+
+    this.renderPostList();
+    // 初期選択に対する導出もここから始める。ハンドラが読むだけで済む状態を最初から作る
+    this.onSelectionChanged();
+  }
+
+  /** 拡張子とカバーの選択欄を組み立てる */
+  private buildExtensionSection(ctx: ReviewContext): HTMLElement {
+    const section = document.createElement('section');
+    section.className = 'review-section';
+
+    const heading = document.createElement('h3');
+    heading.textContent = '添付の拡張子';
+    section.appendChild(heading);
+
+    const note = document.createElement('p');
+    note.className = 'review-note';
+    // 「.pdf のみ」と読ませない。拡張子の指定は投稿の添付にしか効かず、カバーは別枠で決まる
+    note.textContent = '拡張子の指定は投稿の添付にだけ効きます。カバー画像は下のトグルで別に選びます。';
+    section.appendChild(note);
+
+    const list = document.createElement('div');
+    list.className = 'review-chip-list';
+    for (const option of ctx.extensionOptions) {
+      const label = document.createElement('label');
+      label.className = 'review-chip';
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = ctx.selection.extensions.has(option.extension);
+      box.addEventListener('change', () => {
+        if (box.checked) {
+          ctx.selection.extensions.add(option.extension);
+        } else {
+          ctx.selection.extensions.delete(option.extension);
+        }
+        this.onSelectionChanged();
+      });
+      label.appendChild(box);
+      label.appendChild(
+        document.createTextNode(
+          ` ${option.extension === '' ? NO_EXTENSION_LABEL : option.extension} (${option.fileCount})`,
+        ),
+      );
+      list.appendChild(label);
+    }
+    if (ctx.extensionOptions.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'progress-text';
+      empty.textContent = '添付を持つ投稿がありません';
+      list.appendChild(empty);
+    }
+    section.appendChild(list);
+
+    const coverLabel = document.createElement('label');
+    const coverBox = document.createElement('input');
+    coverBox.type = 'checkbox';
+    coverBox.id = 'review-cover';
+    coverBox.checked = ctx.selection.includeCover;
+    coverBox.addEventListener('change', () => {
+      ctx.selection.includeCover = coverBox.checked;
+      this.onSelectionChanged();
+    });
+    coverLabel.appendChild(coverBox);
+    coverLabel.appendChild(document.createTextNode('カバー画像を含める'));
+    section.appendChild(coverLabel);
+
+    return section;
+  }
+
+  /** 投稿の検索・一括操作・一覧を組み立てる */
+  private buildPostSection(ctx: ReviewContext): HTMLElement {
+    const section = document.createElement('section');
+    section.className = 'review-section';
+
+    const heading = document.createElement('h3');
+    heading.textContent = '投稿';
+    section.appendChild(heading);
+
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.id = 'review-search';
+    search.className = 'review-search';
+    search.placeholder = '投稿タイトル / postId で絞り込み';
+    search.addEventListener('input', () => {
+      ctx.query = search.value;
+      this.renderPostList();
+    });
+    section.appendChild(search);
+
+    const actions = document.createElement('div');
+    actions.className = 'review-actions';
+    // 操作は 全選択 / 全解除 / 検索結果の選択 / 検索結果の解除 の 4 つに限る。
+    // 「表示中」を対象にする操作は入れない (検索一致が描画上限を超えたとき、利用者が
+    // どちらを指すのか判別できない)。反転も入れない
+    actions.appendChild(
+      this.buildActionButton('全選択', () => {
+        for (const post of ctx.posts) ctx.selection.postIds.add(post.postId);
+        this.renderPostList();
+        this.onSelectionChanged();
+      }),
+    );
+    actions.appendChild(
+      this.buildActionButton('全解除', () => {
+        ctx.selection.postIds.clear();
+        this.renderPostList();
+        this.onSelectionChanged();
+      }),
+    );
+    const selectMatched = this.buildActionButton('検索結果をすべて選択', () => {
+      for (const post of filterPosts(ctx.posts, ctx.query)) ctx.selection.postIds.add(post.postId);
+      this.renderPostList();
+      this.onSelectionChanged();
+    });
+    selectMatched.id = 'review-select-matched';
+    actions.appendChild(selectMatched);
+    const clearMatched = this.buildActionButton('検索結果をすべて解除', () => {
+      for (const post of filterPosts(ctx.posts, ctx.query)) ctx.selection.postIds.delete(post.postId);
+      this.renderPostList();
+      this.onSelectionChanged();
+    });
+    clearMatched.id = 'review-clear-matched';
+    actions.appendChild(clearMatched);
+    section.appendChild(actions);
+
+    const range = document.createElement('p');
+    range.className = 'progress-text';
+    range.id = 'review-range';
+    section.appendChild(range);
+
+    const list = document.createElement('ul');
+    list.className = 'review-post-list';
+    list.id = 'review-list';
+    section.appendChild(list);
+
+    return section;
+  }
+
+  private buildActionButton(label: string, onClick: () => void): HTMLButtonElement {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn-link';
+    button.textContent = label;
+    button.addEventListener('click', onClick);
+    return button;
+  }
+
+  /**
+   * 投稿一覧を描き直す。
+   *
+   * 描画は `POST_LIST_RENDER_LIMIT` 件までに抑えるが、選択は postId の集合に対して適用するので
+   * 描画されていない投稿も一括操作の対象になる。上限は描画コストだけを抑えるものである。
+   */
+  private renderPostList() {
+    const ctx = this.review;
+    const list = this.shadowRoot.getElementById('review-list');
+    const range = this.shadowRoot.getElementById('review-range');
+    if (!ctx || !list) return;
+
+    const matched = filterPosts(ctx.posts, ctx.query);
+    const rendered = matched.slice(0, POST_LIST_RENDER_LIMIT);
+    list.innerHTML = '';
+    for (const post of rendered) {
+      const item = document.createElement('li');
+      const label = document.createElement('label');
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = ctx.selection.postIds.has(post.postId);
+      box.addEventListener('change', () => {
+        if (box.checked) {
+          ctx.selection.postIds.add(post.postId);
+        } else {
+          ctx.selection.postIds.delete(post.postId);
+        }
+        this.onSelectionChanged();
+      });
+      label.appendChild(box);
+      const title = document.createElement('span');
+      title.className = 'review-post-title';
+      title.textContent = post.name;
+      label.appendChild(title);
+      const meta = document.createElement('span');
+      meta.className = 'review-post-meta';
+      meta.textContent = `#${post.postId} / 添付 ${post.files.length} 件${post.cover ? ' / カバーあり' : ''}`;
+      label.appendChild(meta);
+      item.appendChild(label);
+      list.appendChild(item);
+    }
+    if (range) range.textContent = describeRenderedRange(matched.length, rendered.length);
+
+    const hasQuery = ctx.query.trim() !== '';
+    for (const id of ['review-select-matched', 'review-clear-matched']) {
+      const button = this.shadowRoot.getElementById(id) as HTMLButtonElement | null;
+      // 検索語が無いときは「検索結果」が全件と同義になり、全選択 / 全解除と区別が付かない
+      if (button) button.disabled = !hasQuery;
+    }
+  }
+
+  /**
+   * 選択が変わったときの処理。
+   *
+   * 導出 (`project`) はここでは行わず、操作が止まってから走らせる。1000 投稿規模では
+   * `project()` だけで 100 ms 近くかかるため、チェックのたびに走らせるとメインスレッドが
+   * 目に見えて止まる。
+   */
+  private onSelectionChanged() {
+    const ctx = this.review;
+    if (!ctx) return;
+    ctx.prepared = null;
+    ctx.errorMessage = null;
+    if (ctx.prepareTimer !== null) clearTimeout(ctx.prepareTimer);
+    ctx.prepareTimer = setTimeout(() => {
+      ctx.prepareTimer = null;
+      this.prepareProjection(ctx);
+    }, PROJECTION_DEBOUNCE_MS);
+    this.refreshReviewSummary();
+  }
+
+  /**
+   * 選択からダウンロード対象を導出し、ZIP 入力として受け付けられる形かまで確かめる。
+   *
+   * `showSaveFilePicker` は呼ぶだけで新規ファイルを作るため、導出や検証で落ちる可能性を
+   * picker より前に潰しておく。ここで落ちた場合は確定ボタンを無効のままにする。
+   * @param ctx 導出対象の review 状態
+   */
+  private prepareProjection(ctx: ReviewContext) {
+    // 導出待ちの間にパネルが閉じられた、または再収集された場合は捨てる
+    if (this.review !== ctx) return;
+    try {
+      const json = ctx.result.downloadObject.project(toSelection(ctx.selection));
+      assertDownloadable(json);
+      ctx.prepared = json;
+      ctx.errorMessage = null;
+    } catch (e) {
+      console.error('ダウンロード対象の導出に失敗:', e);
+      ctx.prepared = null;
+      ctx.errorMessage = `${PROJECTION_FAILED_MESSAGE}: ${e instanceof Error ? e.message : String(e)}`;
+    }
+    // 件数は選択が変わった時点で更新済みで、導出では変わらない。ここで数え直さない
+    this.refreshConfirmState();
+  }
+
+  /** 件数とサイズを現在の選択に合わせる */
+  private refreshReviewSummary() {
+    const ctx = this.review;
+    if (!ctx) return;
+    const counts = countSelection(ctx.posts, ctx.selection);
+
+    const countsEl = this.shadowRoot.getElementById('review-counts');
+    if (countsEl) countsEl.textContent = describeSelectionCounts(counts);
+    const sizeEl = this.shadowRoot.getElementById('review-size');
+    if (sizeEl) sizeEl.textContent = describeSizeEstimate(counts);
+    publishTestState({
+      'selected-post-count': String(counts.postCount),
+      'selected-file-count': String(counts.fileCount),
+      'selected-cover-count': String(counts.coverCount),
+    });
+    this.refreshConfirmState();
+  }
+
+  /** エラー表示と確定ボタンの可否を更新する。件数の再集計を伴わない */
+  private refreshConfirmState() {
+    const ctx = this.review;
+    if (!ctx) return;
+    const errorEl = this.shadowRoot.getElementById('review-error');
+    if (errorEl) {
+      errorEl.textContent = ctx.errorMessage ?? '';
+      errorEl.hidden = ctx.errorMessage === null;
+    }
+    const confirmBtn = this.shadowRoot.getElementById('review-confirm') as HTMLButtonElement | null;
+    if (confirmBtn) {
+      // 投稿が 0 件なら picker を出さない。押せてしまうと、書くものが無いのに新規ファイルだけ作る。
+      // 収集済みの投稿から作った集合なので、要素があれば必ずどれかの投稿に対応する
+      confirmBtn.disabled = ctx.selection.postIds.size === 0 || ctx.prepared === null;
+    }
+  }
+
+  /**
+   * review の確定。**`pickSaveHandle` より前に await も重い処理も置かないこと。**
+   *
+   * `showSaveFilePicker` はユーザアクティベーションが有効な間しか開けない。導出と検証は
+   * `prepareProjection` が選択のたびに済ませてあるので、ここは読むだけで済む。
+   * @param confirmBtn 二重操作を防ぐために無効化する確定ボタン
+   */
+  private confirmReview(confirmBtn: HTMLButtonElement) {
+    const ctx = this.review;
+    if (!ctx || ctx.prepared === null) return;
+    const prepared = ctx.prepared;
+    const runId = ++this.downloadRunId;
+    confirmBtn.disabled = true;
+    pickSaveHandle(ctx.creatorId, () => this.downloadRunId === runId)
+      .then((handle) => {
+        if (this.downloadRunId !== runId || this.review !== ctx) return;
+        this.startDownloading(ctx, runId, prepared, handle);
+      })
+      .catch((e: unknown) => {
+        if (this.downloadRunId !== runId || this.review !== ctx) return;
+        // 失敗しても選択状態 (ctx.selection) には触れない。選び直せば同じ対象で再試行できる
+        confirmBtn.disabled = false;
+        const message = describePickerFailure(e);
+        // 保存先の選択をやめただけなら、文言も出さずに review に留まる
+        if (message === null) return;
+        console.error('ファイル保存先の取得に失敗:', e);
+        ctx.errorMessage = message;
+        this.refreshConfirmState();
+      });
+  }
+
   private renderDownloading() {
     if (!this.panelEl) return;
+    this.panelEl.className = 'overlay-panel';
     this.panelEl.innerHTML = '';
 
     const h2 = document.createElement('h2');
@@ -418,9 +937,9 @@ export class OverlayController {
     stopBtn.addEventListener('click', () => {
       // 二重操作 (連打・非同期の停止処理中の再クリック) を防ぐため即座に無効化する。
       // hidePanel() はここでは呼ばない: 全破棄ではなく、downloadZip が閉じた
-      // 部分保存の ZIP を活かして完了画面へ遷移させたいため (startCollecting 側で処理する)。
+      // 部分保存の ZIP を活かして完了画面へ遷移させたいため (startDownloading 側で処理する)。
       stopBtn.disabled = true;
-      this.abortController?.abort();
+      this.downloadAbort?.abort();
     });
     btnRow.appendChild(stopBtn);
     this.panelEl.appendChild(btnRow);
@@ -428,6 +947,7 @@ export class OverlayController {
 
   private renderComplete(message: string) {
     if (!this.panelEl) return;
+    this.panelEl.className = 'overlay-panel';
     this.panelEl.innerHTML = '';
 
     const h2 = document.createElement('h2');
@@ -449,69 +969,160 @@ export class OverlayController {
     this.panelEl.appendChild(btnRow);
   }
 
-  private async startCollecting(settings: CollectorSettings, saveHandle: FileSystemFileHandle) {
+  /**
+   * 完了画面へ遷移する。ここから先はページを離れても失うものが無いので unload の警告も外す。
+   *
+   * 収集結果も併せて捨てる。完了画面が使う値は呼び出し側で既に取り出してあり、保持し続けると
+   * 大きいクリエイターでは投稿・アセット・導出結果を抱えたまま画面を閉じるまで解放されない。
+   */
+  private finish(message: string) {
+    this.releaseUnloadGuard();
+    this.discardReview();
+    this.setState('complete');
+    this.renderComplete(message);
+  }
+
+  private async startCollecting(settings: CollectorSettings) {
     if (!this.pageType) return;
     resetTestState();
+    // 新しい収集を始めた時点で、前の ZIP フェーズの結果は観測状態に載せてはいけない
+    this.downloadRunId++;
+    // 前の収集が走ったままなら止める。止めずに差し替えると、旧実行の signal が aborted に
+    // ならないまま進み、集計を publish して review を上書きしうる
+    this.collectAbort?.abort();
+    this.discardReview();
     this.setState('collecting');
     this.renderCollecting();
-    this.abortController = new AbortController();
-    const signal = this.abortController.signal;
-
-    const beforeUnload = (e: BeforeUnloadEvent) => {
-      e.returnValue = 'downloading';
-    };
-    window.addEventListener('beforeunload', beforeUnload);
+    this.collectAbort = new AbortController();
+    const signal = this.collectAbort.signal;
+    this.guardUnload();
 
     try {
       const creatorId = this.pageType.creatorId;
       const postId = this.pageType.type === 'post' ? this.pageType.postId : undefined;
 
-      const { downloadObject, addedPostCount, postFailures, failedPageCount, stoppedReason } = await collect(
+      const result = await collect(
         creatorId,
         postId,
         settings,
         (current, total) => {
+          // await の後の判定ではコールバックに間に合わない。旧実行の進捗が新実行の画面を
+          // 塗り替えないよう、呼び出しごとに現行かを見る
+          if (!this.isCurrentCollect(signal)) return;
           const el = this.shadowRoot.getElementById('collect-progress');
           if (el) el.textContent = `投稿情報を収集中... (${current}/${total})`;
         },
         signal,
       );
 
+      // 状態に触る前に現行かを見る (ZIP フェーズと同じ順序)
+      if (!this.isCurrentCollect(signal)) return;
       if (signal.aborted) {
-        this.publishAbortedIfCurrent(signal);
+        publishTestState({ aborted: '1' });
         return;
       }
 
       publishTestState({
-        'added-post-count': String(addedPostCount),
-        'unavailable-post-count': String(postFailures.unavailable),
-        'unsupported-post-count': String(postFailures.unsupported),
-        'api-failed-post-count': String(postFailures.apiFailed),
-        'failed-page-count': String(failedPageCount),
-        ...(stoppedReason ? { 'stopped-reason': stoppedReason } : {}),
+        'added-post-count': String(result.addedPostCount),
+        'unavailable-post-count': String(result.postFailures.unavailable),
+        'unsupported-post-count': String(result.postFailures.unsupported),
+        'api-failed-post-count': String(result.postFailures.apiFailed),
+        'failed-page-count': String(result.failedPageCount),
+        ...(result.stoppedReason ? { 'stopped-reason': result.stoppedReason } : {}),
       });
 
-      if (addedPostCount === 0) {
-        // 登録できた投稿が無いので ZIP を保存しない (Issue #14)。saveHandle には触れない:
-        // downloadAsZip を呼ばなければ writable を開かないので、書き込みは一切発生しない。
-        // showSaveFilePicker が既に作成済みの 0 バイトファイルはそのまま残る
-        // (削除できない理由は NOTHING_SAVED_HEADLINE のコメントを参照)。
-        this.setState('complete');
-        this.renderComplete(
-          buildCompleteMessage({ aborted: false, addedPostCount, postFailures, failedPageCount, failedFileCount: 0 }),
+      if (result.addedPostCount === 0) {
+        // 登録できた投稿が無いので review へ進まず、ZIP も保存しない (Issue #14)。
+        // 保存先の確保は review の確定時に初めて行うので、0 バイトのファイルも作られない
+        // (Issue #55 でこの経路の「空ファイルが残る」問題は解消した)
+        this.finish(
+          buildCompleteMessage({
+            aborted: false,
+            addedPostCount: result.addedPostCount,
+            postFailures: result.postFailures,
+            failedPageCount: result.failedPageCount,
+            failedFileCount: 0,
+          }),
         );
         return;
       }
 
-      this.setState('downloading');
-      this.renderDownloading();
+      this.enterReview(creatorId, result);
+    } catch (e) {
+      // hidePanel() や新しい収集が既に走っているなら、旧実行はここで降りる。
+      // エラー表示も publish も新実行のものを上書きしてしまう
+      if (!this.isCurrentCollect(signal)) return;
+      if (signal.aborted) {
+        publishTestState({ aborted: '1' });
+        // 収集中のキャンセルは renderCollecting() のボタンが hidePanel() を伴うため、
+        // 上の判定で弾かれてここには来ない。到達したなら契約違反なので素直にエラーを出す
+        console.error('収集エラー (中断中の契約違反):', e);
+        publishTestState({ error: '1' });
+        this.finish(`エラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);
+        return;
+      }
+      if (isUnsupportedResponseError(e)) {
+        // 未対応のレスポンス形式による中断 (Issue #14。内訳は isUnsupportedResponseError 参照)。
+        // review へ進まないので保存先も確保せず、ZIP も空ファイルも残らない
+        console.error('収集を中断しました (未対応のレスポンス形式):', e);
+        publishTestState({ 'unsupported-response': '1' });
+        this.finish(UNSUPPORTED_RESPONSE_HEADLINE);
+        return;
+      }
+      console.error('収集エラー:', e);
+      publishTestState({ error: '1' });
+      this.finish(`エラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      // 無条件に null 化すると、旧実行が遅れて解決した際に新実行の controller を消してしまう
+      if (this.isCurrentCollect(signal)) {
+        this.collectAbort = null;
+      }
+    }
+  }
 
+  /** 収集結果を review 画面に載せる。収集用の controller はここで役目を終える */
+  private enterReview(creatorId: string, result: CollectResult) {
+    const posts = result.downloadObject.listPosts();
+    this.review = {
+      creatorId,
+      result,
+      posts,
+      extensionOptions: listExtensionOptions(posts),
+      selection: createInitialSelection(posts),
+      query: '',
+      prepared: null,
+      prepareTimer: null,
+      errorMessage: null,
+    };
+    this.setState('review');
+    this.renderReview();
+  }
+
+  private async startDownloading(
+    ctx: ReviewContext,
+    runId: number,
+    json: DownloadJsonObj,
+    saveHandle: FileSystemFileHandle,
+  ) {
+    // 確定した時点で選択はもう変わらない。残った導出待ちを走らせても捨てるだけになる
+    this.cancelPreparation();
+    this.downloadAbort = new AbortController();
+    const signal = this.downloadAbort.signal;
+    this.setState('downloading');
+    this.renderDownloading();
+    const { addedPostCount, postFailures, failedPageCount, stoppedReason } = ctx.result;
+
+    try {
+      // コールバックは downloadZip の中から呼ばれるので、await の後の判定では間に合わない。
+      // 旧実行の進捗が新実行の画面を塗り替えないよう、各呼び出しで現行かを見る
       const downloadProgress: DownloadProgress = {
         onProgress: (percent) => {
+          if (this.downloadRunId !== runId) return;
           const fill = this.shadowRoot.getElementById('dl-progress-fill');
           if (fill) fill.style.width = `${percent}%`;
         },
         onLog: (message) => {
+          if (this.downloadRunId !== runId) return;
           const logArea = this.shadowRoot.getElementById('dl-log') as HTMLTextAreaElement | null;
           if (logArea) {
             logArea.value += `${message}\n`;
@@ -519,48 +1130,33 @@ export class OverlayController {
           }
         },
         onRemainTime: (time) => {
+          if (this.downloadRunId !== runId) return;
           const el = this.shadowRoot.getElementById('dl-remain');
           if (el) el.textContent = `残りおよそ ${time}`;
         },
       };
 
-      const json = downloadObject.stringify();
-      const { zip } = await downloadAsZip(saveHandle, json, downloadProgress, signal);
-      // zip.failedFileCount はカバー画像を含む対象単位の最終失敗数 (download-helper v4.4.0 が
-      // 中断由来の欠落を除いて集計する)。試行単位の記録 (attempts) とは別物なので、
-      // ここでは対象単位の集計のみを完了画面に反映する
+      const { zip } = await downloadAsZip(
+        saveHandle,
+        json,
+        downloadProgress,
+        signal,
+        () => this.downloadRunId === runId,
+      );
+      // 状態を触る前に現行の実行かを見る。旧実行の遅延解決が新実行の画面と観測状態を
+      // 上書きするのを防ぐ (中断してすぐ再実行したときに起こりうる)
+      if (this.downloadRunId !== runId || !this.isCurrentDownload(signal)) return;
+      // zip.failedFileCount はカバー画像を含む対象単位の最終失敗数 (中断由来は含まない)。
+      // 試行単位の記録 (attempts) とは別物なので、完了画面には対象単位の集計だけを反映する
       publishTestState({ 'failed-file-count': String(zip.failedFileCount) });
 
       // downloadZip は中断されても ZIP を閉じて正常に戻るため、ここで見ないと
-      // 途中までの ZIP を「完了しました」と表示してしまう
-      if (signal.aborted) {
-        this.publishAbortedIfCurrent(signal);
-        if (signal !== this.abortController?.signal) {
-          // hidePanel() (パネルの再オープン等) が既に別経路で呼ばれ、UI は
-          // settings にリセット済み。ここでは何もしない。
-          return;
-        }
-        // ここまで残っているのは「ここまでで終了」ボタンによる中断のみ (収集中の
-        // キャンセルは renderCollecting() のボタンが hidePanel() を伴って
-        // 即座に全破棄するため、この分岐に到達する前に上の signal !== ... で弾かれる)。
-        this.setState('complete');
-        this.renderComplete(
-          buildCompleteMessage({
-            aborted: true,
-            addedPostCount,
-            postFailures,
-            failedPageCount,
-            failedFileCount: zip.failedFileCount,
-            stoppedReason,
-          }),
-        );
-        return;
-      }
-
-      this.setState('complete');
-      this.renderComplete(
+      // 途中までの ZIP を「完了しました」と表示してしまう。
+      // ここまで残っている中断は「ここまでで終了」ボタンによるものだけである
+      if (signal.aborted) publishTestState({ aborted: '1' });
+      this.finish(
         buildCompleteMessage({
-          aborted: false,
+          aborted: signal.aborted,
           addedPostCount,
           postFailures,
           failedPageCount,
@@ -569,48 +1165,22 @@ export class OverlayController {
         }),
       );
     } catch (e) {
+      if (this.downloadRunId !== runId || !this.isCurrentDownload(signal)) return;
       if (signal.aborted) {
-        this.publishAbortedIfCurrent(signal);
-        if (signal !== this.abortController?.signal) {
-          // hidePanel() が既に別経路で UI をリセット済み (収集中のキャンセル等)。
-          // ここでは何もしない。
-          return;
-        }
+        publishTestState({ aborted: '1' });
         // 「ここまでで終了」による中断中に例外が発生したケース。downloadZip の契約上
         // 中断は正常 return のはずだが、契約違反として素直にログを残しつつ、
         // 「ダウンロード中」画面のまま固まらせないよう通常のエラー表示に合流させる
         // (部分保存の保証はできないため「保存して終了しました」ではなく素直にエラーと伝える)。
         console.error('ダウンロードエラー (中断中の契約違反):', e);
-        publishTestState({ error: '1' });
-        this.setState('complete');
-        this.renderComplete(`エラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);
-        return;
+      } else {
+        console.error('ダウンロードエラー:', e);
       }
-      if (isUnsupportedResponseError(e)) {
-        // 未対応のレスポンス形式による中断 (Issue #14。内訳は isUnsupportedResponseError 参照)。
-        // collect() が投稿を 1 件も返さないまま例外を投げるため、downloadAsZip は
-        // 呼ばれておらず ZIP は保存されていない (NOTHING_SAVED_HEADLINE と同じ理由で、
-        // showSaveFilePicker が作成済みの 0 バイトファイルはそのまま残る)。
-        console.error('収集を中断しました (未対応のレスポンス形式):', e);
-        publishTestState({ 'unsupported-response': '1' });
-        this.setState('complete');
-        this.renderComplete(UNSUPPORTED_RESPONSE_HEADLINE);
-        return;
-      }
-      console.error('ダウンロードエラー:', e);
       publishTestState({ error: '1' });
-      this.setState('complete');
-      this.renderComplete(`エラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);
+      this.finish(`エラーが発生しました: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
-      window.removeEventListener('beforeunload', beforeUnload);
-      // 無条件に null化すると、旧実行が downloadAsZip (中断後の zip.close 含む) の
-      // 完了を待っている間にパネルが再オープンされ新しい実行が始まった場合、旧実行の
-      // finally が新実行の this.abortController を消してしまう競合が起きる。
-      // そうなると新実行では「ここまでで終了」も hidePanel() のキャンセルも
-      // abortController.abort() が発火せず効かなくなる。signal が現行の実行のもので
-      // あるときに限って null にすることで、旧実行は新実行の controller に触れない。
-      if (signal === this.abortController?.signal) {
-        this.abortController = null;
+      if (this.isCurrentDownload(signal)) {
+        this.downloadAbort = null;
       }
     }
   }

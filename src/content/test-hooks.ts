@@ -76,6 +76,9 @@ export function resetTestState(): void {
       'failed-page-count',
       'stopped-reason',
       'failed-file-count',
+      'selected-post-count',
+      'selected-file-count',
+      'selected-cover-count',
       'fetched-urls',
       'zip-b64',
       'zip-url',
@@ -84,6 +87,24 @@ export function resetTestState(): void {
     ];
     for (const key of keys) {
       document.documentElement.removeAttribute(`data-fbdl-${key}`);
+    }
+  }
+}
+
+/**
+ * 状態遷移が許された組み合わせかを、テストビルドでのみ検証する。
+ *
+ * 表そのものは overlay.ts にあり、そちらが SoT である。ここは「実装が表どおりに動いているか」を
+ * 実行時に突き合わせる側で、e2e が通る間ずっと有効になる。
+ * 通常ビルドでは何もしない。遷移表の破れは開発時の誤りであって、利用者の画面を落として直すものではない。
+ * @param from 現在の状態
+ * @param to 遷移先
+ * @param allowed 許される遷移先の一覧 (overlay.ts の OVERLAY_TRANSITIONS)
+ */
+export function assertAllowedTransitionForTest(from: string, to: string, allowed: readonly string[]): void {
+  if (typeof __FBDL_TEST__ !== 'undefined' && __FBDL_TEST__) {
+    if (from !== to && !allowed.includes(to)) {
+      throw new Error(`許されない状態遷移: ${from} → ${to}`);
     }
   }
 }
@@ -107,14 +128,20 @@ const ZIP_B64_PUBLISH_LIMIT = 8 * 1024 * 1024;
  *
  * 呼び出し側 (downloader.ts の pickSaveHandle) が既に `if (IS_TEST_BUILD)` の中でのみ
  * 呼ぶため、ここでは内部ガードを持たない (呼び出し規約は本ファイル冒頭のコメントを参照)。
+ *
+ * `shouldPublish` は close() の時点で評価する。ZIP の書き込みは中断されても最後まで走るので、
+ * パネルを閉じて別の収集を始めた後に旧実行の close() が完了しうる。そのとき publish すると、
+ * 新しい実行の観測状態に旧実行の ZIP が載る (resetTestState の後に publish されるため消えない)。
+ * @param shouldPublish close() 時に観測状態を publish してよいかの判定。省略時は常に publish する
  */
-export function createTestSaveHandle(): FileSystemFileHandle {
+export function createTestSaveHandle(shouldPublish?: () => boolean): FileSystemFileHandle {
   const chunks: Uint8Array[] = [];
   const writable = {
     write: async (data: Uint8Array) => {
       chunks.push(new Uint8Array(data));
     },
     close: async () => {
+      if (shouldPublish && !shouldPublish()) return;
       const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
       const buffer = new Uint8Array(total);
       let offset = 0;
@@ -150,12 +177,18 @@ export function createTestSaveHandle(): FileSystemFileHandle {
  */
 export function wrapFetchFileForTest(
   fetchFile: (url: string, name: string, context: { kind: 'cover' | 'file' }) => Promise<Blob | null>,
+  shouldPublish?: () => boolean,
 ): (url: string, name: string, context: { kind: 'cover' | 'file' }) => Promise<Blob | null> {
   if (IS_TEST_BUILD) {
     const fetchedUrls: string[] = [];
     return async (url: string, name: string, context: { kind: 'cover' | 'file' }) => {
       fetchedUrls.push(url);
-      publishTestState({ 'fetched-urls': JSON.stringify(fetchedUrls) });
+      // 中断は次のループ境界でしか効かないので、旧実行はまだ数件ぶん進みうる。
+      // 新しい収集が resetTestState() した後にここが publish すると、旧実行の URL が
+      // 新実行の観測状態に載ったまま消えない
+      if (!shouldPublish || shouldPublish()) {
+        publishTestState({ 'fetched-urls': JSON.stringify(fetchedUrls) });
+      }
       return fetchFile(url, name, context);
     };
   }
