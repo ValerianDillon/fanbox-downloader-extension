@@ -130,7 +130,17 @@ function filePost(id: string, title: string, files: { url: string; name: string;
   return {
     stub: { ...common, cover: null },
     infoUrl: `https://api.fanbox.cc/post.info?postId=${id}`,
-    info: { body: { post: { ...common, coverImageUrl: null, type: 'file', body: { text: '', files } } } },
+    // download-helper v8 以降、アセットの id は必須 (AssetKey の identity になる)
+    info: {
+      body: {
+        post: {
+          ...common,
+          coverImageUrl: null,
+          type: 'file',
+          body: { text: '', files: files.map((file, index) => ({ id: `${id}-file-${index + 1}`, ...file })) },
+        },
+      },
+    },
   };
 }
 

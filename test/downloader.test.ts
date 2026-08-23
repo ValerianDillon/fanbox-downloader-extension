@@ -6,6 +6,55 @@ import { installFakeMediaRuntime, simpleResponder } from './fake-media-port';
 // chrome.storage.local も get(key) / set(items) の契約は storage.session と同じなのでフェイクを流用する
 import { createFakeSessionStorage } from './service-worker/fake-storage';
 
+/**
+ * 手組みの DownloadJsonObj に manifest を後付けする。
+ *
+ * download-helper v8 から manifest は projection を経た印であり、isDownloadJsonObj は
+ * JSON の投稿・アセットと 1 対 1 で対応することまで検証する。テストの fixture は
+ * projection を通していないので、対応する manifest をここで組み立てる
+ */
+type TestPost = {
+  originalName: string;
+  encodedName: string;
+  informationText: string;
+  htmlText: string;
+  files: { url: string; originalName: string; encodedName: string }[];
+  tags: string[];
+  cover?: { url: string; name: string };
+  publishedDatetime?: string;
+};
+
+function withManifest(obj: { id: string; posts: TestPost[]; [key: string]: unknown }): Record<string, unknown> {
+  const posts = obj.posts.map((post, i) => ({
+    postId: `p${i + 1}`,
+    archiveDirectory: post.encodedName,
+    included: [
+      ...post.files.map((file, j) => ({
+        kind: 'file' as const,
+        assetId: `f${i + 1}-${j + 1}`,
+        originalName: file.originalName,
+        extension: '',
+        archiveName: file.encodedName,
+      })),
+      ...(post.cover
+        ? [{ kind: 'cover' as const, originalName: 'cover', extension: '', archiveName: post.cover.name }]
+        : []),
+    ],
+    excluded: [],
+  }));
+  return {
+    ...obj,
+    manifest: {
+      schemaVersion: 1,
+      creatorId: obj.id,
+      generatedAt: '2026-08-23T00:00:00.000Z',
+      selection: { postIds: posts.map((it) => it.postId), extensions: [''], includeCover: true },
+      posts,
+      excludedPosts: [],
+    },
+  };
+}
+
 // ZipWriter が書き込む先のモック。write() で渡る Uint8Array を蓄積する。
 class MockWritableStream {
   chunks: Uint8Array[] = [];
@@ -93,32 +142,34 @@ describe('downloadAsZip - publishedDatetime (info/html, chrome 不要)', () => {
   test('post 配下 info/index.html とルートは日時付与、publishedDatetime なしの post 配下は付与なし', async () => {
     const published = '2024-05-01T12:34:56Z';
     const expectedUnix = Math.floor(new Date(published).getTime() / 1000);
-    const json = JSON.stringify({
-      id: 'u',
-      url: '#main',
-      tags: [],
-      postCount: 2,
-      fileCount: 0,
-      posts: [
-        {
-          originalName: 'withDate',
-          encodedName: 'withDate',
-          informationText: '{"postId":"1"}',
-          htmlText: '<p>a</p>',
-          files: [],
-          tags: [],
-          publishedDatetime: published,
-        },
-        {
-          originalName: 'noDate',
-          encodedName: 'noDate',
-          informationText: '{"postId":"2"}',
-          htmlText: '<p>b</p>',
-          files: [],
-          tags: [],
-        },
-      ],
-    });
+    const json = JSON.stringify(
+      withManifest({
+        id: 'u',
+        url: '#main',
+        tags: [],
+        postCount: 2,
+        fileCount: 0,
+        posts: [
+          {
+            originalName: 'withDate',
+            encodedName: 'withDate',
+            informationText: '{"postId":"1"}',
+            htmlText: '<p>a</p>',
+            files: [],
+            tags: [],
+            publishedDatetime: published,
+          },
+          {
+            originalName: 'noDate',
+            encodedName: 'noDate',
+            informationText: '{"postId":"2"}',
+            htmlText: '<p>b</p>',
+            files: [],
+            tags: [],
+          },
+        ],
+      }),
+    );
     const { handle, mock } = makeHandle();
     await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
     expect(mock.closed).toBe(true);
@@ -168,24 +219,26 @@ describe('downloadAsZip - publishedDatetime (info/html, chrome 不要)', () => {
   });
 
   test('不正値 publishedDatetime の post は date なし (fallback)', async () => {
-    const json = JSON.stringify({
-      id: 'u',
-      url: '#main',
-      tags: [],
-      postCount: 1,
-      fileCount: 0,
-      posts: [
-        {
-          originalName: 'bad',
-          encodedName: 'bad',
-          informationText: '{"postId":"3"}',
-          htmlText: '<p>c</p>',
-          files: [],
-          tags: [],
-          publishedDatetime: 'not-a-date',
-        },
-      ],
-    });
+    const json = JSON.stringify(
+      withManifest({
+        id: 'u',
+        url: '#main',
+        tags: [],
+        postCount: 1,
+        fileCount: 0,
+        posts: [
+          {
+            originalName: 'bad',
+            encodedName: 'bad',
+            informationText: '{"postId":"3"}',
+            htmlText: '<p>c</p>',
+            files: [],
+            tags: [],
+            publishedDatetime: 'not-a-date',
+          },
+        ],
+      }),
+    );
     const { handle, mock } = makeHandle();
     await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
 
@@ -215,41 +268,43 @@ describe('downloadAsZip - publishedDatetime (info/html, chrome 不要)', () => {
     const later = '2024-12-31T23:59:59Z';
     const expectedEarlierUnix = Math.floor(new Date(earlier).getTime() / 1000);
     const expectedLaterUnix = Math.floor(new Date(later).getTime() / 1000);
-    const json = JSON.stringify({
-      id: 'u',
-      url: '#main',
-      tags: [],
-      postCount: 3,
-      fileCount: 0,
-      posts: [
-        {
-          originalName: 'earlier',
-          encodedName: 'earlier',
-          informationText: '{}',
-          htmlText: '<p>a</p>',
-          files: [],
-          tags: [],
-          publishedDatetime: earlier,
-        },
-        {
-          originalName: 'later',
-          encodedName: 'later',
-          informationText: '{}',
-          htmlText: '<p>b</p>',
-          files: [],
-          tags: [],
-          publishedDatetime: later,
-        },
-        {
-          originalName: 'none',
-          encodedName: 'none',
-          informationText: '{}',
-          htmlText: '<p>c</p>',
-          files: [],
-          tags: [],
-        },
-      ],
-    });
+    const json = JSON.stringify(
+      withManifest({
+        id: 'u',
+        url: '#main',
+        tags: [],
+        postCount: 3,
+        fileCount: 0,
+        posts: [
+          {
+            originalName: 'earlier',
+            encodedName: 'earlier',
+            informationText: '{}',
+            htmlText: '<p>a</p>',
+            files: [],
+            tags: [],
+            publishedDatetime: earlier,
+          },
+          {
+            originalName: 'later',
+            encodedName: 'later',
+            informationText: '{}',
+            htmlText: '<p>b</p>',
+            files: [],
+            tags: [],
+            publishedDatetime: later,
+          },
+          {
+            originalName: 'none',
+            encodedName: 'none',
+            informationText: '{}',
+            htmlText: '<p>c</p>',
+            files: [],
+            tags: [],
+          },
+        ],
+      }),
+    );
     const { handle, mock } = makeHandle();
     await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
 
@@ -281,25 +336,27 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
 
     const published = '2023-08-15T09:00:00Z';
     const expectedUnix = Math.floor(new Date(published).getTime() / 1000);
-    const json = JSON.stringify({
-      id: 'u',
-      url: '#main',
-      tags: [],
-      postCount: 1,
-      fileCount: 1,
-      posts: [
-        {
-          originalName: 'p',
-          encodedName: 'p',
-          informationText: '{}',
-          htmlText: '<p></p>',
-          files: [{ url: 'https://example.test/f', originalName: 'f.bin', encodedName: 'f.bin' }],
-          tags: [],
-          cover: { url: 'https://example.test/c', name: 'cover.png' },
-          publishedDatetime: published,
-        },
-      ],
-    });
+    const json = JSON.stringify(
+      withManifest({
+        id: 'u',
+        url: '#main',
+        tags: [],
+        postCount: 1,
+        fileCount: 1,
+        posts: [
+          {
+            originalName: 'p',
+            encodedName: 'p',
+            informationText: '{}',
+            htmlText: '<p></p>',
+            files: [{ url: 'https://example.test/f', originalName: 'f.bin', encodedName: 'f.bin' }],
+            tags: [],
+            cover: { url: 'https://example.test/c', name: 'cover.png' },
+            publishedDatetime: published,
+          },
+        ],
+      }),
+    );
     const { handle, mock } = makeHandle();
     const { zip, attempts } = await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
 
@@ -334,23 +391,25 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
       origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
 
     try {
-      const json = JSON.stringify({
-        id: 'u',
-        url: '#main',
-        tags: [],
-        postCount: 1,
-        fileCount: 1,
-        posts: [
-          {
-            originalName: 'p',
-            encodedName: 'p',
-            informationText: '{}',
-            htmlText: '<p></p>',
-            files: [{ url: 'https://example.test/f', originalName: 'f.bin', encodedName: 'f.bin' }],
-            tags: [],
-          },
-        ],
-      });
+      const json = JSON.stringify(
+        withManifest({
+          id: 'u',
+          url: '#main',
+          tags: [],
+          postCount: 1,
+          fileCount: 1,
+          posts: [
+            {
+              originalName: 'p',
+              encodedName: 'p',
+              informationText: '{}',
+              htmlText: '<p></p>',
+              files: [{ url: 'https://example.test/f', originalName: 'f.bin', encodedName: 'f.bin' }],
+              tags: [],
+            },
+          ],
+        }),
+      );
       const { handle } = makeHandle();
       const { attempts } = await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
 
@@ -370,23 +429,25 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
       origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
 
     try {
-      const json = JSON.stringify({
-        id: 'u',
-        url: '#main',
-        tags: [],
-        postCount: 1,
-        fileCount: 1,
-        posts: [
-          {
-            originalName: 'p',
-            encodedName: 'p',
-            informationText: '{}',
-            htmlText: '<p></p>',
-            files: [{ url: 'https://example.test/f', originalName: 'f.bin', encodedName: 'f.bin' }],
-            tags: [],
-          },
-        ],
-      });
+      const json = JSON.stringify(
+        withManifest({
+          id: 'u',
+          url: '#main',
+          tags: [],
+          postCount: 1,
+          fileCount: 1,
+          posts: [
+            {
+              originalName: 'p',
+              encodedName: 'p',
+              informationText: '{}',
+              htmlText: '<p></p>',
+              files: [{ url: 'https://example.test/f', originalName: 'f.bin', encodedName: 'f.bin' }],
+              tags: [],
+            },
+          ],
+        }),
+      );
       const { handle } = makeHandle();
       const { zip, attempts } = await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
 
