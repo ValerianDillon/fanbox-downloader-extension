@@ -155,11 +155,31 @@ export function buildSavedPosts(
 }
 
 /**
- * 収集と ZIP の結果を、履歴へ送る 1 つの差分にまとめる。
+ * 収集で分かったこと (観測カタログと走査実績) を差分にする。
  *
- * 観測時刻には収集を終えた時刻 (`CollectResult.collectedAt`) を使い、保存時刻には ZIP を
- * 書き終えた時刻を使う。review 画面での選択に時間をかけると両者は大きく離れるので、
- * 観測を保存時刻で代用すると、遅れて保存した古い観測が新しい観測を上書きしうる。
+ * **ZIP の保存とは別に送る。** 全投稿が「前回保存済み」で省かれた回は ZIP を作らないので、
+ * 保存実績と一緒にしか送らないと、**確認しただけの回の走査実績と最終利用時刻が残らない**。
+ * 残らないと、頻繁に確認しているだけの creator が LRU で先に捨てられ、次回は全件取り直しになる。
+ *
+ * 観測だけでは `post.info` の省略は成立しない (省略は保存実績も要求する) ので、
+ * 収集して保存しなかった回にこれを書いても取得済みとして扱われることはない。
+ * @param creatorId 対象の creator
+ * @param result 収集結果
+ */
+export function buildObservationUpdate(creatorId: string, result: CollectResult): CreatorHistoryUpdate {
+  const scan = buildScanRecord(result, result.collectedAt);
+  const update: CreatorHistoryUpdate = {
+    creatorId,
+    at: result.collectedAt,
+    catalog: buildCatalog(result, result.collectedAt),
+  };
+  return scan === null ? update : { ...update, scan };
+}
+
+/**
+ * ZIP の書き込み結果を差分にする。
+ *
+ * 観測は `buildObservationUpdate` が別に送るので、ここには含めない。
  * @param creatorId 対象の creator
  * @param result 収集結果
  * @param manifest `preflight` が返した検証済みの manifest
@@ -167,7 +187,7 @@ export function buildSavedPosts(
  * @param zipName 保存先のファイル名
  * @param savedAt ZIP の書き込みを終えた時刻 (epoch ms)
  */
-export function buildHistoryUpdate(
+export function buildSaveUpdate(
   creatorId: string,
   result: CollectResult,
   manifest: DownloadManifest,
@@ -175,12 +195,9 @@ export function buildHistoryUpdate(
   zipName: string,
   savedAt: number,
 ): CreatorHistoryUpdate {
-  const scan = buildScanRecord(result, result.collectedAt);
-  const update: CreatorHistoryUpdate = {
+  return {
     creatorId,
     at: savedAt,
-    catalog: buildCatalog(result, result.collectedAt),
     saved: buildSavedPosts(manifest, zipAssets, result.listedRevisions, zipName, savedAt),
   };
-  return scan === null ? update : { ...update, scan };
 }

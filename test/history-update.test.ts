@@ -2,7 +2,13 @@ import { describe, expect, test } from 'bun:test';
 import type { AssetWriteResult, DownloadManifest } from 'download-helper/download-helper';
 import { ARCHIVE_FORMAT_VERSION } from '../src/content/archive-path';
 import type { CollectResult } from '../src/content/fanbox/collector';
-import { buildCatalog, buildHistoryUpdate, buildSavedPosts, buildScanRecord } from '../src/content/history-update';
+import {
+  buildCatalog,
+  buildObservationUpdate,
+  buildSavedPosts,
+  buildSaveUpdate,
+  buildScanRecord,
+} from '../src/content/history-update';
 
 const COLLECTED_AT = 1_000;
 const SAVED_AT = 2_000;
@@ -272,24 +278,35 @@ describe('履歴の差分の組み立て', () => {
     { postId: 'p1', archiveDirectory: 'p1_dir', included: [{ kind: 'cover', archiveName: 'cover.jpg' }] },
   ]);
 
-  test('観測時刻は収集の時刻、保存時刻は ZIP の時刻を使う (review に時間をかけても観測が新しく見えないようにするため)。', () => {
+  test('観測の差分には収集の時刻を使い、保存実績は含めない (ZIP を作らない回にも書けるようにするため)。', () => {
     const result = makeResult({ posts: [{ postId: 'p1', name: 'a', tags: [], files: [] }] });
 
-    const update = buildHistoryUpdate('c1', result, manifest, [writeResult(0, 'cover.jpg', 'written')], 'z', SAVED_AT);
+    const update = buildObservationUpdate('c1', result);
 
-    expect([
-      update.at,
-      update.catalog?.[0].observedAt,
-      update.scan?.scannedAt,
-      update.saved?.[0].assets[0].savedAt,
-    ]).toEqual([SAVED_AT, COLLECTED_AT, COLLECTED_AT, SAVED_AT]);
+    expect([update.at, update.catalog?.[0].observedAt, update.scan?.scannedAt]).toEqual([
+      COLLECTED_AT,
+      COLLECTED_AT,
+      COLLECTED_AT,
+    ]);
+    expect('saved' in update).toBe(false);
   });
 
-  test('単一投稿モードでは走査実績を差分に含めない (一覧を見ていない収集で削除の判断材料を上書きしないため)。', () => {
+  test('単一投稿モードでは観測の差分に走査実績を含めない (一覧を見ていない収集で削除の判断材料を上書きしないため)。', () => {
     const result = makeResult({ scannedCreator: false, posts: [{ postId: 'p1', name: 'a', tags: [], files: [] }] });
 
-    const update = buildHistoryUpdate('c1', result, manifest, [writeResult(0, 'cover.jpg', 'written')], 'z', SAVED_AT);
+    expect('scan' in buildObservationUpdate('c1', result)).toBe(false);
+  });
 
-    expect('scan' in update).toBe(false);
+  test('保存の差分には ZIP の時刻を使い、観測は含めない (観測は収集の時点で別に書いてあるため)。', () => {
+    const result = makeResult({ posts: [{ postId: 'p1', name: 'a', tags: [], files: [] }] });
+
+    const update = buildSaveUpdate('c1', result, manifest, [writeResult(0, 'cover.jpg', 'written')], 'z', SAVED_AT);
+
+    expect([update.at, update.saved?.[0].savedAt, update.saved?.[0].assets[0].savedAt]).toEqual([
+      SAVED_AT,
+      SAVED_AT,
+      SAVED_AT,
+    ]);
+    expect(['catalog' in update, 'scan' in update]).toEqual([false, false]);
   });
 });

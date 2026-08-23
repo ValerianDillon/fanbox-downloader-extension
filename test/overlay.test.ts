@@ -1,4 +1,5 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
+import type { DownloadManifest, DownloadZipResult } from 'download-helper/download-helper';
 import {
   ApiShapeError,
   HttpError,
@@ -6,6 +7,7 @@ import {
   ResponseParseError,
   TransportExhaustedError,
 } from '../src/content/fanbox/api';
+import type { CollectResult } from '../src/content/fanbox/collector';
 import { PostBodyInvalidError, type PostFailureCounts } from '../src/content/fanbox/collector';
 import {
   ALREADY_SAVED_HEADLINE,
@@ -21,6 +23,8 @@ import {
   PARTIAL_FILE_FAILURE_HEADLINE,
   PICKER_FAILED_MESSAGE,
   RATE_LIMIT_EXHAUSTED_HEADLINE,
+  recordHistory,
+  recordObservation,
   TRANSPORT_EXHAUSTED_HEADLINE,
   UNSUPPORTED_RESPONSE_HEADLINE,
 } from '../src/content/overlay';
@@ -490,5 +494,129 @@ describe('Issue #55: 保存先の取得に失敗したときの文言 (describeP
 
   test('Error ですらない値も文言を出す', () => {
     expect(describePickerFailure('boom')).toBe(`${PICKER_FAILED_MESSAGE}: boom`);
+  });
+});
+
+/**
+ * Issue #56: 収集・ZIP の結果が実際に履歴として送られるかの検証。
+ *
+ * 差分の組み立て (`history-update.ts`) とは別に、**送る・送らないの判断**を固定する。
+ * 組み立てだけをテストしても、呼び出しを消した退行を検出できない。
+ */
+describe('Issue #56: 履歴の記録', () => {
+  const origChrome = (globalThis as { chrome?: unknown }).chrome;
+  let sent: unknown[];
+
+  const installRuntime = (respond: () => unknown) => {
+    sent = [];
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async (message: unknown) => {
+          sent.push(message);
+          return respond();
+        },
+      },
+    };
+  };
+
+  const makeResult = () =>
+    ({
+      downloadObject: { listPosts: () => [] },
+      addedPostCount: 1,
+      postFailures: {
+        unavailable: 0,
+        unavailableRestricted: 0,
+        unavailableMissingBody: 0,
+        unsupported: 0,
+        apiFailed: 0,
+      },
+      failedPageCount: 0,
+      listedRevisions: new Map(),
+      apiFailedPostIds: new Set(),
+      skippedByHistoryPostIds: new Set(),
+      collectedAt: 1000,
+      scannedCreator: true,
+      completedFullScan: true,
+      limited: false,
+    }) as unknown as CollectResult;
+
+  const manifest = { posts: [] } as unknown as DownloadManifest;
+  const zip = (aborted: boolean) =>
+    ({
+      completedPostCount: 1,
+      totalPostCount: 1,
+      writtenFileCount: 0,
+      failedFileCount: 0,
+      aborted,
+      assets: [],
+    }) as unknown as DownloadZipResult;
+
+  afterEach(() => {
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = origChrome;
+  });
+
+  test('収集を終えたら観測を送る (ZIP を作らない回にも走査実績と最終利用時刻を残すため)', async () => {
+    installRuntime(() => ({ ok: true }));
+
+    const error = await recordObservation('creator-1', makeResult());
+
+    expect(error).toBeNull();
+    expect(sent).toEqual([
+      { type: 'historyApply', update: { creatorId: 'creator-1', at: 1000, catalog: [], scan: expect.anything() } },
+    ]);
+  });
+
+  test('ZIP を書き終えたら保存実績を送る (書けたことを次回の差分判定へ渡すため)', async () => {
+    installRuntime(() => ({ ok: true }));
+
+    const error = await recordHistory(
+      { creatorId: 'creator-1', result: makeResult() },
+      manifest,
+      zip(false),
+      'out.zip',
+      new AbortController().signal,
+    );
+
+    expect(error).toBeNull();
+    expect((sent[0] as { update: { saved?: unknown } }).update.saved).toEqual([]);
+  });
+
+  test('中断で終わった実行は保存実績を送らない (書けたと確認できていないものを保存済みにしないため)', async () => {
+    installRuntime(() => ({ ok: true }));
+    const controller = new AbortController();
+    controller.abort();
+
+    const bySignal = await recordHistory(
+      { creatorId: 'creator-1', result: makeResult() },
+      manifest,
+      zip(false),
+      'out.zip',
+      controller.signal,
+    );
+    const byZip = await recordHistory(
+      { creatorId: 'creator-1', result: makeResult() },
+      manifest,
+      zip(true),
+      'out.zip',
+      new AbortController().signal,
+    );
+
+    expect([bySignal, byZip, sent]).toEqual([null, null, []]);
+  });
+
+  test('service worker が失敗を返したらその理由を返す (完了画面へ伝えるため)', async () => {
+    installRuntime(() => ({ ok: false, error: 'storage が一杯です' }));
+
+    const error = await recordHistory(
+      { creatorId: 'creator-1', result: makeResult() },
+      manifest,
+      zip(false),
+      'out.zip',
+      new AbortController().signal,
+    );
+
+    expect(error).toBe('storage が一杯です');
   });
 });

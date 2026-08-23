@@ -12,7 +12,7 @@ import type { CollectorSettings, CollectResult, PostFailureCounts } from './fanb
 import { collect, PostBodyInvalidError } from './fanbox/collector';
 import { applyCreatorHistory, readCreatorHistory, removeCreatorHistory } from './history';
 import { historyForCollect } from './history-plan';
-import { buildHistoryUpdate } from './history-update';
+import { buildObservationUpdate, buildSaveUpdate } from './history-update';
 import css from './overlay.css' with { type: 'text' };
 import {
   countSelection,
@@ -326,8 +326,23 @@ function zipNameOf(handle: FileSystemFileHandle, fallbackBaseName: string): stri
  *
  * 記録の失敗は ZIP の失敗ではないので例外にせず、完了画面に併記するための文言を返す。
  */
-async function recordHistory(
-  ctx: ReviewContext,
+/**
+ * 収集で分かったこと (観測カタログと走査実績) を記録する (Issue #56)。失敗したらその理由を返す。
+ *
+ * ZIP を作るかに関わらず送る。理由は `buildObservationUpdate` の JSDoc を参照。
+ */
+export async function recordObservation(creatorId: string, result: CollectResult): Promise<string | null> {
+  try {
+    const response = await applyCreatorHistory(buildObservationUpdate(creatorId, result));
+    return response.ok ? null : (response.error ?? '不明な理由');
+  } catch (e) {
+    console.error('収集結果の記録に失敗:', e);
+    return e instanceof Error ? e.message : String(e);
+  }
+}
+
+export async function recordHistory(
+  ctx: Pick<ReviewContext, 'creatorId' | 'result'>,
   manifest: DownloadManifest,
   zip: DownloadZipResult,
   zipName: string,
@@ -335,7 +350,7 @@ async function recordHistory(
 ): Promise<string | null> {
   if (signal.aborted || zip.aborted) return null;
   try {
-    const update = buildHistoryUpdate(ctx.creatorId, ctx.result, manifest, zip.assets, zipName, Date.now());
+    const update = buildSaveUpdate(ctx.creatorId, ctx.result, manifest, zip.assets, zipName, Date.now());
     const response = await applyCreatorHistory(update);
     return response.ok ? null : (response.error ?? '不明な理由');
   } catch (e) {
@@ -702,16 +717,21 @@ export class OverlayController {
     // 進行中の読み込みを無効にしてから消す。無効にしないと、削除の前に始まった読み込みが
     // 後から解決して、消したはずの履歴をメモリ上へ戻す (その履歴で post.info を省きうる)
     const generation = ++this.historyGeneration;
+    // 応答を待つ間に収集を始められるので、メモリ上の履歴もここで落とす。落とさないと
+    // 「削除したつもり」の履歴を根拠に post.info が省かれる
+    const previous = this.history;
+    this.history = null;
     const response = await removeCreatorHistory(creatorId);
     // 削除を待つ間に画面や creator が変わっていたら、こちらの状態には触らない
     if (this.state !== 'settings' || this.pageType?.creatorId !== creatorId) return;
     if (this.historyGeneration !== generation) return;
     if (!response.ok) {
+      // 消せていないので元に戻す。戻さないと、履歴があるのに全件取得になる
+      this.history = previous;
       button.disabled = false;
       button.textContent = `削除できません: ${response.error ?? '不明な理由'}`;
       return;
     }
-    this.history = null;
     this.renderHistoryRow();
   }
 
@@ -1240,6 +1260,11 @@ export class OverlayController {
         return;
       }
 
+      // 収集で分かったことは ZIP を作るかに関わらず記録する。全件が省かれた回は ZIP を
+      // 作らないので、ここで書かないと走査実績と最終利用時刻がその回だけ残らない
+      const observationError = await recordObservation(creatorId, result);
+      if (!this.isCurrentCollect(signal)) return;
+
       publishTestState({
         'added-post-count': String(result.addedPostCount),
         'unavailable-post-count': String(result.postFailures.unavailable),
@@ -1261,6 +1286,7 @@ export class OverlayController {
             failedPageCount: result.failedPageCount,
             failedFileCount: 0,
             skippedByHistoryCount: result.skippedByHistoryPostIds.size,
+            historyError: observationError,
           }),
         );
         return;

@@ -341,7 +341,21 @@ function isSameGeneration(existing: SavedPost, next: SavedPost): boolean {
 }
 
 /**
- * 世代の変わった実績へ、前の世代でだけ現れたアセットの**名前だけ**を引き継ぐ。
+ * 世代の違う 2 つの実績から、残す方と捨てる方を決める。
+ *
+ * `revision` の分かっている方を優先する。`null` は「更新時刻を取得できなかった」で、
+ * 突き合わせに使えない (省略は非 `null` の一致を要求する)。
+ * どちらも分かっている・どちらも `null` なら新しい方を採る。同値では既存を残す —
+ * `>=` にすると、同じミリ秒に終わった別世代の古い差分を再送しただけで実績が入れ替わる。
+ */
+function pickGeneration(existing: SavedPost, next: SavedPost): [winner: SavedPost, loser: SavedPost] {
+  if (existing.revision !== null && next.revision === null) return [existing, next];
+  if (existing.revision === null && next.revision !== null) return [next, existing];
+  return next.savedAt > existing.savedAt ? [next, existing] : [existing, next];
+}
+
+/**
+ * 残す実績へ、捨てる方にしか無いアセットの**名前だけ**を引き継ぐ。
  *
  * 「保存できたか」は世代ごとの状態だが、**一度割り当てた archive 名は世代をまたいで保つ**。
  * 引き継がないと、投稿が編集された回に選ばなかったアセットの名前が失われ、次に選んだときに
@@ -350,15 +364,15 @@ function isSameGeneration(existing: SavedPost, next: SavedPost): boolean {
  * 引き継いだ側は `name-only` にする。前の世代で書けたことは、今の世代で書けたことを意味しない。
  * `zipName` と `savedAt` はその名前を割り当てた実行のものを残す (事実と食い違わせない)。
  */
-function carryOverNames(existing: SavedPost, next: SavedPost): SavedPost {
+function carryOverNames(loser: SavedPost, winner: SavedPost): SavedPost {
   // 採番規則が変わっていれば引き継がない。前の規則で決めた名前を新しい規則の記録に混ぜると、
   // `buildFrozenArchiveNames` が版で選り分けたつもりの名前に旧規則のものが紛れる
-  if (existing.archiveFormatVersion !== next.archiveFormatVersion) return next;
-  const nextIdentities = new Set(next.assets.map(assetIdentity));
-  const carried = existing.assets
-    .filter((asset) => !nextIdentities.has(assetIdentity(asset)))
+  if (loser.archiveFormatVersion !== winner.archiveFormatVersion) return winner;
+  const winnerIdentities = new Set(winner.assets.map(assetIdentity));
+  const carried = loser.assets
+    .filter((asset) => !winnerIdentities.has(assetIdentity(asset)))
     .map((asset): SavedAsset => ({ ...asset, outcome: 'name-only' }));
-  return carried.length === 0 ? next : { ...next, assets: [...next.assets, ...carried] };
+  return carried.length === 0 ? winner : { ...winner, assets: [...winner.assets, ...carried] };
 }
 
 /**
@@ -440,14 +454,12 @@ function mergeSavedPost(existing: SavedPost, next: SavedPost): SavedPost {
   // 採ると、過去に割り当てた凍結名と保存実績が消え、次の ZIP でその投稿のアセットが
   // 別の名前に付け替わる (複数の ZIP をまたいで同じ投稿を同定できなくなる)。
   // 落ちるのは今回の保存の記録だけで、次回はその投稿を取り直すことになる (安全側)
-  if (existing.revision !== null && next.revision === null) return existing;
-  if (existing.revision === null && next.revision !== null) return carryOverNames(existing, next);
   if (!isSameGeneration(existing, next)) {
-    // 世代が違えばマージできない。どちらを残すかは新しい方で決める。到着順で決めると、
-    // 遅れて届いた古い差分が新しい世代の保存実績を丸ごと消す。
-    // 同値では既存を残す。`>=` にすると、同じミリ秒に終わった別世代の古い差分を再送しただけで
-    // 新しい世代の保存実績が消える
-    return next.savedAt > existing.savedAt ? carryOverNames(existing, next) : existing;
+    // 世代が違えばマージできない。勝つ世代を決めたうえで、負けた側にしか無い名前を引き継ぐ。
+    // **勝敗と名前の引き継ぎを分ける。** 一緒にすると、新しい世代が先に届いて古い差分が
+    // 遅れて着いたときだけ名前が失われる (到着順で結果が変わる)
+    const [winner, loser] = pickGeneration(existing, next);
+    return carryOverNames(loser, winner);
   }
   const byIdentity = new Map(next.assets.map((asset) => [assetIdentity(asset), asset]));
   const assets: SavedAsset[] = [];

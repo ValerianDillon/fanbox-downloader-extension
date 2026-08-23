@@ -372,7 +372,13 @@ describe('履歴のマージ', () => {
     const afterSecond = mergeCreatorHistory(current, makeUpdate({ saved: [second] }));
     const resent = mergeCreatorHistory(afterSecond, makeUpdate({ saved: [first] }));
 
-    expect([afterSecond.saved, resent.saved]).toEqual([[first], [first]]);
+    // 実績としては先に記録した方が残り、後から来た世代のアセットは名前だけになる
+    expect(afterSecond.saved[0].revision).toBe('r1');
+    expect(afterSecond.saved[0].assets.map((asset) => [asset.assetId, asset.outcome])).toEqual([
+      ['asset-1', 'written'],
+      ['asset-2', 'name-only'],
+    ]);
+    expect(resent.saved).toEqual(afterSecond.saved);
   });
 
   test('大文字小文字だけが違う凍結名の組は例外にする (allocator が衝突と判定して次のダウンロードごと止まるのを防ぐため)。', () => {
@@ -446,7 +452,11 @@ describe('履歴のマージ', () => {
 
     const result = mergeCreatorHistory(current, makeUpdate({ saved: [unknown] }));
 
-    expect(result.saved).toEqual([known]);
+    expect(result.saved[0].revision).toBe('r1');
+    expect(result.saved[0].assets.map((asset) => [asset.assetId, asset.outcome])).toEqual([
+      ['asset-a', 'written'],
+      ['asset-b', 'name-only'],
+    ]);
   });
 
   test('revision の分かっている実績が revision が null の実績を置き換え、名前だけ引き継ぐ (世代を特定できる記録を採りつつ名前は保つため)。', () => {
@@ -466,6 +476,32 @@ describe('履歴のマージ', () => {
     expect(result.saved[0].assets.map((asset) => [asset.assetId, asset.outcome])).toEqual([
       ['asset-a', 'written'],
       ['asset-b', 'name-only'],
+    ]);
+  });
+
+  test('新しい世代が先に届いても、遅れて来た古い世代の名前を name-only で残す (到着順で名前が失われないため)。', () => {
+    const older = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written', 100)], {
+      revision: 'r1',
+      savedAt: 100,
+    });
+    const newer = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 200)], {
+      revision: 'r2',
+      savedAt: 200,
+    });
+
+    const olderFirst = mergeCreatorHistory(
+      mergeCreatorHistory(null, makeUpdate({ saved: [older] })),
+      makeUpdate({ saved: [newer] }),
+    );
+    const newerFirst = mergeCreatorHistory(
+      mergeCreatorHistory(null, makeUpdate({ saved: [newer] })),
+      makeUpdate({ saved: [older] }),
+    );
+
+    expect(newerFirst.saved).toEqual(olderFirst.saved);
+    expect(newerFirst.saved[0].assets.map((asset) => [asset.assetId, asset.outcome])).toEqual([
+      ['asset-new', 'written'],
+      ['asset-old', 'name-only'],
     ]);
   });
 
