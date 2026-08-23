@@ -49,6 +49,9 @@ export function toWellFormed(value: string): string {
  * - `SEGMENT_MAX_BYTES` を超える名前 — 展開できない ZIP になる
  * - 孤立サロゲートを含む名前 — 書き込み時に U+FFFD へ置き換えられるので、記録上の名前と
  *   ZIP の実体名が違うものになる
+ * - 共有層の `encodeFileName` が書き換える名前 — 通すと、記録した名前と実際に書かれる名前が
+ *   食い違う。`encodeFileName` は固定の文字を全角へ寄せて前後の空白を落とすだけなので、
+ *   「書き換えられない」条件はここに写せる (一致は契約テストで固定する)
  */
 export function describeUnusableSegment(name: string): string | null {
   const trimmedTrailing = name.replace(/[ .]+$/u, '');
@@ -62,5 +65,15 @@ export function describeUnusableSegment(name: string): string | null {
     return `長すぎます (UTF-8 ${byteLength(name)} bytes, 上限 ${SEGMENT_MAX_BYTES} bytes)`;
   }
   if (toWellFormed(name) !== name) return '孤立サロゲートが含まれています';
+  if (ENCODED_BY_SHARED_LAYER.test(name)) return '共有層が書き換える文字が含まれています';
+  if (name.trim() !== name) return '前後に空白があります';
   return null;
 }
+
+/**
+ * 共有層の `encodeFileName` が全角へ寄せる文字。
+ *
+ * この集合と `DownloadUtils.encodeFileName` の一致は `test/archive-name-rules.test.ts` が固定する。
+ * 共有層が対象を増やしたらそこが落ちる。
+ */
+const ENCODED_BY_SHARED_LAYER = /[/\\,:*"<>|]/;

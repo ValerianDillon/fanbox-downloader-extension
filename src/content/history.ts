@@ -64,11 +64,13 @@ async function sendHistoryMessage(message: HistoryMessage): Promise<HistoryRespo
     const response: unknown = await runtime.sendMessage(message);
     // 応答の形が想定と違えば成功とは言えない。service worker が listener を持たない版に
     // 差し替わっている場合 (undefined が返る) をここで成功に丸めない
-    if (typeof response === 'object' && response !== null && (response as HistoryResponse).ok === true) {
-      return { ok: true };
+    if (typeof response !== 'object' || response === null) {
+      return { ok: false, error: '履歴の更新に対する応答が想定外です' };
     }
-    const error = typeof response === 'object' && response !== null ? (response as HistoryResponse).error : undefined;
-    return { ok: false, error: error ?? '履歴の更新に対する応答が想定外です' };
+    const { ok, error } = response as { ok?: unknown; error?: unknown };
+    if (ok === true) return { ok: true };
+    // error も検証する。キャストで通すと、文字列でない値が呼び出し側の表示処理へ流れる
+    return { ok: false, error: typeof error === 'string' ? error : '履歴の更新に対する応答が想定外です' };
   } catch (e) {
     return { ok: false, error: String(e) };
   }

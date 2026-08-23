@@ -81,6 +81,15 @@ describe('コンテンツスクリプトの履歴クライアント', () => {
     expect(result).toEqual({ ok: false, error: '履歴 store failed' });
   });
 
+  test('応答の error が文字列でなければ既定の文言に倒す (文字列でない値が呼び出し元の表示処理へ流れないため)。', async () => {
+    installChrome({ runtime: { sendMessage: async () => ({ ok: false, error: 123 }) } });
+
+    const result = await applyCreatorHistory(update);
+
+    expect(typeof result.error).toBe('string');
+    expect(result.error).not.toBe('123');
+  });
+
   test('applyCreatorHistory と removeCreatorHistory は sendMessage の reject を ok: false に畳む (通信例外で content script を未処理例外にしないため)。', async () => {
     installChrome({
       runtime: {

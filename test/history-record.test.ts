@@ -104,7 +104,7 @@ describe('履歴のマージ', () => {
   test('同じ postId のカタログは元の位置で置換する (更新で投稿の並びが不必要に変わらないようにするため)。', () => {
     const oldPost = makeCatalogPost('post-1');
     const otherPost = makeCatalogPost('post-2');
-    const newPost = makeCatalogPost('post-1', [makeHistoryAsset('asset-1')]);
+    const newPost = makeCatalogPost('post-1', [makeHistoryAsset('asset-1')], 200);
     const current = mergeCreatorHistory(null, makeUpdate({ catalog: [oldPost, otherPost] }));
 
     const result = mergeCreatorHistory(current, makeUpdate({ catalog: [newPost] }));
@@ -283,14 +283,51 @@ describe('履歴のマージ', () => {
     expect(result.catalog).toEqual([newer]);
   });
 
-  test('observedAt が同じで complete が食い違うカタログは complete を false にする (どちらが正しいか決められないなら post.info を取り直させるため)。', () => {
-    const complete = makeCatalogPost('post-1', [makeHistoryAsset('asset-1')], 100);
-    const incomplete = { ...makeCatalogPost('post-1', [], 100), complete: false };
-    const current = mergeCreatorHistory(null, makeUpdate({ catalog: [complete] }));
+  test('observedAt が同じで内容が食い違うカタログは complete を false にする (どちらが正しいか決められないなら post.info を取り直させるため)。', () => {
+    const empty = makeCatalogPost('post-1', [], 100);
+    const withAsset = makeCatalogPost('post-1', [makeHistoryAsset('asset-x')], 100);
+    const forward = mergeCreatorHistory(
+      mergeCreatorHistory(null, makeUpdate({ catalog: [empty] })),
+      makeUpdate({ catalog: [withAsset] }),
+    );
 
-    const result = mergeCreatorHistory(current, makeUpdate({ catalog: [incomplete] }));
+    const back = mergeCreatorHistory(forward, makeUpdate({ catalog: [empty] }));
 
-    expect(result.catalog[0].complete).toBe(false);
+    expect([forward.catalog[0].complete, back.catalog[0].complete]).toEqual([false, false]);
+  });
+
+  test('observedAt が同じでアセットの並びだけが違うカタログは complete を保つ (並びの違いを内容の食い違いと数えないため)。', () => {
+    const assets = [makeHistoryAsset('asset-1'), makeHistoryAsset('asset-2')];
+    const forward = makeCatalogPost('post-1', assets, 100);
+    const reversed = makeCatalogPost('post-1', [...assets].reverse(), 100);
+    const current = mergeCreatorHistory(null, makeUpdate({ catalog: [forward] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ catalog: [reversed] }));
+
+    expect(result.catalog[0].complete).toBe(true);
+  });
+
+  test('世代の違う保存実績は新しい方だけを残す (遅れて届いた古い差分で新しい世代の実績を消さないため)。', () => {
+    const older = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written', 100)], { revision: 'r1' });
+    const newer = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 200)], { revision: 'r2' });
+    const afterNewer = mergeCreatorHistory(
+      mergeCreatorHistory(null, makeUpdate({ saved: [older] })),
+      makeUpdate({ saved: [newer] }),
+    );
+
+    const resent = mergeCreatorHistory(afterNewer, makeUpdate({ saved: [older] }));
+
+    expect([afterNewer.saved, resent.saved]).toEqual([[newer], [newer]]);
+  });
+
+  test('revision が null 同士の保存実績はマージしない (更新時刻を取得できなかっただけで同じ投稿状態とは言えないため)。', () => {
+    const first = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written', 100)], { revision: null });
+    const second = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 200)], { revision: null });
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [first] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ saved: [second] }));
+
+    expect(result.saved).toEqual([second]);
   });
 
   test('scannedAt が同じで内容が食い違う scan は完走していない方を残す (欠落を削除と誤認させないため)。', () => {

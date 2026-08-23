@@ -270,6 +270,35 @@ function upsertByPostId<T extends { readonly postId: string }>(
 }
 
 /**
+ * 2 つの保存実績が同じ投稿の同じ状態を指しているか。
+ *
+ * revision (= 保存時の `updatedDatetime`)・`ARCHIVE_FORMAT_VERSION`・投稿ディレクトリ名が
+ * すべて一致するときだけ同じ世代とみなす。
+ *
+ * **`revision` が `null` 同士は同じ世代とみなさない。** `null` は「更新時刻を取得できなかった」で
+ * あって「同じ状態である」ではない。同じ世代として扱うと、投稿が編集された前後の保存実績が
+ * 1 つの `SavedPost` に統合され、別の状態のアセットが同居する。
+ */
+function isSameGeneration(existing: SavedPost, next: SavedPost): boolean {
+  if (existing.revision === null || next.revision === null) return false;
+  return (
+    existing.revision === next.revision &&
+    existing.archiveFormatVersion === next.archiveFormatVersion &&
+    existing.archiveDirectory === next.archiveDirectory
+  );
+}
+
+/**
+ * その保存実績がいつの ZIP のものかを表す時刻。
+ *
+ * 投稿単位の時刻を別に持たない。持つとアセット側の `savedAt` と食い違いうるうえ、
+ * 食い違ったときにどちらが正しいか決められない。
+ */
+function latestSavedAt(post: SavedPost): number {
+  return post.assets.reduce((max, asset) => Math.max(max, asset.savedAt), 0);
+}
+
+/**
  * 同じ投稿のカタログが 2 つあるとき、どちらを残すか決める。
  *
  * **新しい観測 (`observedAt` が大きい方) を残す。** 到着順で決めると、遅れて届いた古い観測が
@@ -280,7 +309,24 @@ function upsertByPostId<T extends { readonly postId: string }>(
  */
 function mergeCatalogPost(existing: CatalogPost, next: CatalogPost): CatalogPost {
   if (next.observedAt !== existing.observedAt) return next.observedAt > existing.observedAt ? next : existing;
-  return { ...next, complete: existing.complete && next.complete };
+  if (catalogFingerprint(existing) === catalogFingerprint(next)) return next;
+  // 同時刻に別の内容が観測されている。どちらが正しいか決められないので、`post.info` を
+  // 取り直させる。`complete` を両方の論理積にするだけでは足りない — 両方が complete でも
+  // アセットの構成が違えば、片方を採った時点で存在するアセットを見失う
+  return { ...next, complete: false };
+}
+
+/**
+ * カタログの内容が同じかを比べるための正規形。
+ *
+ * `complete` と `observedAt` は含めない (それらは比べる側が扱う)。
+ * アセットは identity で並べ替える。観測ごとに並びが違っても内容が同じなら同じとみなすため。
+ */
+function catalogFingerprint(post: CatalogPost): string {
+  const assets = [...post.assets]
+    .map((asset) => [assetIdentity(asset), asset.originalName, asset.extension, asset.size ?? null] as const)
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return JSON.stringify([post.updatedDatetime, post.title, post.publishedDatetime, post.feeRequired, assets]);
 }
 
 /**
@@ -317,20 +363,15 @@ function preferSavedAsset(existing: SavedAsset, next: SavedAsset): SavedAsset {
 /**
  * 同じ投稿の保存実績を統合する。
  *
- * revision (= 保存時の `updatedDatetime`)・`ARCHIVE_FORMAT_VERSION`・投稿ディレクトリ名が
- * すべて一致するときだけアセットをマージする。**1 つでも違えば過去の実績は使えない**ので
- * 丸ごと置き換える。投稿が編集されていればアセットの構成が変わっており、採番規則や
- * ディレクトリ名が変わっていれば過去の ZIP は別の場所に入っている。
- *
- * マージするのは、前回失敗した対象だけを再試行したときに前回成功した対象の実績を失わないため。
+ * 同じ世代 (`isSameGeneration`) のときだけアセットをマージする。前回失敗した対象だけを
+ * 再試行したときに、前回成功した対象の実績を失わないためである。
+ * 世代が違えば過去の実績は使えないので、新しい方の世代だけを残す。
  */
 function mergeSavedPost(existing: SavedPost, next: SavedPost): SavedPost {
-  if (
-    existing.revision !== next.revision ||
-    existing.archiveFormatVersion !== next.archiveFormatVersion ||
-    existing.archiveDirectory !== next.archiveDirectory
-  ) {
-    return next;
+  if (!isSameGeneration(existing, next)) {
+    // 世代が違えばマージできない。どちらを残すかは新しい方で決める。到着順で決めると、
+    // 遅れて届いた古い差分が新しい世代の保存実績を丸ごと消す
+    return latestSavedAt(next) >= latestSavedAt(existing) ? next : existing;
   }
   const byIdentity = new Map(next.assets.map((asset) => [assetIdentity(asset), asset]));
   const assets: SavedAsset[] = [];
