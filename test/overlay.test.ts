@@ -8,6 +8,7 @@ import {
 } from '../src/content/fanbox/api';
 import { PostBodyInvalidError, type PostFailureCounts } from '../src/content/fanbox/collector';
 import {
+  ALREADY_SAVED_HEADLINE,
   buildCompleteMessage,
   COMPLETE_HEADLINE,
   type CompleteMessageParams,
@@ -192,6 +193,31 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
     failedPageCount: 0,
     failedFileCount: 0,
   };
+
+  test('省いた投稿があっても見出しは変わらない (取りこぼしではないため)', () => {
+    const message = buildCompleteMessage({ ...base, skippedByHistoryCount: 3 });
+
+    expect(message.split('\n')[0]).toBe(COMPLETE_HEADLINE);
+    expect(message).toContain('前回保存済みのため取得を省いた投稿: 3 件');
+  });
+
+  test('全件が省かれたときは「更新はありません」にする (差分が無いことを失敗のように読ませないため)', () => {
+    const message = buildCompleteMessage({ ...base, addedPostCount: 0, skippedByHistoryCount: 5 });
+
+    expect(message.split('\n')[0]).toBe(ALREADY_SAVED_HEADLINE);
+    expect(message).toContain('前回保存済みのため取得を省いた投稿: 5 件');
+  });
+
+  test('省いた投稿があっても取りこぼしがあれば「保存していません」を出す (欠落を更新なしで隠さないため)', () => {
+    const message = buildCompleteMessage({
+      ...base,
+      addedPostCount: 0,
+      skippedByHistoryCount: 5,
+      postFailures: { ...base.postFailures, apiFailed: 1 },
+    });
+
+    expect(message.split('\n')[0]).toBe(NOTHING_SAVED_HEADLINE);
+  });
 
   test('履歴の更新に失敗しても見出しは変わらない (ZIP は保存できているので「一部取得できませんでした」にしないため)', () => {
     const message = buildCompleteMessage({ ...base, historyError: 'storage が一杯です' });

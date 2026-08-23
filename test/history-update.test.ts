@@ -31,6 +31,7 @@ function makeResult(overrides: Partial<CollectResult> & { posts?: PostSummaryStu
     failedPageCount: 0,
     listedRevisions: new Map(),
     apiFailedPostIds: new Set(),
+    skippedByHistoryPostIds: new Set(),
     collectedAt: COLLECTED_AT,
     scannedCreator: true,
     completedFullScan: true,

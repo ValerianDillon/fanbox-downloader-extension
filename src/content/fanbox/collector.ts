@@ -5,7 +5,9 @@ import {
   DownloadManage,
   type PostListItemCandidate,
 } from 'download-helper/fanbox-collector';
-import { createPostIdArchivePathAllocator } from '../archive-path';
+
+import type { CreatorHistory } from '../../history-record';
+import { canSkipPostInfo, prepareHistoryPlan } from '../history-plan';
 import {
   ApiSession,
   ApiShapeError,
@@ -77,6 +79,13 @@ export type CollectResult = {
    * (取り込めなかった投稿も含む) — 次回この値と突き合わせるのは一覧の走査だけで済ませたいため。
    */
   listedRevisions: ReadonlyMap<string, string | null>;
+  /**
+   * 履歴を根拠に `post.info` を省いた投稿 (Issue #56)。
+   *
+   * 取りこぼしではないので失敗には数えない。今回の ZIP には含まれない (差分 ZIP は
+   * 独立した追加バッチであって、展開先に適用するパッチではない)。
+   */
+  skippedByHistoryPostIds: ReadonlySet<string>;
   /**
    * `post.info` の取得が HttpError で終わった投稿。
    * 「前回失敗した分だけ再試行する」の対象になる。件数ではなく集合で持つ理由は
@@ -159,12 +168,22 @@ function applyAddResult(result: AddPostResult, counts: PostFailureCounts): AddOu
   }
 }
 
+/**
+ * 投稿を収集する。
+ * @param creatorId 対象の creator
+ * @param postId 指定すると単一投稿モードになる
+ * @param settings 収集の設定
+ * @param onProgress 進捗の通知
+ * @param signal 中断
+ * @param history 差分ダウンロードの履歴。`null` を渡すと全件を取得する (Issue #56)
+ */
 export async function collect(
   creatorId: string,
   postId: string | undefined,
   settings: CollectorSettings,
   onProgress: ProgressCallback,
   signal: AbortSignal,
+  history?: CreatorHistory | null,
 ): Promise<CollectResult> {
   // レート制限の状態は収集ごとに持つ。前回引き上がった間隔を次の収集に持ち越さない
   const api = new ApiSession(settings.apiIntervalMs ?? DEFAULT_API_RATE_LIMIT_MS);
@@ -180,12 +199,10 @@ export async function collect(
   }
   // archive path は postId 由来で採番する。従来の採番は同名グループの件数に依存するため、
   // 同名の投稿やアセットが増減すると過去に割り当てた名前まで変わり、複数の ZIP をまたいで
-  // 同じ投稿を同定できない (Issue #56)
-  const downloadManage = new DownloadManage(
-    creatorId,
-    feeMapper,
-    createPostIdArchivePathAllocator(DownloadManage.utils),
-  );
+  // 同じ投稿を同定できない (Issue #56)。
+  // 履歴があれば過去に割り当てた名前を据え置く。凍結名を使えなければ履歴ごと無いものとして扱う
+  const plan = prepareHistoryPlan(DownloadManage.utils, history ?? null);
+  const downloadManage = new DownloadManage(creatorId, feeMapper, plan.allocator);
   downloadManage.downloadObject.setUrl(`https://www.fanbox.cc/@${creatorId}`);
   downloadManage.isIgnoreFree = settings.isIgnoreFree;
   if (settings.limit !== null && settings.limit > 0) {
@@ -206,6 +223,7 @@ export async function collect(
   let stoppedReason: CollectResult['stoppedReason'];
   let listedRevisions: ReadonlyMap<string, string | null> = new Map();
   let apiFailedPostIds: ReadonlySet<string> = new Set();
+  let skippedByHistoryPostIds: ReadonlySet<string> = new Set();
   let completedFullScan = false;
   let limited = false;
   if (postId) {
@@ -236,12 +254,13 @@ export async function collect(
     }
     onProgress(1, 1);
   } else {
-    const collected = await getItemsByCreator(api, downloadManage, onProgress, signal);
+    const collected = await getItemsByCreator(api, downloadManage, onProgress, signal, plan.history);
     addedPostCount = collected.addedPostCount;
     postFailures = collected.postFailures;
     failedPageCount = collected.failedPageCount;
     listedRevisions = collected.listedRevisions;
     apiFailedPostIds = collected.apiFailedPostIds;
+    skippedByHistoryPostIds = collected.skippedByHistoryPostIds;
     completedFullScan = collected.completedFullScan;
     limited = collected.limited;
     if (collected.stoppedBy) {
@@ -265,6 +284,7 @@ export async function collect(
     stoppedReason,
     listedRevisions,
     apiFailedPostIds,
+    skippedByHistoryPostIds,
     collectedAt: Date.now(),
     scannedCreator: postId === undefined,
     // 打ち切りは「一覧を全部見た」を否定する。件数上限は getItemsByCreator が
@@ -281,6 +301,7 @@ type CreatorCollectCounts = {
   failedPageCount: number;
   listedRevisions: ReadonlyMap<string, string | null>;
   apiFailedPostIds: ReadonlySet<string>;
+  skippedByHistoryPostIds: ReadonlySet<string>;
   /** 投稿一覧の全ページを走査し終えたか */
   completedFullScan: boolean;
   /** 件数の上限に達して打ち切ったか */
@@ -294,6 +315,7 @@ async function getItemsByCreator(
   downloadManage: DownloadManage,
   onProgress: ProgressCallback,
   signal: AbortSignal,
+  history: CreatorHistory | null,
 ): Promise<CreatorCollectCounts> {
   let urls: string[];
   try {
@@ -332,6 +354,8 @@ async function getItemsByCreator(
   const apiFailedPostIds = new Set<string>();
   // 一覧が返した updatedDatetime。取り込めなかった投稿も含めて記録する (Issue #56)
   const listedRevisions = new Map<string, string | null>();
+  // 履歴を根拠に post.info を省いた投稿。取りこぼしではないので失敗には数えない
+  const skippedByHistoryPostIds = new Set<string>();
   let scannedAllPages = false;
   let stoppedByLimit = false;
   const counts = (): CreatorCollectCounts => ({
@@ -340,6 +364,7 @@ async function getItemsByCreator(
     failedPageCount,
     listedRevisions,
     apiFailedPostIds,
+    skippedByHistoryPostIds,
     // 取得に失敗したページがあれば、走査し切っていても一覧を全部見たとは言えない
     // (そのページに載っていた投稿が丸ごと欠けている)
     completedFullScan: scannedAllPages && failedPageCount === 0,
@@ -430,6 +455,17 @@ async function getItemsByCreator(
           apiFailedPostIds.delete(post.id);
           postFailures.unavailable++;
           postFailures.unavailableRestricted++;
+          processed++;
+          onProgress(processed, totalEstimate);
+          continue;
+        }
+        // 前回と変わっておらず、全アセットを保存できている投稿は post.info を発行しない。
+        // これが Issue #56 で実際に API コストを減らす箇所である。省いた投稿は
+        // DownloadObject に入らないので、今回の ZIP にも含まれない (差分 ZIP の意味論)
+        if (canSkipPostInfo(history, post.id, listedRevisions.get(post.id) ?? null)) {
+          seenPostIds.add(post.id);
+          apiFailedPostIds.delete(post.id);
+          skippedByHistoryPostIds.add(post.id);
           processed++;
           onProgress(processed, totalEstimate);
           continue;

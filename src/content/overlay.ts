@@ -4,12 +4,13 @@ import type {
   DownloadZipResult,
   PostSummary,
 } from 'download-helper/download-helper';
+import type { CreatorHistory } from '../history-record';
 import type { DownloadProgress, FileSystemFileHandle } from './downloader';
 import { downloadAsZip, pickSaveHandle, preflightDownload } from './downloader';
 import { ApiShapeError, type PageType, ResponseParseError } from './fanbox/api';
 import type { CollectorSettings, CollectResult, PostFailureCounts } from './fanbox/collector';
 import { collect, PostBodyInvalidError } from './fanbox/collector';
-import { applyCreatorHistory } from './history';
+import { applyCreatorHistory, readCreatorHistory, removeCreatorHistory } from './history';
 import { buildHistoryUpdate } from './history-update';
 import css from './overlay.css' with { type: 'text' };
 import {
@@ -80,6 +81,14 @@ export const COMPLETE_HEADLINE = 'ダウンロードが完了しました';
  * 本文に併記される欠落の詳細行と矛盾していた)。
  */
 export const PARTIAL_FILE_FAILURE_HEADLINE = '一部取得できませんでした';
+
+/**
+ * 新しく取得するものが無かったときの見出し (Issue #56)。
+ *
+ * 「取得済み」ではなく「前回保存済み」とする。拡張が主張できるのは書き込みの完了を確認した
+ * ことまでで、その ZIP が今も存在するとは主張できない。
+ */
+export const ALREADY_SAVED_HEADLINE = '前回保存済みから更新はありませんでした';
 
 /** 収集フェーズがレート制限で打ち切られた場合の完了画面の見出し */
 export const RATE_LIMIT_EXHAUSTED_HEADLINE = 'レート制限のため途中で打ち切りました (取得できた分のみ保存しています)';
@@ -174,6 +183,12 @@ export type CompleteMessageParams = {
   /** 収集フェーズが再試行の上限で打ち切られた場合、その理由 */
   stoppedReason?: 'rate-limit-exhausted' | 'transport-exhausted';
   /**
+   * 履歴を根拠に `post.info` を省いた投稿数 (Issue #56)。
+   *
+   * 失敗ではないので見出しの判定には使わない。省いた投稿が ZIP に無い理由を書くためだけに持つ。
+   */
+  skippedByHistoryCount?: number;
+  /**
    * 差分ダウンロードの履歴の更新に失敗した理由 (Issue #56)。成功または記録対象外なら null。
    *
    * ZIP は保存できているので見出しは変えない。次回の差分判定がこの回を知らないという
@@ -253,7 +268,10 @@ export function buildCompleteMessage(params: CompleteMessageParams): string {
   const historySuffix = params.historyError
     ? `\n保存済みの記録を更新できませんでした: ${params.historyError} (次回は差分ではなく全件を取得します)`
     : '';
-  return `${buildDownloadOutcome(params)}${historySuffix}`;
+  const skipped = params.skippedByHistoryCount ?? 0;
+  // 省いた投稿は取りこぼしではないので、これも見出しの判定には混ぜない
+  const skippedSuffix = skipped > 0 ? `\n前回保存済みのため取得を省いた投稿: ${skipped} 件` : '';
+  return `${buildDownloadOutcome(params)}${skippedSuffix}${historySuffix}`;
 }
 
 function buildDownloadOutcome(params: CompleteMessageParams): string {
@@ -261,6 +279,11 @@ function buildDownloadOutcome(params: CompleteMessageParams): string {
   const failedSuffix = failureLines.length ? `\n${failureLines.join('\n')}` : '';
 
   if (params.addedPostCount === 0) {
+    // 全部が「前回保存済み」で省かれたなら、取りこぼしではなく更新が無かっただけである。
+    // NOTHING_SAVED_HEADLINE のままだと、差分が無いことを失敗のように読ませてしまう
+    if ((params.skippedByHistoryCount ?? 0) > 0 && failureLines.length === 0) {
+      return ALREADY_SAVED_HEADLINE;
+    }
     return `${NOTHING_SAVED_HEADLINE}${failedSuffix}`;
   }
   if (params.stoppedReason) {
@@ -363,6 +386,10 @@ type ReviewContext = {
 
 export class OverlayController {
   private state: OverlayState = 'settings';
+  /** 読み込み済みの差分ダウンロードの履歴 (Issue #56)。未読または無ければ null */
+  private history: CreatorHistory | null = null;
+  /** 履歴の読み込みの世代。遅れて解決した読み込みが新しい画面を書き換えないようにする */
+  private historyGeneration = 0;
   /**
    * 収集フェーズ用と ZIP フェーズ用で AbortController を分ける (Issue #55)。
    *
@@ -453,6 +480,25 @@ export class OverlayController {
   showPanel() {
     this.setState('settings');
     this.renderPanel();
+    // 履歴の読み出しは storage への往復なので、画面を出してから追いつかせる。
+    // 待ってから描画すると、パネルが開くまでに間が空く
+    void this.loadHistory();
+  }
+
+  /**
+   * 差分ダウンロードの履歴を読み込み、設定画面に反映する (Issue #56)。
+   *
+   * 読めなければ履歴が無いものとして扱う (`readCreatorHistory` が null に倒す)。
+   * 読み込み中に画面が変わっていたら描画しない。
+   */
+  private async loadHistory() {
+    const creatorId = this.pageType?.creatorId;
+    if (creatorId === undefined) return;
+    const generation = ++this.historyGeneration;
+    const history = await readCreatorHistory(creatorId);
+    if (this.historyGeneration !== generation) return;
+    this.history = history;
+    if (this.state === 'settings') this.renderHistoryRow();
   }
 
   hidePanel() {
@@ -559,6 +605,13 @@ export class OverlayController {
       this.panelEl.appendChild(intervalRow);
     }
 
+    // 履歴の行は読み込みが済んでから埋める。ここでは器だけ置く
+    const historyRow = document.createElement('div');
+    historyRow.className = 'setting-row';
+    historyRow.id = 'history-row';
+    this.panelEl.appendChild(historyRow);
+    this.renderHistoryRow();
+
     const btnRow = document.createElement('div');
     btnRow.className = 'btn-row';
     const collectBtn = document.createElement('button');
@@ -572,7 +625,9 @@ export class OverlayController {
         limit: limitInput?.value ? Number.parseInt(limitInput.value, 10) : null,
         apiIntervalMs: intervalInput?.value ? Number.parseInt(intervalInput.value, 10) : null,
       };
-      this.startCollecting(settings);
+      const ignoreHistory =
+        (this.shadowRoot.getElementById('history-ignore') as HTMLInputElement | null)?.checked ?? false;
+      this.startCollecting(settings, ignoreHistory);
     });
     btnRow.appendChild(collectBtn);
 
@@ -583,6 +638,67 @@ export class OverlayController {
     btnRow.appendChild(cancelBtn);
 
     this.panelEl.appendChild(btnRow);
+  }
+
+  /**
+   * 設定画面の履歴の行を描く (Issue #56)。
+   *
+   * **表示は「取得済み」ではなく「前回保存済み」とする。** 拡張が主張できるのは
+   * 「この拡張が日時 X の ZIP 生成で当該エントリの書き込み完了を確認した」までで、
+   * その ZIP が今も存在するとは主張できない。
+   */
+  private renderHistoryRow() {
+    const row = this.shadowRoot.getElementById('history-row');
+    if (!row) return;
+    row.innerHTML = '';
+    const savedCount = this.history?.saved.length ?? 0;
+    if (savedCount === 0) {
+      row.textContent = '前回保存済みの記録はありません (全件を取得します)';
+      return;
+    }
+
+    const summary = document.createElement('span');
+    summary.textContent = `前回保存済み: ${savedCount} 投稿`;
+    row.appendChild(summary);
+
+    const ignoreLabel = document.createElement('label');
+    const ignoreBox = document.createElement('input');
+    ignoreBox.type = 'checkbox';
+    ignoreBox.id = 'history-ignore';
+    ignoreLabel.appendChild(ignoreBox);
+    // 「履歴を無視して全件を取得する」と「既存の履歴を含めて再保存する」は、収集から見れば
+    // 同じ操作である (どちらも全件を取得し、その結果で記録を更新する)
+    ignoreLabel.appendChild(document.createTextNode('前回保存分も取得する'));
+    row.appendChild(ignoreLabel);
+
+    const forgetBtn = document.createElement('button');
+    forgetBtn.className = 'btn-secondary';
+    forgetBtn.id = 'history-forget';
+    forgetBtn.textContent = '記録を削除';
+    forgetBtn.addEventListener('click', () => void this.forgetHistory(forgetBtn));
+    row.appendChild(forgetBtn);
+  }
+
+  /**
+   * この creator の履歴を消す (Issue #56 の利用者の操作)。
+   *
+   * 消してよいかは利用者に確かめる。消すと次回は全件を取得することになるので、
+   * 誤操作の代償が通信量と待ち時間になる。
+   */
+  private async forgetHistory(button: HTMLButtonElement) {
+    const creatorId = this.pageType?.creatorId;
+    if (creatorId === undefined) return;
+    if (!confirm(`@${creatorId} の保存済みの記録を削除しますか (次回は全件を取得します)`)) return;
+    button.disabled = true;
+    const response = await removeCreatorHistory(creatorId);
+    if (this.state !== 'settings') return;
+    if (!response.ok) {
+      button.disabled = false;
+      button.textContent = `削除できません: ${response.error ?? '不明な理由'}`;
+      return;
+    }
+    this.history = null;
+    this.renderHistoryRow();
   }
 
   private renderCollecting() {
@@ -639,6 +755,15 @@ export class OverlayController {
     size.className = 'progress-text';
     size.id = 'review-size';
     this.panelEl.appendChild(size);
+
+    // 省いた投稿が一覧に出てこない理由を書く。書かないと「取りこぼした」ように見える
+    const skipped = ctx.result.skippedByHistoryPostIds.size;
+    if (skipped > 0) {
+      const skippedText = document.createElement('p');
+      skippedText.className = 'progress-text';
+      skippedText.textContent = `前回保存済みのため取得を省いた投稿: ${skipped} 件 (この ZIP には含まれません)`;
+      this.panelEl.appendChild(skippedText);
+    }
 
     const error = document.createElement('p');
     error.className = 'review-error';
@@ -1058,7 +1183,7 @@ export class OverlayController {
     this.renderComplete(message);
   }
 
-  private async startCollecting(settings: CollectorSettings) {
+  private async startCollecting(settings: CollectorSettings, ignoreHistory = false) {
     if (!this.pageType) return;
     resetTestState();
     // 新しい収集を始めた時点で、前の ZIP フェーズの結果は観測状態に載せてはいけない
@@ -1089,6 +1214,8 @@ export class OverlayController {
           if (el) el.textContent = `投稿情報を収集中... (${current}/${total})`;
         },
         signal,
+        // 履歴を無視する指定なら null を渡す。差分にせず全件を取得する (Issue #56)
+        ignoreHistory ? null : this.history,
       );
 
       // 状態に触る前に現行かを見る (ZIP フェーズと同じ順序)
@@ -1118,6 +1245,7 @@ export class OverlayController {
             postFailures: result.postFailures,
             failedPageCount: result.failedPageCount,
             failedFileCount: 0,
+            skippedByHistoryCount: result.skippedByHistoryPostIds.size,
           }),
         );
         return;
@@ -1247,6 +1375,7 @@ export class OverlayController {
           failedPageCount,
           failedFileCount: zip.failedFileCount,
           stoppedReason,
+          skippedByHistoryCount: ctx.result.skippedByHistoryPostIds.size,
           historyError,
         }),
       );

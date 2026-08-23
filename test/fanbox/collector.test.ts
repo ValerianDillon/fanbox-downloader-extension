@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { ARCHIVE_FORMAT_VERSION } from '../../src/content/archive-path';
 import { ResponseParseError, resetSharedBackoff } from '../../src/content/fanbox/api';
 import { collect, PostBodyInvalidError, type ProgressCallback } from '../../src/content/fanbox/collector';
+import { type CreatorHistory, HISTORY_SCHEMA_VERSION } from '../../src/history-record';
 
 const CREATOR_ID = 'testcreator';
 const LIST_PAGE_URL = `https://api.fanbox.cc/post.listCreator?creatorId=${CREATOR_ID}&cursor=1`;
@@ -66,6 +68,47 @@ function recordRequestedUrls(): string[] {
 
 const SETTINGS = { isIgnoreFree: false, limit: null, apiIntervalMs: 50 };
 
+/** POST_STUB を「前回すべて保存できた」状態で記録した履歴 (Issue #56 の差分判定用) */
+const HISTORY: CreatorHistory = {
+  schemaVersion: HISTORY_SCHEMA_VERSION,
+  creatorId: CREATOR_ID,
+  lastUsedAt: 1,
+  catalog: [
+    {
+      postId: POST_STUB.id,
+      observedAt: 1,
+      updatedDatetime: POST_STUB.updatedDatetime,
+      title: POST_STUB.title,
+      publishedDatetime: POST_STUB.publishedDatetime,
+      complete: true,
+      assets: [
+        { kind: 'image', assetId: 'img-1', originalName: 'img', extension: 'png' },
+        { kind: 'cover', originalName: 'cover', extension: 'jpg' },
+      ],
+    },
+  ],
+  saved: [
+    {
+      postId: POST_STUB.id,
+      archiveDirectory: `${POST_STUB.id}_${POST_STUB.title}`,
+      revision: POST_STUB.updatedDatetime,
+      archiveFormatVersion: ARCHIVE_FORMAT_VERSION,
+      assets: [
+        {
+          kind: 'image',
+          assetId: 'img-1',
+          archiveName: 'img_image_img-1.png',
+          outcome: 'written',
+          zipName: 'out.zip',
+          savedAt: 2,
+        },
+        { kind: 'cover', archiveName: 'cover.jpg', outcome: 'written', zipName: 'out.zip', savedAt: 2 },
+      ],
+    },
+  ],
+  scan: null,
+};
+
 /**
  * 待機を即時化する。観測できない失敗の再試行は 5 秒・15 秒の固定待機で、Retry-After のように
  * テストから短くできないため、待機時間そのものが関心事でないテストではこれで実時間を待たない。
@@ -103,6 +146,48 @@ describe('collect', () => {
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = origChrome;
     resetSharedBackoff();
+  });
+
+  test('履歴に載っている変わらない投稿は post.info を発行しない (Issue #56 で実際に API コストを減らす箇所)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+    const requested = recordRequestedUrls();
+
+    const result = await collect(CREATOR_ID, undefined, SETTINGS, () => {}, new AbortController().signal, HISTORY);
+
+    expect(requested).not.toContain(POST_INFO_URL);
+    expect([result.addedPostCount, [...result.skippedByHistoryPostIds]]).toEqual([0, ['1001']]);
+  });
+
+  test('省いた投稿は失敗にも成功にも数えない (取りこぼしではないため)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+
+    const result = await collect(CREATOR_ID, undefined, SETTINGS, () => {}, new AbortController().signal, HISTORY);
+
+    expect([result.postFailures.apiFailed, result.postFailures.unavailable, result.failedPageCount]).toEqual([0, 0, 0]);
+  });
+
+  test('履歴を渡さなければ全件を取得する (「前回保存分も取得する」の経路)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+    const requested = recordRequestedUrls();
+
+    const result = await collect(CREATOR_ID, undefined, SETTINGS, () => {}, new AbortController().signal, null);
+
+    expect(requested).toContain(POST_INFO_URL);
+    expect([result.addedPostCount, result.skippedByHistoryPostIds.size]).toEqual([1, 0]);
+  });
+
+  test('一覧の updatedDatetime が変わっていれば履歴があっても取得する (編集された投稿を飛ばさないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [{ ...POST_STUB, updatedDatetime: '2099-01-01T00:00:00+09:00' }] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+    const requested = recordRequestedUrls();
+
+    const result = await collect(CREATOR_ID, undefined, SETTINGS, () => {}, new AbortController().signal, HISTORY);
+
+    expect(requested).toContain(POST_INFO_URL);
+    expect(result.addedPostCount).toBe(1);
   });
 
   test('一覧の updatedDatetime を postId ごとに記録する (次回の差分判定を一覧の走査だけで済ませるため)', async () => {
