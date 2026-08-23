@@ -437,10 +437,10 @@ export class OverlayController {
    */
   private readonly deletingCreators = new Set<string>();
   /**
-   * 進行中の履歴の読み込み。収集を始める前にこれを待つ。
+   * 進行中の履歴の読み込み。設定画面の表示にだけ使う。
    *
-   * 待たずに始めると、読み込みが終わる前に押された収集が履歴なしで走る。差分にならないだけでなく
-   * **凍結名も使われない**ので、タイトルやアセット名が変わっていれば archive 名が付け替わる。
+   * 収集はこれを待たず、開始の直前に storage から読み直す。画面に持っている値は
+   * 別のタブの削除で古くなりうるので、待っても正しい値になるとは限らない。
    */
   private historyLoad: Promise<void> = Promise.resolve();
   /** 履歴を一度でも読み終えたか。設定画面の表示を「確認中」と分けるために持つ */
@@ -531,12 +531,19 @@ export class OverlayController {
   setPageType(pageType: PageType) {
     // SPA 遷移で creator が変わったら、読み込み済みの履歴も進行中の読み込みも捨てる。
     // 残すと別の creator の保存実績を根拠に post.info を省きうる (Issue #56)
-    if (pageType?.creatorId !== this.pageType?.creatorId) {
+    const creatorChanged = pageType?.creatorId !== this.pageType?.creatorId;
+    if (creatorChanged) {
       this.history = null;
       this.historyLoaded = false;
       this.historyGeneration++;
     }
     this.pageType = pageType;
+    // 設定画面を開いたまま遷移したら、移った先の履歴を読み直して表示も更新する。
+    // 更新しないと、前の creator の件数を出したまま「記録を削除」がこちらの creator に効く
+    if (creatorChanged && this.state === 'settings' && this.panelEl) {
+      this.renderHistoryRow();
+      this.historyLoad = this.loadHistory();
+    }
   }
 
   showPanel() {
@@ -1306,10 +1313,11 @@ export class OverlayController {
     this.guardUnload();
 
     try {
-      // 履歴の読み込みが終わるまで待つ。待たずに始めると、履歴なしで収集が走って
-      // 凍結名が使われず archive 名が付け替わる。保存先の確保は review の確定時なので、
-      // ここで待ってもユーザアクティベーションは失効しない
-      await this.historyLoad;
+      // **収集の直前に storage から読み直す。** 画面に持っている値は古くなりうる —
+      // 同じ creator を別のタブで開いて記録を削除しても、こちらのメモリ上の履歴は残るので、
+      // 削除したはずの履歴を根拠に post.info を省いてしまう (「次回は全件を取得します」に反する)。
+      // 保存先の確保は review の確定時なので、ここで待ってもユーザアクティベーションは失効しない
+      const history = await readCreatorHistory(this.pageType.creatorId);
       if (!this.isCurrentCollect(signal)) return;
       const creatorId = this.pageType.creatorId;
       const postId = this.pageType.type === 'post' ? this.pageType.postId : undefined;
@@ -1326,7 +1334,7 @@ export class OverlayController {
           if (el) el.textContent = `投稿情報を収集中... (${current}/${total})`;
         },
         signal,
-        historyForCollect(this.history, creatorId),
+        historyForCollect(history, creatorId),
         // 「前回保存分も取得する」は省略だけを止める。凍結名は据え置く
         !ignoreHistory,
       );
