@@ -1,0 +1,83 @@
+---
+paths:
+  - 'src/history-record.ts'
+  - 'src/service-worker/history-store.ts'
+  - 'src/content/history.ts'
+---
+
+# 差分ダウンロードの履歴 (Issue #56)
+
+creator ごとの 観測カタログ / 保存実績 / scan 実績 を `chrome.storage.local` に持つ。
+レコード型・マージ規則・復号は `src/history-record.ts`、保存先の I/O と破棄は `src/service-worker/history-store.ts`、content script 側のクライアントは `src/content/history.ts`。
+
+content script から Web Storage / IndexedDB を使うと FANBOX ページ側の origin になるため使わない。
+
+## 書き込みは service worker、読みは直読み
+
+**書き込みは service worker に一本化して直列化する。**
+拡張の service worker は 1 プロセスの単一スレッドなので、そこで直列化すれば全タブの書き込みが直列になる。
+content script 側の直列化は同一タブしか守れない (`media-attempt-log.ts` の `queue` が既にその限界を持つ)。
+`navigator.locks` では解けない — Web Locks は origin で分割され、ページ origin の content script と拡張 origin の service worker でロックを共有できない。
+
+**キューは creator 単位ではなく 1 本。** 破棄の判断で全 creator を見るため、creator ごとに並行させると判断の材料が競合する。
+
+読みは content script が `chrome.storage.local` を直接引く。
+`get` は atomic なので書き込み途中の状態は見えない。
+読みまで往復にすると、収集の入口で service worker の起動待ちが入る。
+
+content script が送るのは creator レコード全体ではなく**冪等な upsert 差分**にする。
+全体を送って上書きすると、同じ creator を 2 タブで開いたときに片方の更新が他方を丸ごと巻き戻す。
+冪等にするのは、service worker が応答の直前に停止して content script が再送する経路があるため。
+
+## 安全側の向き
+
+**失われてよいのは履歴だけで、「取得していないものを取得済みとして扱う」ことは起こしてはならない。**
+service worker が `get` と `set` の間で停止すればその差分は失われるが、失われる方向は「履歴が欠ける → 再ダウンロード」である。
+
+**読めない値はすべて「履歴が無い」に倒す。** 版違い・破損・配列の 1 件でも復号失敗、いずれも `null` を返す。
+部分的に信じると、実際には保存していない対象を「前回保存済み」として飛ばしうる。
+
+キーとレコードの `creatorId` の一致は必ず突き合わせる。
+ずれたレコードを返すと、別の creator の保存実績を今の creator のものとして扱う。
+
+## 到着順に依存させない
+
+差分は遅れて届きうるので、**どのフィールドも到着順ではなく記録された時刻で新旧を決める**。
+
+- カタログは投稿ごとの `observedAt`。同時刻で内容が食い違えば `complete` を `false` にし、`post.info` を取り直させる。内容の比較は `complete` を除いた正規形で行い、アセットは identity 順に並べ替える (観測ごとの並びの違いを食い違いと数えない)
+- 保存実績はアセットごとの `savedAt`。世代 (`revision` / `ARCHIVE_FORMAT_VERSION` / 投稿ディレクトリ名の組) が同じならアセットをマージし、違えば `savedAt` の最大値が大きい方だけを残す。同値なら既存を残す
+- scan は `scannedAt`。同時刻で食い違えば「完走していない」方に倒す
+
+**`revision` が `null` 同士・空文字同士は同じ世代とみなさない。**
+`null` は「更新時刻を取得できなかった」であって「同じ状態である」ではない。
+空文字も復号の時点で失敗にする — 通すと、編集の前後がどちらも空文字のときに同じ世代と判定される。
+
+**保存元 (`zipName`) と保存時刻 (`savedAt`) はアセットごとに持つ。**
+同じ投稿の一部だけを別の ZIP で取り直せるので、投稿側にまとめると「ZIP A で書いたアセット」が「ZIP B で書いた」ことになる。
+
+**同じ postId・同じアセットが 2 度現れる差分は例外にする。**
+重複があると upsert の結果が適用回数に依存し、冪等でなくなる。
+
+## 凍結名の衝突は履歴の入口で弾く
+
+単体で使える名前でも、組にすると衝突する (`same.png` と `SAME.PNG` は Windows と既定の macOS で同じファイルを指す)。
+allocator は凍結名を受け取った時点で例外にするので、通すと**破損した履歴が次のダウンロードごと止める**。
+別々の差分がマージされて初めて衝突する組もあるため、**復号時とマージ後の両方**で確かめる。
+`toCollisionKey` は allocator と共有する。
+
+## 容量
+
+`chrome.storage.local` の既定容量は Chrome 114 以降が 10 MiB、それ以前は 5 MiB で、Issue #51 の観測記録 (`fbdlMediaAttempts`) と共有する。
+予算は実行時の `QUOTA_BYTES` から決める (`QUOTA_BYTES * 0.8` と 8 MiB の小さい方)。
+`unlimitedStorage` を足すかは実測してから決める。
+
+**使用量の索引は持たない。** 別のキーに合計と更新時刻を持たせると、索引と実体がずれたときに実体が容量計算から永久に外れる。
+ずれた索引を根拠に「まだ余裕がある」と判断すると、実際の上限に当たって以後の書き込みが失敗し続ける。
+書き込みのたびに全エントリを読んで数える方が状態が 1 つで済む。
+
+**破棄は creator 単位でまとめて行う。** 投稿単位で部分的に捨てると「カタログが完全か」が誤って true のまま残る経路ができる。
+破棄の対象は creatorId ではなく storage のキーで持つ — `fbdlHistory:` のように creatorId が空のキーに残った値が、容量計算からも破棄候補からも外れないようにするため。
+
+**破棄と書き込みは 1 回の `set` にまとめる。** 捨てる側は `null` を書いて中身を空にする (復号は `null` を「履歴が無い」として扱う)。
+先に `remove` してから `set` すると、その間に service worker が停止したり `set` が失敗したりしたときに、更新対象と無関係な creator の履歴だけが消えて何も書かれない。
+空にしたキーの `remove` は後片付けなので、失敗しても呼び出し元へ伝えない。
