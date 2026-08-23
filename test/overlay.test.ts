@@ -229,7 +229,7 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
     const message = buildCompleteMessage({ ...base, historyError: 'storage が一杯です' });
 
     expect(message).toContain('storage が一杯です');
-    expect(message).toContain('次回は差分ではなく全件を取得します');
+    expect(message).toContain('今回の保存分は次回の差分判定に反映されません');
   });
 
   test('失敗ゼロ・非中断は COMPLETE_HEADLINE のみ (従来どおり)', () => {

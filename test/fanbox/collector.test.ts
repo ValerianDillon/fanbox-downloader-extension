@@ -222,7 +222,19 @@ describe('collect', () => {
     expect([result.addedPostCount, result.listedRevisions.get('1001')]).toEqual([0, POST_STUB.updatedDatetime]);
   });
 
-  test('同じ投稿が一覧に二度来たら最初の updatedDatetime を採る (同じ入力への結果が一覧の並びに依存しないようにするため)', async () => {
+  test('同じ投稿が同じ updatedDatetime で二度来たらその値を採る (重複そのものは差分判定を妨げないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [POST_STUB, POST_STUB] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect(result.listedRevisions.get('1001')).toBe(POST_STUB.updatedDatetime);
+  });
+
+  test('同じ投稿の updatedDatetime が食い違ったら読めなかった扱いにする (走査中の編集を古い値で省略しないため)', async () => {
     mockApi({
       ...BASE_RESPONSES,
       [LIST_PAGE_URL]: { body: { posts: [POST_STUB, { ...POST_STUB, updatedDatetime: '2099-01-01T00:00:00+09:00' }] } },
@@ -231,7 +243,21 @@ describe('collect', () => {
 
     const result = await collectCreator();
 
-    expect(result.listedRevisions.get('1001')).toBe(POST_STUB.updatedDatetime);
+    expect(result.listedRevisions.get('1001')).toBeNull();
+  });
+
+  test('古い値で省略した投稿は、食い違う重複が来たら取り消して取得する (編集後の投稿を落とさないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [POST_STUB, { ...POST_STUB, updatedDatetime: '2099-01-01T00:00:00+09:00' }] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+    const requested = recordRequestedUrls();
+
+    const result = await collect(CREATOR_ID, undefined, SETTINGS, () => {}, new AbortController().signal, HISTORY);
+
+    expect(requested).toContain(POST_INFO_URL);
+    expect([result.addedPostCount, result.skippedByHistoryPostIds.size]).toEqual([1, 0]);
   });
 
   test('全ページを走査できたら完走として報告する (走査実績の整合性を保つため)', async () => {
@@ -264,6 +290,24 @@ describe('collect', () => {
         body: { pageUrls: [LIST_PAGE_URL, secondPage] },
       },
       [secondPage]: { body: { posts: [{ ...POST_STUB, id: '1002' }] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      { ...SETTINGS, limit: 1 },
+      () => {},
+      new AbortController().signal,
+    );
+
+    expect([result.limited, result.completedFullScan]).toEqual([true, false]);
+  });
+
+  test('同じページの途中で上限に達しても完走として報告しない (最終ページでは外側のループが正常終了してしまうため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [POST_STUB, { ...POST_STUB, id: '1002' }] } },
       [POST_INFO_URL]: { body: { post: POST_FULL } },
     });
 

@@ -373,14 +373,34 @@ describe('履歴のマージ', () => {
     expect([afterNewer.saved, resent.saved]).toEqual([[newer], [newer]]);
   });
 
-  test('revision が null 同士の保存実績はマージしない (更新時刻を取得できなかっただけで同じ投稿状態とは言えないため)。', () => {
+  test('revision が null 同士の保存実績はアセットをマージする (単一投稿モードの保存で過去の凍結名を消さないため)。', () => {
     const first = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written', 100)], { revision: null });
     const second = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 200)], { revision: null });
     const current = mergeCreatorHistory(null, makeUpdate({ saved: [first] }));
 
     const result = mergeCreatorHistory(current, makeUpdate({ saved: [second] }));
 
-    expect(result.saved).toEqual([second]);
+    expect(result.saved[0].assets).toEqual([...first.assets, ...second.assets]);
+  });
+
+  test('revision が null の実績は revision の分かっている実績を置き換えない (世代の分からない保存で凍結名と実績を失わないため)。', () => {
+    const known = makeSavedPost('post-1', [makeSavedAsset('asset-a', 'written', 100)], { revision: 'r1' });
+    const unknown = makeSavedPost('post-1', [makeSavedAsset('asset-b', 'written', 200)], { revision: null });
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [known] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ saved: [unknown] }));
+
+    expect(result.saved).toEqual([known]);
+  });
+
+  test('revision の分かっている実績は revision が null の実績を置き換える (世代を特定できる記録の方が使えるため)。', () => {
+    const unknown = makeSavedPost('post-1', [makeSavedAsset('asset-b', 'written', 200)], { revision: null });
+    const known = makeSavedPost('post-1', [makeSavedAsset('asset-a', 'written', 100)], { revision: 'r1' });
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [unknown] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ saved: [known] }));
+
+    expect(result.saved).toEqual([known]);
   });
 
   test('scannedAt が同じで内容が食い違う scan は完走していない方を残す (欠落を削除と誤認させないため)。', () => {

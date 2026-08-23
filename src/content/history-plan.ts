@@ -105,3 +105,22 @@ export function canSkipPostInfo(
 function hasWrittenRecord(saved: SavedPost, kind: string, assetId: string | undefined): boolean {
   return saved.assets.some((asset) => asset.outcome === 'written' && asset.kind === kind && asset.assetId === assetId);
 }
+
+/**
+ * 収集に渡してよい履歴を選ぶ (Issue #56)。
+ *
+ * **creator の一致を必ず確かめる。** FANBOX は SPA なので、履歴を読み込んでから収集を
+ * 始めるまでの間に別の creator へ遷移しうる。creator の違う履歴を渡すと、postId が
+ * たまたま一致した投稿について**別の creator の保存実績を根拠に `post.info` を省く**。
+ * @param history 読み込み済みの履歴
+ * @param creatorId これから収集する creator
+ * @param ignoreHistory 利用者が「前回保存分も取得する」を選んだか
+ */
+export function historyForCollect(
+  history: CreatorHistory | null,
+  creatorId: string,
+  ignoreHistory: boolean,
+): CreatorHistory | null {
+  if (ignoreHistory) return null;
+  return history?.creatorId === creatorId ? history : null;
+}

@@ -140,18 +140,17 @@ export function buildSavedPosts(
     list.push({ ...identity, archiveName: asset.archiveName, outcome: asset.outcome, zipName, savedAt });
     byPostIndex.set(asset.postIndex, list);
   }
-  const saved: SavedPost[] = [];
-  for (const [postIndex, postAssets] of byPostIndex) {
-    const post = manifest.posts[postIndex];
-    saved.push({
-      postId: post.postId,
-      archiveDirectory: post.archiveDirectory,
-      revision: listedRevisions.get(post.postId) ?? null,
-      archiveFormatVersion: ARCHIVE_FORMAT_VERSION,
-      assets: postAssets,
-    });
-  }
-  return saved;
+  // **アセットを 1 つも持たない投稿にも実績を作る。** 本文だけの投稿は `zip.assets` に
+  // 現れないので、書き込み結果からだけ組み立てると保存実績が永久にできず、
+  // 差分判定が一度も成立しない (カタログのアセットが空なら全件照合は成立するのに、
+  // 実績が無いという理由だけで毎回 post.info を取り直すことになる)
+  return manifest.posts.map((post, postIndex) => ({
+    postId: post.postId,
+    archiveDirectory: post.archiveDirectory,
+    revision: listedRevisions.get(post.postId) ?? null,
+    archiveFormatVersion: ARCHIVE_FORMAT_VERSION,
+    assets: byPostIndex.get(postIndex) ?? [],
+  }));
 }
 
 /**

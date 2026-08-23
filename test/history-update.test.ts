@@ -240,6 +240,26 @@ describe('保存実績の組み立て', () => {
     ]);
   });
 
+  test('アセットを一つも持たない投稿にも実績を作る (本文だけの投稿で差分判定が一度も成立しなくなるため)。', () => {
+    const textOnly = makeManifest([{ postId: 'p1', archiveDirectory: 'p1_dir', included: [] }]);
+
+    const saved = buildSavedPosts(textOnly, [], new Map(), 'out.zip', SAVED_AT);
+
+    expect(saved).toHaveLength(1);
+    expect([saved[0].postId, saved[0].assets]).toEqual(['p1', []]);
+  });
+
+  test('書き込み結果の無い投稿も manifest にあれば実績を作る (選択から外したアセットしか無い投稿を記録から落とさないため)。', () => {
+    const twoPosts = makeManifest([
+      { postId: 'p1', archiveDirectory: 'p1_dir', included: [{ kind: 'cover', archiveName: 'cover.jpg' }] },
+      { postId: 'p2', archiveDirectory: 'p2_dir', included: [] },
+    ]);
+
+    const saved = buildSavedPosts(twoPosts, [writeResult(0, 'cover.jpg', 'written')], new Map(), 'z', SAVED_AT);
+
+    expect(saved.map((post) => post.postId)).toEqual(['p1', 'p2']);
+  });
+
   test('投稿ディレクトリ名を manifest から写す (次回の凍結名として渡すため)。', () => {
     const saved = buildSavedPosts(manifest, [writeResult(0, 'cover.jpg', 'written')], new Map(), 'z', SAVED_AT);
 

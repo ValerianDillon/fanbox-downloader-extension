@@ -311,12 +311,13 @@ function upsertByPostId<T extends { readonly postId: string }>(
  * revision (= 保存時の `updatedDatetime`)・`ARCHIVE_FORMAT_VERSION`・投稿ディレクトリ名が
  * すべて一致するときだけ同じ世代とみなす。
  *
- * **`revision` が `null` 同士は同じ世代とみなさない。** `null` は「更新時刻を取得できなかった」で
- * あって「同じ状態である」ではない。同じ世代として扱うと、投稿が編集された前後の保存実績が
- * 1 つの `SavedPost` に統合され、別の状態のアセットが同居する。
+ * **`revision` が `null` 同士は同じ世代とみなす。** `null` は「更新時刻を取得できなかった」で、
+ * 同じ状態であるとは言えない。それでもマージするのは、置換にすると単一投稿モードの保存が
+ * 過去に割り当てた凍結名を消してしまうためである。誤った省略には繋がらない —
+ * 省略は `saved.revision` が今回の一覧の値 (非 null) と一致することを要求するので、
+ * `null` の実績はどう積んでも省略を成立させない。
  */
 function isSameGeneration(existing: SavedPost, next: SavedPost): boolean {
-  if (existing.revision === null || next.revision === null) return false;
   return (
     existing.revision === next.revision &&
     existing.archiveFormatVersion === next.archiveFormatVersion &&
@@ -408,6 +409,13 @@ function preferSavedAsset(existing: SavedAsset, next: SavedAsset): SavedAsset {
  * 世代が違えば過去の実績は使えないので、新しい方の世代だけを残す。
  */
 function mergeSavedPost(existing: SavedPost, next: SavedPost): SavedPost {
+  // **世代の分からない実績は、分かっている実績を置き換えない。** 単一投稿モードや
+  // `updatedDatetime` を読めなかった収集は `revision: null` になる。これを新しい方として
+  // 採ると、過去に割り当てた凍結名と保存実績が消え、次の ZIP でその投稿のアセットが
+  // 別の名前に付け替わる (複数の ZIP をまたいで同じ投稿を同定できなくなる)。
+  // 落ちるのは今回の保存の記録だけで、次回はその投稿を取り直すことになる (安全側)
+  if (existing.revision !== null && next.revision === null) return existing;
+  if (existing.revision === null && next.revision !== null) return next;
   if (!isSameGeneration(existing, next)) {
     // 世代が違えばマージできない。どちらを残すかは新しい方で決める。到着順で決めると、
     // 遅れて届いた古い差分が新しい世代の保存実績を丸ごと消す

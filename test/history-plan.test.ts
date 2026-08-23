@@ -1,7 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import { DownloadUtils } from 'download-helper/download-helper';
 import { ARCHIVE_FORMAT_VERSION } from '../src/content/archive-path';
-import { buildFrozenArchiveNames, canSkipPostInfo, prepareHistoryPlan } from '../src/content/history-plan';
+import {
+  buildFrozenArchiveNames,
+  canSkipPostInfo,
+  historyForCollect,
+  prepareHistoryPlan,
+} from '../src/content/history-plan';
 import type { CatalogPost, CreatorHistory, SavedAsset, SavedPost } from '../src/history-record';
 import { HISTORY_SCHEMA_VERSION } from '../src/history-record';
 
@@ -175,5 +180,22 @@ describe('post.info を省略できる条件', () => {
     });
 
     expect(canSkipPostInfo(history, 'p1', REVISION)).toBe(false);
+  });
+});
+
+describe('収集に渡す履歴の選別', () => {
+  test('creator が一致する履歴だけを渡す (SPA 遷移で別の creator の保存実績を根拠に省略しないため)。', () => {
+    const history = makeHistory();
+
+    expect(historyForCollect(history, 'c1', false)).toBe(history);
+    expect(historyForCollect(history, 'c2', false)).toBeNull();
+  });
+
+  test('前回保存分も取得する指定なら履歴を渡さない (全件を取得するため)。', () => {
+    expect(historyForCollect(makeHistory(), 'c1', true)).toBeNull();
+  });
+
+  test('履歴が無ければ null を返す (初回の収集を止めないため)。', () => {
+    expect(historyForCollect(null, 'c1', false)).toBeNull();
   });
 });

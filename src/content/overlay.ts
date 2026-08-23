@@ -11,6 +11,7 @@ import { ApiShapeError, type PageType, ResponseParseError } from './fanbox/api';
 import type { CollectorSettings, CollectResult, PostFailureCounts } from './fanbox/collector';
 import { collect, PostBodyInvalidError } from './fanbox/collector';
 import { applyCreatorHistory, readCreatorHistory, removeCreatorHistory } from './history';
+import { historyForCollect } from './history-plan';
 import { buildHistoryUpdate } from './history-update';
 import css from './overlay.css' with { type: 'text' };
 import {
@@ -266,7 +267,7 @@ export function buildCompleteMessage(params: CompleteMessageParams): string {
   // 混ぜず、どの見出しになっても最後に足すだけにする。混ぜると、全部取得できているのに
   // 「一部取得できませんでした」と出る
   const historySuffix = params.historyError
-    ? `\n保存済みの記録を更新できませんでした: ${params.historyError} (次回は差分ではなく全件を取得します)`
+    ? `\n保存済みの記録を更新できませんでした: ${params.historyError} (今回の保存分は次回の差分判定に反映されません)`
     : '';
   const skipped = params.skippedByHistoryCount ?? 0;
   // 省いた投稿は取りこぼしではないので、これも見出しの判定には混ぜない
@@ -474,6 +475,12 @@ export class OverlayController {
   }
 
   setPageType(pageType: PageType) {
+    // SPA 遷移で creator が変わったら、読み込み済みの履歴も進行中の読み込みも捨てる。
+    // 残すと別の creator の保存実績を根拠に post.info を省きうる (Issue #56)
+    if (pageType?.creatorId !== this.pageType?.creatorId) {
+      this.history = null;
+      this.historyGeneration++;
+    }
     this.pageType = pageType;
   }
 
@@ -496,7 +503,9 @@ export class OverlayController {
     if (creatorId === undefined) return;
     const generation = ++this.historyGeneration;
     const history = await readCreatorHistory(creatorId);
-    if (this.historyGeneration !== generation) return;
+    // 世代だけでなく creator も突き合わせる。世代を上げずに creator が戻ってくる経路
+    // (A → B → A) では世代の一致だけでは足りない
+    if (this.historyGeneration !== generation || this.pageType?.creatorId !== creatorId) return;
     this.history = history;
     if (this.state === 'settings') this.renderHistoryRow();
   }
@@ -1214,8 +1223,7 @@ export class OverlayController {
           if (el) el.textContent = `投稿情報を収集中... (${current}/${total})`;
         },
         signal,
-        // 履歴を無視する指定なら null を渡す。差分にせず全件を取得する (Issue #56)
-        ignoreHistory ? null : this.history,
+        historyForCollect(this.history, creatorId, ignoreHistory),
       );
 
       // 状態に触る前に現行かを見る (ZIP フェーズと同じ順序)

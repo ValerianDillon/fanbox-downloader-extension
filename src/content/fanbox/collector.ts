@@ -426,9 +426,25 @@ async function getItemsByCreator(
       for (const post of postList) {
         if (signal.aborted) return counts();
         // 同じ投稿が一覧に 2 回来ても最初の値を採る。後勝ちにすると、同じ入力への結果が
-        // 一覧の並びに依存する
-        if (!listedRevisions.has(post.id)) listedRevisions.set(post.id, decodeListedUpdatedDatetime(post));
-        if (!downloadManage.isLimitValid()) break;
+        // 一覧の並びに依存する。
+        // **ただし値が食い違ったら「読めなかった」に倒す。** 走査の途中で編集されると
+        // ページをまたいで別の値が現れうる。先に見た古い値で省略を成立させると、
+        // 編集後の投稿が取得されないまま落ちる
+        const listedRevision = decodeListedUpdatedDatetime(post);
+        const knownRevision = listedRevisions.get(post.id);
+        if (knownRevision === undefined) {
+          listedRevisions.set(post.id, listedRevision);
+        } else if (knownRevision !== listedRevision) {
+          listedRevisions.set(post.id, null);
+          // 古い値で既に省略していたなら取り消し、この要素で post.info を発行させる
+          if (skippedByHistoryPostIds.delete(post.id)) seenPostIds.delete(post.id);
+        }
+        // ページの途中で上限に達した場合も一覧を全部見ていない。break だと最終ページでは
+        // 外側のループが正常終了し、「完走した」に落ちてしまう
+        if (!downloadManage.isLimitValid()) {
+          stoppedByLimit = true;
+          return counts();
+        }
         // 既に結果の出た投稿は失敗にも成功にも数えない。利用者から見て取りこぼしではない。
         // 進捗だけは進める (除外・閲覧不可・取得失敗でも進めているので、揃えないと
         // 重複を含む一覧で進捗が最後まで届かない)。
