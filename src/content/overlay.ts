@@ -1228,7 +1228,9 @@ export class OverlayController {
           if (el) el.textContent = `投稿情報を収集中... (${current}/${total})`;
         },
         signal,
-        historyForCollect(this.history, creatorId, ignoreHistory),
+        historyForCollect(this.history, creatorId),
+        // 「前回保存分も取得する」は省略だけを止める。凍結名は据え置く
+        !ignoreHistory,
       );
 
       // 状態に触る前に現行かを見る (ZIP フェーズと同じ順序)

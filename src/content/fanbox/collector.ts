@@ -169,15 +169,6 @@ function applyAddResult(result: AddPostResult, counts: PostFailureCounts): AddOu
 }
 
 /**
- * 投稿を収集する。
- * @param creatorId 対象の creator
- * @param postId 指定すると単一投稿モードになる
- * @param settings 収集の設定
- * @param onProgress 進捗の通知
- * @param signal 中断
- * @param history 差分ダウンロードの履歴。`null` を渡すと全件を取得する (Issue #56)
- */
-/**
  * 一覧要素のうち、`post.info` を発行せずに結果を決めるのに使う値をまとめた指紋。
  *
  * 同じ投稿が一覧に 2 回現れたとき、この指紋が変わっていれば走査の途中で投稿が変わっている。
@@ -187,6 +178,19 @@ function listFingerprint(revision: string | null, post: PostListItemCandidate): 
   return JSON.stringify([revision, post.feeRequired, post.isRestricted]);
 }
 
+/**
+ * 投稿を収集する。
+ * @param creatorId 対象の creator
+ * @param postId 指定すると単一投稿モードになる
+ * @param settings 収集の設定
+ * @param onProgress 進捗の通知
+ * @param signal 中断
+ * @param history 差分ダウンロードの履歴 (Issue #56)。凍結名は `skipPreviouslySaved` に
+ *   関わらずこれを使う
+ * @param skipPreviouslySaved 前回保存済みの投稿の `post.info` を省くか。
+ *   `false` にすると全件を取得するが、**凍結名は据え置く** — 「再取得する」と
+ *   「過去に割り当てた名前を忘れる」は別の要求である
+ */
 export async function collect(
   creatorId: string,
   postId: string | undefined,
@@ -194,6 +198,7 @@ export async function collect(
   onProgress: ProgressCallback,
   signal: AbortSignal,
   history?: CreatorHistory | null,
+  skipPreviouslySaved = true,
 ): Promise<CollectResult> {
   // レート制限の状態は収集ごとに持つ。前回引き上がった間隔を次の収集に持ち越さない
   const api = new ApiSession(settings.apiIntervalMs ?? DEFAULT_API_RATE_LIMIT_MS);
@@ -264,7 +269,13 @@ export async function collect(
     }
     onProgress(1, 1);
   } else {
-    const collected = await getItemsByCreator(api, downloadManage, onProgress, signal, plan.history);
+    const collected = await getItemsByCreator(
+      api,
+      downloadManage,
+      onProgress,
+      signal,
+      skipPreviouslySaved ? plan.history : null,
+    );
     addedPostCount = collected.addedPostCount;
     postFailures = collected.postFailures;
     failedPageCount = collected.failedPageCount;

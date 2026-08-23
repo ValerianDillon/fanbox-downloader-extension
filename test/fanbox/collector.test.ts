@@ -167,14 +167,43 @@ describe('collect', () => {
     expect([result.postFailures.apiFailed, result.postFailures.unavailable, result.failedPageCount]).toEqual([0, 0, 0]);
   });
 
-  test('履歴を渡さなければ全件を取得する (「前回保存分も取得する」の経路)', async () => {
+  test('skipPreviouslySaved が false なら履歴があっても全件を取得する (前回保存分も取得する の経路)', async () => {
     mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
     const requested = recordRequestedUrls();
 
-    const result = await collect(CREATOR_ID, undefined, SETTINGS, () => {}, new AbortController().signal, null);
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      SETTINGS,
+      () => {},
+      new AbortController().signal,
+      HISTORY,
+      false,
+    );
 
     expect(requested).toContain(POST_INFO_URL);
     expect([result.addedPostCount, result.skippedByHistoryPostIds.size]).toEqual([1, 0]);
+  });
+
+  test('skipPreviouslySaved が false でも凍結名は据え置く (再取得の指定は過去に割り当てた名前を捨てる理由にならないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      // タイトルが変わっても、凍結名を使うなら投稿ディレクトリ名は前回のままになる
+      [POST_INFO_URL]: { body: { post: { ...POST_FULL, title: '変更後のタイトル' } } },
+    });
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      SETTINGS,
+      () => {},
+      new AbortController().signal,
+      HISTORY,
+      false,
+    );
+
+    const json = JSON.parse(result.downloadObject.stringify());
+    expect(json.posts[0].encodedName).toBe(HISTORY.saved[0].archiveDirectory);
   });
 
   test('一覧の updatedDatetime が変わっていれば履歴があっても取得する (編集された投稿を飛ばさないため)', async () => {
@@ -221,6 +250,33 @@ describe('collect', () => {
     const result = await collectCreator();
 
     expect([result.addedPostCount, result.listedRevisions.get('1001')]).toEqual([0, POST_STUB.updatedDatetime]);
+  });
+
+  test('一覧だけの決定を取り消しても進捗は最後まで届く (取り消しで進捗を戻すと途中で止まって見えるため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: {
+        body: {
+          posts: [
+            { ...POST_STUB, isRestricted: true },
+            { ...POST_STUB, isRestricted: false },
+          ],
+        },
+      },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+    const progress: Array<[number, number]> = [];
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      SETTINGS,
+      (current, total) => progress.push([current, total]),
+      new AbortController().signal,
+    );
+
+    expect(progress[progress.length - 1]).toEqual([2, 2]);
+    expect([...result.apiFailedPostIds]).toEqual([]);
   });
 
   test('無料として除外した投稿が有料に変わって二度目に来たら取得する (走査中の変更で取得対象を落とさないため)', async () => {

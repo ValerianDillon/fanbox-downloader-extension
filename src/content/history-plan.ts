@@ -112,15 +112,13 @@ function hasWrittenRecord(saved: SavedPost, kind: string, assetId: string | unde
  * **creator の一致を必ず確かめる。** FANBOX は SPA なので、履歴を読み込んでから収集を
  * 始めるまでの間に別の creator へ遷移しうる。creator の違う履歴を渡すと、postId が
  * たまたま一致した投稿について**別の creator の保存実績を根拠に `post.info` を省く**。
+ *
+ * 「前回保存分も取得する」の指定はここでは見ない。**再取得の指定は凍結名を捨てる理由に
+ * ならない**ためで、その指定は `collect` の `skipPreviouslySaved` が受け取る。
+ * 混ぜると、再取得を選んだだけで投稿とアセットの archive 名が付け替わる。
  * @param history 読み込み済みの履歴
  * @param creatorId これから収集する creator
- * @param ignoreHistory 利用者が「前回保存分も取得する」を選んだか
  */
-export function historyForCollect(
-  history: CreatorHistory | null,
-  creatorId: string,
-  ignoreHistory: boolean,
-): CreatorHistory | null {
-  if (ignoreHistory) return null;
+export function historyForCollect(history: CreatorHistory | null, creatorId: string): CreatorHistory | null {
   return history?.creatorId === creatorId ? history : null;
 }

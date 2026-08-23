@@ -188,15 +188,11 @@ describe('収集に渡す履歴の選別', () => {
   test('creator が一致する履歴だけを渡す (SPA 遷移で別の creator の保存実績を根拠に省略しないため)。', () => {
     const history = makeHistory();
 
-    expect(historyForCollect(history, 'c1', false)).toBe(history);
-    expect(historyForCollect(history, 'c2', false)).toBeNull();
-  });
-
-  test('前回保存分も取得する指定なら履歴を渡さない (全件を取得するため)。', () => {
-    expect(historyForCollect(makeHistory(), 'c1', true)).toBeNull();
+    expect(historyForCollect(history, 'c1')).toBe(history);
+    expect(historyForCollect(history, 'c2')).toBeNull();
   });
 
   test('履歴が無ければ null を返す (初回の収集を止めないため)。', () => {
-    expect(historyForCollect(null, 'c1', false)).toBeNull();
+    expect(historyForCollect(null, 'c1')).toBeNull();
   });
 });

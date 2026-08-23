@@ -153,7 +153,7 @@ describe('履歴のマージ', () => {
     expect(result.saved[0].assets).toEqual([...existing.assets, ...retry.assets]);
   });
 
-  test('revision が変わった保存実績は投稿ごと置換する (編集前のアセットを編集後の投稿へ持ち越さないため)。', () => {
+  test('revision が変わったら前の世代の書き込み結果は引き継がず、名前だけ name-only で残す (書けたかは世代ごとの状態だが archive 名は世代をまたいで保つため)。', () => {
     const existing = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written')], { revision: 'revision-old' });
     const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 300)], {
       revision: 'revision-new',
@@ -163,7 +163,11 @@ describe('履歴のマージ', () => {
 
     const result = mergeCreatorHistory(current, makeUpdate({ saved: [updated] }));
 
-    expect(result.saved).toEqual([updated]);
+    expect(result.saved[0].assets.map((asset) => [asset.assetId, asset.outcome])).toEqual([
+      ['asset-new', 'written'],
+      ['asset-old', 'name-only'],
+    ]);
+    expect(result.saved[0].revision).toBe('revision-new');
   });
 
   test('archiveFormatVersion が変わった保存実績は投稿ごと置換する (旧形式の ZIP の実績を新形式へ持ち越さないため)。', () => {
@@ -259,7 +263,7 @@ describe('履歴のマージ', () => {
     expect(fromFailed.saved[0].assets[0].outcome).toBe('failed');
   });
 
-  test('archiveDirectory が変わった保存実績は投稿ごと置換する (別のディレクトリへ書いた ZIP の実績を混ぜないため)。', () => {
+  test('archiveDirectory が変わっても名前だけは引き継ぐ (採番規則が同じなら過去に割り当てた名前は保つため)。', () => {
     const existing = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written')], { archiveDirectory: 'dir-a' });
     const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 300)], {
       archiveDirectory: 'dir-b',
@@ -269,7 +273,11 @@ describe('履歴のマージ', () => {
 
     const result = mergeCreatorHistory(current, makeUpdate({ saved: [updated] }));
 
-    expect(result.saved).toEqual([updated]);
+    expect(result.saved[0].archiveDirectory).toBe('dir-b');
+    expect(result.saved[0].assets.map((asset) => [asset.assetId, asset.outcome])).toEqual([
+      ['asset-new', 'written'],
+      ['asset-old', 'name-only'],
+    ]);
   });
 
   test('保存実績をマージしても各アセットの zipName と savedAt はそのまま残る (書いていない ZIP で書いたと主張しないため)。', () => {
@@ -407,7 +415,12 @@ describe('履歴のマージ', () => {
 
     const resent = mergeCreatorHistory(afterNewer, makeUpdate({ saved: [older] }));
 
-    expect([afterNewer.saved, resent.saved]).toEqual([[newer], [newer]]);
+    // 新しい世代の結果が残り、古い世代のアセットは名前だけになる。再送でも変わらない
+    expect(afterNewer.saved[0].assets.map((asset) => [asset.assetId, asset.outcome])).toEqual([
+      ['asset-new', 'written'],
+      ['asset-old', 'name-only'],
+    ]);
+    expect(resent.saved).toEqual(afterNewer.saved);
   });
 
   test('revision が null 同士の保存実績はアセットをマージする (単一投稿モードの保存で過去の凍結名を消さないため)。', () => {
@@ -436,7 +449,7 @@ describe('履歴のマージ', () => {
     expect(result.saved).toEqual([known]);
   });
 
-  test('revision の分かっている実績は revision が null の実績を置き換える (世代を特定できる記録の方が使えるため)。', () => {
+  test('revision の分かっている実績が revision が null の実績を置き換え、名前だけ引き継ぐ (世代を特定できる記録を採りつつ名前は保つため)。', () => {
     const unknown = makeSavedPost('post-1', [makeSavedAsset('asset-b', 'written', 200)], {
       revision: null,
       savedAt: 200,
@@ -449,7 +462,11 @@ describe('履歴のマージ', () => {
 
     const result = mergeCreatorHistory(current, makeUpdate({ saved: [known] }));
 
-    expect(result.saved).toEqual([known]);
+    expect(result.saved[0].revision).toBe('r1');
+    expect(result.saved[0].assets.map((asset) => [asset.assetId, asset.outcome])).toEqual([
+      ['asset-a', 'written'],
+      ['asset-b', 'name-only'],
+    ]);
   });
 
   test('scannedAt が同じで内容が食い違う scan は完走していない方を残す (欠落を削除と誤認させないため)。', () => {

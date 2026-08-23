@@ -109,8 +109,14 @@ export type CatalogPost = {
  * 保存実績がある」なので、記録が無いことと「選ばなかった」と記録することは同じ判断になる。
  * 記録する側は archive 名を持たない (共有層の manifest は除外したアセットに archive 名を付けない)
  * ため、名前が省略できる変種を足すことになり、凍結名の組み立てと衝突検査が複雑になる。
+ *
+ * `name-only` は**割り当て済みの名前だけが残っている**状態である。投稿が編集されて世代が
+ * 変わったとき、新しい世代に現れなかったアセットの実績はここへ落とす。
+ * 「保存できたか」は世代ごとの状態だが、**一度割り当てた archive 名は世代をまたいで保つ**
+ * 必要がある (変えると過去の ZIP と同じアセットを同定できなくなる)。
+ * `written` ではないので省略条件は満たさない。
  */
-export type SavedAssetOutcome = 'written' | 'failed';
+export type SavedAssetOutcome = 'written' | 'failed' | 'name-only';
 
 /**
  * 保存実績のアセット 1 件。
@@ -335,6 +341,27 @@ function isSameGeneration(existing: SavedPost, next: SavedPost): boolean {
 }
 
 /**
+ * 世代の変わった実績へ、前の世代でだけ現れたアセットの**名前だけ**を引き継ぐ。
+ *
+ * 「保存できたか」は世代ごとの状態だが、**一度割り当てた archive 名は世代をまたいで保つ**。
+ * 引き継がないと、投稿が編集された回に選ばなかったアセットの名前が失われ、次に選んだときに
+ * 編集後の元名から採番し直される (過去の ZIP と同じアセットを同定できなくなる)。
+ *
+ * 引き継いだ側は `name-only` にする。前の世代で書けたことは、今の世代で書けたことを意味しない。
+ * `zipName` と `savedAt` はその名前を割り当てた実行のものを残す (事実と食い違わせない)。
+ */
+function carryOverNames(existing: SavedPost, next: SavedPost): SavedPost {
+  // 採番規則が変わっていれば引き継がない。前の規則で決めた名前を新しい規則の記録に混ぜると、
+  // `buildFrozenArchiveNames` が版で選り分けたつもりの名前に旧規則のものが紛れる
+  if (existing.archiveFormatVersion !== next.archiveFormatVersion) return next;
+  const nextIdentities = new Set(next.assets.map(assetIdentity));
+  const carried = existing.assets
+    .filter((asset) => !nextIdentities.has(assetIdentity(asset)))
+    .map((asset): SavedAsset => ({ ...asset, outcome: 'name-only' }));
+  return carried.length === 0 ? next : { ...next, assets: [...next.assets, ...carried] };
+}
+
+/**
  * 同じ投稿のカタログが 2 つあるとき、どちらを残すか決める。
  *
  * **新しい観測 (`observedAt` が大きい方) を残す。** 到着順で決めると、遅れて届いた古い観測が
@@ -414,13 +441,13 @@ function mergeSavedPost(existing: SavedPost, next: SavedPost): SavedPost {
   // 別の名前に付け替わる (複数の ZIP をまたいで同じ投稿を同定できなくなる)。
   // 落ちるのは今回の保存の記録だけで、次回はその投稿を取り直すことになる (安全側)
   if (existing.revision !== null && next.revision === null) return existing;
-  if (existing.revision === null && next.revision !== null) return next;
+  if (existing.revision === null && next.revision !== null) return carryOverNames(existing, next);
   if (!isSameGeneration(existing, next)) {
     // 世代が違えばマージできない。どちらを残すかは新しい方で決める。到着順で決めると、
-    // 遅れて届いた古い差分が新しい世代の保存実績を丸ごと消す
+    // 遅れて届いた古い差分が新しい世代の保存実績を丸ごと消す。
     // 同値では既存を残す。`>=` にすると、同じミリ秒に終わった別世代の古い差分を再送しただけで
     // 新しい世代の保存実績が消える
-    return next.savedAt > existing.savedAt ? next : existing;
+    return next.savedAt > existing.savedAt ? carryOverNames(existing, next) : existing;
   }
   const byIdentity = new Map(next.assets.map((asset) => [assetIdentity(asset), asset]));
   const assets: SavedAsset[] = [];
@@ -558,7 +585,7 @@ function decodeSavedAsset(value: unknown): SavedAsset | null {
   // 通してしまうと allocator が例外を投げ、破損した履歴が次のダウンロードごと止める
   if (typeof value.archiveName !== 'string' || describeUnusableSegment(value.archiveName) !== null) return null;
   const outcome = value.outcome;
-  if (outcome !== 'written' && outcome !== 'failed') return null;
+  if (outcome !== 'written' && outcome !== 'failed' && outcome !== 'name-only') return null;
   if (typeof value.zipName !== 'string' || value.zipName === '' || !isCount(value.savedAt)) return null;
   return { ...identity, archiveName: value.archiveName, outcome, zipName: value.zipName, savedAt: value.savedAt };
 }
