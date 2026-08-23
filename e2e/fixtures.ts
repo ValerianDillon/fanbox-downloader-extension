@@ -110,26 +110,29 @@ export const EXPECTED_FETCHED_URLS = [POST_A_COVER_URL, POST_A_IMAGE_URL, POST_B
 /**
  * 期待される ZIP エントリ名一覧。
  *
- * download-helper.ts の downloadZip / DownloadObject.stringify (project) から手で導出した固定値。
+ * archive path は postId 由来の allocator (`src/content/archive-path.ts`、Issue #56) が決める。
  * - encodedId = utils.encodeFileName('testcreator') = 'testcreator' (エスケープ対象文字なし)
- * - 各投稿の encodedName = utils.encodeFileName(title) (同名衝突なしなので getFileName はそのまま名前を返す)
- * - cover のエントリ名は 'cover' + '.' + (coverImageUrl の拡張子)
- * - image type の投稿は addFile(postName, ext, url) で呼ばれるため、ファイル名は投稿タイトルベースになる
- * - file type の投稿は addFile(file.name, file.extension, file.url) で呼ばれるため、ファイル名は FileInfo.name ベースになる
- * - download-manifest.json は projection の記録として ZIP ルートに必ず書かれる (download-helper v8)
+ * - 投稿ディレクトリは `<postId>_<タイトル>`
+ * - 本文アセットは `<元の名前>_<kind>_<assetId><拡張子>`。assetId を常に付けるので、同名のアセットが
+ *   増えても既存の名前が変わらない。kind も含めるのは image と file で同じ assetId が来ても別物だから
+ * - image type の投稿は addFile(postName, ext, url) で呼ばれるため、元の名前は投稿タイトルになる
+ * - file type の投稿は addFile(file.name, file.extension, file.url) で呼ばれるため、元の名前は
+ *   FileInfo.name になる
+ * - cover のエントリ名は 'cover' + (coverImageUrl の拡張子)。投稿に高々 1 つなので一意である
+ * - download-manifest.json は projection の記録として ZIP ルートに必ず書かれる
  */
 export const EXPECTED_ZIP_ENTRIES = [
   'testcreator/',
   'testcreator/index.html',
   'testcreator/download-manifest.json',
-  'testcreator/リンゴ/',
-  'testcreator/リンゴ/info.json',
-  'testcreator/リンゴ/index.html',
-  'testcreator/リンゴ/cover.jpg',
-  'testcreator/リンゴ/リンゴ.png',
-  'testcreator/バナナ/',
-  'testcreator/バナナ/info.json',
-  'testcreator/バナナ/index.html',
-  'testcreator/バナナ/cover.png',
-  'testcreator/バナナ/資料.pdf',
+  'testcreator/1001_リンゴ/',
+  'testcreator/1001_リンゴ/info.json',
+  'testcreator/1001_リンゴ/index.html',
+  'testcreator/1001_リンゴ/cover.jpg',
+  'testcreator/1001_リンゴ/リンゴ_image_a-img-1.png',
+  'testcreator/1002_バナナ/',
+  'testcreator/1002_バナナ/info.json',
+  'testcreator/1002_バナナ/index.html',
+  'testcreator/1002_バナナ/cover.png',
+  'testcreator/1002_バナナ/資料_file_b-file-1.pdf',
 ].sort();

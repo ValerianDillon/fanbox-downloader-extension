@@ -201,10 +201,10 @@ test('review で外した投稿とカバーは ZIP にも取得要求にも現�
         'testcreator/',
         'testcreator/index.html',
         'testcreator/download-manifest.json',
-        'testcreator/バナナ/',
-        'testcreator/バナナ/info.json',
-        'testcreator/バナナ/index.html',
-        'testcreator/バナナ/資料.pdf',
+        'testcreator/1002_バナナ/',
+        'testcreator/1002_バナナ/info.json',
+        'testcreator/1002_バナナ/index.html',
+        'testcreator/1002_バナナ/資料_file_b-file-1.pdf',
       ].sort(),
     );
 
@@ -254,7 +254,7 @@ test('review で外した拡張子の添付だけが ZIP から消える (Issue 
 
     const parsed = parseZip(decodeBase64ToBytes(state.zipB64 ?? ''));
     expect([...parsed.entries.map((e) => e.name)].sort()).toEqual(
-      EXPECTED_ZIP_ENTRIES.filter((name) => name !== 'testcreator/バナナ/資料.pdf'),
+      EXPECTED_ZIP_ENTRIES.filter((name) => name !== 'testcreator/1002_バナナ/資料_file_b-file-1.pdf'),
     );
 
     expect(unexpectedRequests, `予期しないリクエストが発生した: ${unexpectedRequests.join(', ')}`).toEqual([]);
@@ -265,17 +265,14 @@ test('review で外した拡張子の添付だけが ZIP から消える (Issue 
 });
 
 /**
- * Issue #55 / ValerianDillon/download-helper#52: 保存先を確保する前に入力の不備を検出すること。
+ * Issue #56: 同名の投稿が並んでも archive path が衝突しないこと。
  *
- * `showSaveFilePicker` は解決した時点で対象ファイルの中身を空にする (新規なら 0 バイトで作成し、
- * 既存ファイルを選べばその内容を消す)。picker の後で ZIP 生成が入力の不備で落ちると、書くものが
- * 無いまま利用者のファイルだけが空になる。
- *
- * legacy allocator は投稿タイトルが a / a / a_1 のとき a_2 / a_1 / a_1 を割り当てる。
- * 型検証 (`isDownloadJsonObj`) はこれを通すので、共有層の `preflight` まで通していないと
- * picker の後で初めて落ちる。ここでは確定ボタンが押せないまま review に留まることを確かめる。
+ * 従来の採番は同名グループの件数に依存しており、投稿タイトルが `a` / `a` / `a_1` のとき
+ * `a_2` / `a_1` / `a_1` を割り当てて**同じディレクトリ名を 2 回作っていた**。
+ * 同じパスに 2 投稿ぶんの中身が入るので、片方の `index.html` と `info.json` が失われる。
+ * postId 由来の採番ではこの入力でも 3 投稿が別々のディレクトリに入る。
  */
-test('投稿ディレクトリ名が衝突する収集結果は、保存先を確保する前に確定できなくなる (Issue #55)', async () => {
+test('同名の投稿が並んでも archive path が衝突しない (Issue #56)', async () => {
   const collidingTitles = ['a', 'a', 'a_1'];
   const collidingIds = ['2001', '2002', '2003'];
   const collidingResponses: Record<string, unknown> = {
@@ -294,6 +291,68 @@ test('投稿ディレクトリ名が衝突する収集結果は、保存先を�
   };
 
   const session = await launchAndStartCollecting(collidingResponses, 'collide');
+  const { context, page, userDataDir } = session;
+
+  try {
+    await confirmReview(session);
+
+    await expect
+      .poll(() => page.evaluate(readTestState), { timeout: 30_000 })
+      .toMatchObject({ overlayState: 'complete', zipDone: '1' });
+
+    const state = await page.evaluate(readTestState);
+    expect(state.error, 'startCollecting でエラーが発生した').toBeNull();
+
+    const parsed = parseZip(decodeBase64ToBytes(state.zipB64 ?? ''));
+    const names = parsed.entries.map((e) => e.name);
+    // 3 投稿が別々のディレクトリに入り、どれも index.html と info.json を失っていない
+    for (const [index, id] of collidingIds.entries()) {
+      const dir = `testcreator/${id}_${collidingTitles[index]}`;
+      expect(names, `${dir} が作られていない`).toContain(`${dir}/`);
+      expect(names).toContain(`${dir}/index.html`);
+      expect(names).toContain(`${dir}/info.json`);
+    }
+    expect(new Set(names).size, 'ZIP のエントリ名が重複している').toBe(names.length);
+  } finally {
+    await context.close();
+    await rm(userDataDir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Issue #55: 対象の導出か検証に失敗したら、**保存先を確保する前に**確定できなくなること。
+ *
+ * `showSaveFilePicker` は解決した時点で対象ファイルの中身を空にする (新規なら 0 バイトで作成し、
+ * 既存ファイルを選べばその内容を消す)。picker の後で ZIP 生成が入力の不備で落ちると、書くものが
+ * 無いまま利用者のファイルだけが空になる。
+ *
+ * 検証は共有層の `preflight` を通す。`isDownloadJsonObj` だけでは型検証しか行わず、ZIP のエントリ名が
+ * 上限を超えるような**型検証を通る入力**が picker の後で落ちる。
+ * 拡張子は共有層の decoder が文字列としてしか検証しておらず、archive 名の長さ制限も掛からないので、
+ * 長い拡張子を返す投稿でこの経路を通す。現実の FANBOX では起きない入力である。
+ */
+test('導出に失敗する収集結果は、保存先を確保する前に確定できなくなる (Issue #55)', async () => {
+  const longExtension = 'a'.repeat(70_000);
+  const longPost = {
+    ...POST_A_FULL,
+    id: '3001',
+    type: 'file',
+    body: {
+      text: '',
+      files: [
+        { id: 'long-1', url: 'https://downloads.fanbox.cc/files/3001/x', name: '資料', extension: longExtension },
+      ],
+    },
+  };
+  const longResponses: Record<string, unknown> = {
+    [PLANS_URL]: PLANS_RESPONSE,
+    [TAGS_URL]: TAGS_RESPONSE,
+    [PAGINATE_URL]: PAGINATE_RESPONSE,
+    [LIST_PAGE_URL]: { body: { posts: [{ ...POST_A_STUB, id: '3001' }] } },
+    'https://api.fanbox.cc/post.info?postId=3001': { body: { post: longPost } },
+  };
+
+  const session = await launchAndStartCollecting(longResponses, 'toolong');
   const { context, page, overlay, userDataDir, unexpectedRequests } = session;
 
   try {
@@ -302,7 +361,7 @@ test('投稿ディレクトリ名が衝突する収集結果は、保存先を�
       .toMatchObject({ overlayState: 'review' });
 
     // 導出は選択の変更から少し待って走るので、エラーが出るまで待つ
-    await expect(overlay.locator('#review-error')).toContainText('重複', { timeout: 10_000 });
+    await expect(overlay.locator('#review-error')).toContainText('長すぎます', { timeout: 10_000 });
     await expect(overlay.locator('#review-confirm')).toBeDisabled();
 
     const state = await page.evaluate(readTestState);

@@ -240,13 +240,13 @@ test.describe('Issue #22: 大きいファイルの分割転送', () => {
       const { totalSize, entries } = await digestZipEntriesInPage(page, state.zipUrl ?? '');
       expect(totalSize).toBe(Number.parseInt(state.zipSize ?? '0', 10));
       const byName = Object.fromEntries(entries.map((e) => [e.name, e]));
-      expect(byName['testcreator/大きいファイル/big48.bin']).toEqual({
-        name: 'testcreator/大きいファイル/big48.bin',
+      expect(byName['testcreator/2001_大きいファイル/big48_file_2001-file-1.bin']).toEqual({
+        name: 'testcreator/2001_大きいファイル/big48_file_2001-file-1.bin',
         size: OLD_LIMIT_BYTES,
         sha256: sha256Hex(big48),
       });
-      expect(byName['testcreator/大きいファイル/big65.bin']).toEqual({
-        name: 'testcreator/大きいファイル/big65.bin',
+      expect(byName['testcreator/2001_大きいファイル/big65_file_2001-file-2.bin']).toEqual({
+        name: 'testcreator/2001_大きいファイル/big65_file_2001-file-2.bin',
         size: OVER_MESSAGE_LIMIT_BYTES,
         sha256: sha256Hex(big65),
       });
@@ -306,13 +306,13 @@ test.describe('Issue #22: 大きいファイルの分割転送', () => {
 
       const { entries } = await digestZipEntriesInPage(page, state.zipUrl ?? '');
       const byName = Object.fromEntries(entries.map((e) => [e.name, e]));
-      expect(byName['testcreator/再開/resume-range.bin']).toEqual({
-        name: 'testcreator/再開/resume-range.bin',
+      expect(byName['testcreator/2002_再開/resume-range_file_2002-file-1.bin']).toEqual({
+        name: 'testcreator/2002_再開/resume-range_file_2002-file-1.bin',
         size: withRange.length,
         sha256: sha256Hex(withRange),
       });
-      expect(byName['testcreator/再開/resume-norange.bin']).toEqual({
-        name: 'testcreator/再開/resume-norange.bin',
+      expect(byName['testcreator/2002_再開/resume-norange_file_2002-file-2.bin']).toEqual({
+        name: 'testcreator/2002_再開/resume-norange_file_2002-file-2.bin',
         size: noRange.length,
         sha256: sha256Hex(noRange),
       });
