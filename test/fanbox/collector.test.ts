@@ -25,7 +25,7 @@ const POST_FULL = {
   ...POST_STUB,
   coverImageUrl: 'https://i.pximg.net/cover.jpg',
   type: 'image',
-  body: { text: '', images: [{ originalUrl: 'https://downloads.fanbox.cc/img.png', extension: 'png' }] },
+  body: { text: '', images: [{ id: 'img-1', originalUrl: 'https://downloads.fanbox.cc/img.png', extension: 'png' }] },
 };
 
 type ProxyApiResponse = { ok: boolean; status: number; retryAfter: string | null; body?: string };

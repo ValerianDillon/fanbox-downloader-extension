@@ -71,7 +71,7 @@ export const POST_A_FULL = {
   type: 'image',
   body: {
     text: 'テキストA',
-    images: [{ originalUrl: POST_A_IMAGE_URL, extension: 'png' }],
+    images: [{ id: 'a-img-1', originalUrl: POST_A_IMAGE_URL, extension: 'png' }],
   },
 };
 
@@ -81,7 +81,7 @@ export const POST_B_FULL = {
   type: 'file',
   body: {
     text: 'テキストB',
-    files: [{ url: POST_B_FILE_URL, name: '資料', extension: 'pdf' }],
+    files: [{ id: 'b-file-1', url: POST_B_FILE_URL, name: '資料', extension: 'pdf' }],
   },
 };
 
@@ -110,16 +110,18 @@ export const EXPECTED_FETCHED_URLS = [POST_A_COVER_URL, POST_A_IMAGE_URL, POST_B
 /**
  * 期待される ZIP エントリ名一覧。
  *
- * download-helper.ts の downloadZip / DownloadObject.stringify (toJsonObjBy) から手で導出した固定値。
+ * download-helper.ts の downloadZip / DownloadObject.stringify (project) から手で導出した固定値。
  * - encodedId = utils.encodeFileName('testcreator') = 'testcreator' (エスケープ対象文字なし)
  * - 各投稿の encodedName = utils.encodeFileName(title) (同名衝突なしなので getFileName はそのまま名前を返す)
  * - cover のエントリ名は 'cover' + '.' + (coverImageUrl の拡張子)
  * - image type の投稿は addFile(postName, ext, url) で呼ばれるため、ファイル名は投稿タイトルベースになる
  * - file type の投稿は addFile(file.name, file.extension, file.url) で呼ばれるため、ファイル名は FileInfo.name ベースになる
+ * - download-manifest.json は projection の記録として ZIP ルートに必ず書かれる (download-helper v8)
  */
 export const EXPECTED_ZIP_ENTRIES = [
   'testcreator/',
   'testcreator/index.html',
+  'testcreator/download-manifest.json',
   'testcreator/リンゴ/',
   'testcreator/リンゴ/info.json',
   'testcreator/リンゴ/index.html',
