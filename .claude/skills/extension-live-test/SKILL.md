@@ -29,7 +29,8 @@ description: 実 FANBOX (https://www.fanbox.cc/) を相手に拡張を実ブラ�
 3. chrome-devtools MCP のツールで操作する
    - MCP が `http://127.0.0.1:9222` に未接続の場合は、ランチャーが起動中であることを確認した上で MCP 側を再接続する (「MCP 接続確認」参照)
    - 収集対象は 1〜2 投稿など最小限に絞る (「安全上の注意」参照)
-4. 終了する: ランチャーのプロセスに SIGINT または SIGTERM を送る (`pgrep -af "[l]ive-browser.ts"` で PID を確認してから `kill <pid>`)。`context.close()` が実行されプロファイルに状態が保存されてから終了する
+4. 終了する: `pkill -TERM -f "[l]ive-browser.ts"` を送る。`context.close()` が実行されプロファイルに状態が保存されてから終了する
+   - **PID を 1 つだけ kill しない。** バックグラウンドで起動した場合、ラッパーシェルの argv にもコマンド全文が含まれてパターンに一致するため、`pgrep ... | head -1` はランチャー本体ではなくラッパーを返しうる。ラッパーを kill してもブラウザは動き続ける (実測: kill 後も CDP が応答し、`pkill` で初めて停止した)
    - 終了後、`curl -s http://127.0.0.1:9222/json/version` が応答しなくなることで停止を確認できる
 
 ## 拡張の操作レシピ
