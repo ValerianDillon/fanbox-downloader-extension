@@ -318,11 +318,28 @@ function zipNameOf(handle: FileSystemFileHandle, fallbackBaseName: string): stri
 }
 
 /**
+ * 収集時の観測と保存実績、両方の記録の失敗をひとつの文言にまとめる (Issue #56)。
+ *
+ * 片方だけを採ると、両方落ちたときにもう片方の理由が消える。同じ理由なら 1 回だけ出す
+ * (storage が一杯なら両方が同じ文言になる)。
+ */
+export function joinHistoryErrors(observationError: string | null, saveError: string | null): string | null {
+  if (observationError === null || saveError === null) return observationError ?? saveError;
+  if (observationError === saveError) return observationError;
+  return `収集の記録: ${observationError} / 保存の記録: ${saveError}`;
+}
+
+/**
  * 差分ダウンロードの履歴を記録する (Issue #56)。失敗したらその理由を返す。
  *
  * **中断で終わった実行は記録しない。** 書けたと確認できていないものを保存済みとして扱わない。
  * `downloadZip` は中断されても ZIP を閉じて正常に戻るので、ここで見ないと途中までの結果を
  * 保存実績にしてしまう。
+ *
+ * 判断は `zip.aborted` だけで行い、`signal.aborted` は見ない。**全データを書き終えた後、
+ * `close()` の実行中に中断された場合は `zip.aborted` が false のまま返る** (共有層が
+ * 「書けているものを誤って中断と報告しない」ためにそうしている)。signal で判断すると、
+ * 完成した ZIP の実績を捨てて次回また全件取得することになる。
  *
  * 記録の失敗は ZIP の失敗ではないので例外にせず、完了画面に併記するための文言を返す。
  */
@@ -348,7 +365,7 @@ export async function recordHistory(
   zipName: string,
   signal: AbortSignal,
 ): Promise<string | null> {
-  if (signal.aborted || zip.aborted) return null;
+  if (zip.aborted) return null;
   try {
     const update = buildSaveUpdate(ctx.creatorId, ctx.result, manifest, zip.assets, zipName, Date.now());
     const response = await applyCreatorHistory(update);
@@ -769,6 +786,7 @@ export class OverlayController {
       if (this.historyGeneration === generation) {
         // 消せていないので元に戻す。戻さないと、履歴があるのに全件取得になる
         this.history = previous;
+        this.historyLoaded = true;
       } else {
         // 世代が進んでいる = この削除の間に読み込みが走っており、その結果は
         // `deletingCreators` で捨てられている。放っておくと storage には履歴があるのに
@@ -781,9 +799,13 @@ export class OverlayController {
       }
       return;
     }
-    // 消えたことは世代に依らない事実なので、世代が進んでいてもメモリ上の履歴は落とす。
-    // 落とさないと、削除中に読んだ旧履歴を根拠に post.info を省きうる
+    // **削除の前に始まった読み込みをすべて無効にする。** `deletingCreators` は応答が返った
+    // 時点で外れるので、それより後に解決した読み込みは素通りして削除済みの履歴を戻してしまう。
+    // 世代を進めれば、削除より前に始まった読み込みは結果を捨てる
+    this.historyGeneration++;
     this.history = null;
+    // 読み込みを捨てたまま「確認中」で止めない
+    this.historyLoaded = true;
     if (this.state === 'settings') this.renderHistoryRow();
   }
 
@@ -1451,7 +1473,7 @@ export class OverlayController {
       const saveError = await recordHistory(ctx, prepared.manifest, zip, zipNameOf(saveHandle, ctx.creatorId), signal);
       // 収集時の観測の失敗も併せて出す。どちらが落ちても次回は差分にならないので、
       // 保存実績が書けたことだけを見て「記録は正常」と読ませない
-      const historyError = ctx.observationError ?? saveError;
+      const historyError = joinHistoryErrors(ctx.observationError, saveError);
       // 状態を触る前に現行の実行かを見る。旧実行の遅延解決が新実行の画面と観測状態を
       // 上書きするのを防ぐ (中断してすぐ再実行したときに起こりうる)
       if (this.downloadRunId !== runId || !this.isCurrentDownload(signal)) return;
