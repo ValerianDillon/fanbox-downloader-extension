@@ -8,7 +8,7 @@
     "build:test": "bun scripts/build.ts --test",
     "lint": "biome check --write .",
     "typecheck": "tsc --noEmit",
-    "test": "bun test test",
+    "test": "sh -c 'bun test \"${@:-test}\"' --",
     "test:smoke": "bun run build:test && playwright test"
   },
   "repository": {

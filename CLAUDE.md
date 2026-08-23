@@ -9,7 +9,7 @@ FANBOX 固有の収集ロジックと ZIP 生成は `download-helper` に集約�
 - `bun run build` — content script + service worker をバンドルし、静的ファイルを `dist/` にコピー
 - `bun run build:test` — テストビルド版 (`__FBDL_TEST__=true`) を `dist-test/` に出力
 - `bun run lint` / `bun run typecheck`
-- `bun run test` — `test/` 配下のユニットテスト。**素の `bun test` は使わない** (リポジトリ全体を探索して `e2e/*.spec.ts` も拾う)
+- `bun run test` — `test/` 配下のユニットテスト。**素の `bun test` は使わない** (リポジトリ全体を探索して `e2e/*.spec.ts` も拾う)。単一ファイルやディレクトリだけ走らせたいときは `bun run test <path>`
 - `bun run test:smoke` — `dist-test/` をビルドし、Playwright で smoke test を実行
 
 ## プロセス構成
