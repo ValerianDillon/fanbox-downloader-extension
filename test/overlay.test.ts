@@ -198,6 +198,12 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
     failedFileCount: 0,
   };
 
+  test('収集時の観測の記録に失敗したら完了画面に出す (保存実績だけ記録されて次回また全件になる理由を伝えるため)', () => {
+    const message = buildCompleteMessage({ ...base, historyError: '収集の記録に失敗' });
+
+    expect(message).toContain('収集の記録に失敗');
+  });
+
   test('省いた投稿があっても見出しは変わらない (取りこぼしではないため)', () => {
     const message = buildCompleteMessage({ ...base, skippedByHistoryCount: 3 });
 

@@ -368,11 +368,22 @@ function carryOverNames(loser: SavedPost, winner: SavedPost): SavedPost {
   // 採番規則が変わっていれば引き継がない。前の規則で決めた名前を新しい規則の記録に混ぜると、
   // `buildFrozenArchiveNames` が版で選り分けたつもりの名前に旧規則のものが紛れる
   if (loser.archiveFormatVersion !== winner.archiveFormatVersion) return winner;
-  const winnerIdentities = new Set(winner.assets.map(assetIdentity));
-  const carried = loser.assets
-    .filter((asset) => !winnerIdentities.has(assetIdentity(asset)))
-    .map((asset): SavedAsset => ({ ...asset, outcome: 'name-only' }));
-  return carried.length === 0 ? winner : { ...winner, assets: [...winner.assets, ...carried] };
+  const byIdentity = new Map(winner.assets.map((asset) => [assetIdentity(asset), asset]));
+  let changed = false;
+  for (const asset of loser.assets) {
+    const identity = assetIdentity(asset);
+    const current = byIdentity.get(identity);
+    // 勝った世代の結果 (written / failed) が今の名前である。名前だけの記録で上書きしない
+    if (current !== undefined && current.outcome !== 'name-only') continue;
+    // どちらも名前だけなら、後から割り当てた方を残す。**先に入っていた方を無条件に採ると、
+    // 3 世代以上で結果が到着順に依存する** (古い世代が先に届いた回だけ古い名前が残る)
+    if (current !== undefined && current.savedAt >= asset.savedAt) continue;
+    byIdentity.set(identity, { ...asset, outcome: 'name-only' });
+    changed = true;
+  }
+  // 並びは Map の挿入順 (勝った世代のアセット → 引き継いだ名前) になる。
+  // 既にある identity を置き換えても位置は動かないので、同じ入力なら同じ並びになる
+  return changed ? { ...winner, assets: [...byIdentity.values()] } : winner;
 }
 
 /**

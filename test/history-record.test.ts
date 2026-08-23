@@ -505,6 +505,47 @@ describe('履歴のマージ', () => {
     ]);
   });
 
+  test('勝った世代の written は、後から来た別世代の名前で name-only に落とさない (省略条件が成立しなくなるため)。', () => {
+    const known = makeSavedPost('post-1', [{ ...makeSavedAsset('asset-a', 'written', 100), archiveName: 'kept.png' }], {
+      revision: 'r1',
+      savedAt: 100,
+    });
+    const unknown = makeSavedPost(
+      'post-1',
+      [{ ...makeSavedAsset('asset-a', 'written', 200), archiveName: 'other.png' }],
+      { revision: null, savedAt: 200 },
+    );
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [known] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ saved: [unknown] }));
+
+    expect(result.saved[0].assets).toEqual(known.assets);
+  });
+
+  test('3 世代の適用順を変えても同じ名前が残る (古い世代が先に届いた回だけ古い名前が残るのを防ぐため)。', () => {
+    const g1 = makeSavedPost('post-1', [{ ...makeSavedAsset('asset-a', 'written', 100), archiveName: 'old.png' }], {
+      revision: 'r1',
+      savedAt: 100,
+    });
+    const g2 = makeSavedPost('post-1', [{ ...makeSavedAsset('asset-a', 'written', 200), archiveName: 'new.png' }], {
+      revision: 'r2',
+      savedAt: 200,
+    });
+    const g3 = makeSavedPost('post-1', [makeSavedAsset('asset-b', 'written', 300)], { revision: 'r3', savedAt: 300 });
+    const applyAll = (order: SavedPost[]) =>
+      order.reduce<CreatorHistory | null>(
+        (history, post) => mergeCreatorHistory(history, makeUpdate({ saved: [post] })),
+        null,
+      );
+
+    const forward = applyAll([g1, g2, g3]);
+    const shuffled = applyAll([g3, g1, g2]);
+
+    const nameOf = (history: CreatorHistory | null) =>
+      history?.saved[0].assets.find((asset) => asset.assetId === 'asset-a')?.archiveName;
+    expect([nameOf(forward), nameOf(shuffled)]).toEqual(['new.png', 'new.png']);
+  });
+
   test('scannedAt が同じで内容が食い違う scan は完走していない方を残す (欠落を削除と誤認させないため)。', () => {
     const completed = makeScan(400, 0);
     const stopped: ScanRecord = { ...completed, completedFullScan: false, stoppedReason: 'transport-exhausted' };

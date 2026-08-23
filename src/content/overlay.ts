@@ -4,7 +4,7 @@ import type {
   DownloadZipResult,
   PostSummary,
 } from 'download-helper/download-helper';
-import type { CreatorHistory } from '../history-record';
+import type { CreatorHistory, HistoryResponse } from '../history-record';
 import type { DownloadProgress, FileSystemFileHandle } from './downloader';
 import { downloadAsZip, pickSaveHandle, preflightDownload } from './downloader';
 import { ApiShapeError, type PageType, ResponseParseError } from './fanbox/api';
@@ -394,6 +394,13 @@ type ReviewContext = {
    * ハンドラは読むだけにする。
    */
   prepared: PreparedDownload | null;
+  /**
+   * 収集時の観測 (カタログと走査実績) の記録に失敗した理由 (Issue #56)。成功なら null。
+   *
+   * 完了画面まで持ち越す。ここで落とすと、保存実績だけが記録されてカタログが古いまま残り、
+   * 次回また全件を取得することになる理由が利用者に伝わらない。
+   */
+  observationError: string | null;
   /** 導出待ちのタイマー。連続した操作で導出が何度も走るのを 1 回にまとめる */
   prepareTimer: ReturnType<typeof setTimeout> | null;
   /** review 画面に表示するエラー。選択状態は保ったまま出す */
@@ -406,6 +413,13 @@ export class OverlayController {
   private history: CreatorHistory | null = null;
   /** 履歴の読み込みの世代。遅れて解決した読み込みが新しい画面を書き換えないようにする */
   private historyGeneration = 0;
+  /**
+   * 削除の応答を待っている creator。
+   *
+   * 削除の途中で始まった読み込みは、まだ消える前の storage を読む。世代だけで守ると、
+   * パネルを閉じて開き直したときに新しい世代の読み込みが旧履歴を戻してしまう。
+   */
+  private readonly deletingCreators = new Set<string>();
   /**
    * 収集フェーズ用と ZIP フェーズ用で AbortController を分ける (Issue #55)。
    *
@@ -521,6 +535,8 @@ export class OverlayController {
     // 世代だけでなく creator も突き合わせる。世代を上げずに creator が戻ってくる経路
     // (A → B → A) では世代の一致だけでは足りない
     if (this.historyGeneration !== generation || this.pageType?.creatorId !== creatorId) return;
+    // 削除の応答を待っている間に読んだ値は、消える前の storage のものである
+    if (this.deletingCreators.has(creatorId)) return;
     this.history = history;
     if (this.state === 'settings') this.renderHistoryRow();
   }
@@ -721,18 +737,29 @@ export class OverlayController {
     // 「削除したつもり」の履歴を根拠に post.info が省かれる
     const previous = this.history;
     this.history = null;
-    const response = await removeCreatorHistory(creatorId);
-    // 削除を待つ間に画面や creator が変わっていたら、こちらの状態には触らない
-    if (this.state !== 'settings' || this.pageType?.creatorId !== creatorId) return;
-    if (this.historyGeneration !== generation) return;
+    this.deletingCreators.add(creatorId);
+    let response: HistoryResponse;
+    try {
+      response = await removeCreatorHistory(creatorId);
+    } finally {
+      this.deletingCreators.delete(creatorId);
+    }
+    // 削除を待つ間に別の creator へ移っていたら、こちらの状態には触らない
+    if (this.pageType?.creatorId !== creatorId) return;
     if (!response.ok) {
-      // 消せていないので元に戻す。戻さないと、履歴があるのに全件取得になる
-      this.history = previous;
-      button.disabled = false;
-      button.textContent = `削除できません: ${response.error ?? '不明な理由'}`;
+      // 消せていないので元に戻す。戻さないと、履歴があるのに全件取得になる。
+      // 世代が進んでいれば、そちらの読み込みが正しい値を入れるので戻さない
+      if (this.historyGeneration === generation) this.history = previous;
+      if (this.state === 'settings') {
+        button.disabled = false;
+        button.textContent = `削除できません: ${response.error ?? '不明な理由'}`;
+      }
       return;
     }
-    this.renderHistoryRow();
+    // 消えたことは世代に依らない事実なので、世代が進んでいてもメモリ上の履歴は落とす。
+    // 落とさないと、削除中に読んだ旧履歴を根拠に post.info を省きうる
+    this.history = null;
+    if (this.state === 'settings') this.renderHistoryRow();
   }
 
   private renderCollecting() {
@@ -1292,7 +1319,7 @@ export class OverlayController {
         return;
       }
 
-      this.enterReview(creatorId, result);
+      this.enterReview(creatorId, result, observationError);
     } catch (e) {
       // hidePanel() や新しい収集が既に走っているなら、旧実行はここで降りる。
       // エラー表示も publish も新実行のものを上書きしてしまう
@@ -1326,7 +1353,7 @@ export class OverlayController {
   }
 
   /** 収集結果を review 画面に載せる。収集用の controller はここで役目を終える */
-  private enterReview(creatorId: string, result: CollectResult) {
+  private enterReview(creatorId: string, result: CollectResult, observationError: string | null) {
     const posts = result.downloadObject.listPosts();
     this.review = {
       creatorId,
@@ -1338,6 +1365,7 @@ export class OverlayController {
       prepared: null,
       prepareTimer: null,
       errorMessage: null,
+      observationError,
     };
     this.setState('review');
     this.renderReview();
