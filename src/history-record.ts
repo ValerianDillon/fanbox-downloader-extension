@@ -144,6 +144,15 @@ export type SavedPost = {
   readonly revision: string | null;
   /** 保存した時点の `ARCHIVE_FORMAT_VERSION`。違えば過去の ZIP は別の場所に入っている */
   readonly archiveFormatVersion: number;
+  /**
+   * この実績を出した ZIP の書き込みを終えた時刻 (epoch ms)。
+   *
+   * アセット側の `savedAt` の最大値では代用できない。**本文だけの投稿はアセットを 1 つも
+   * 持たない**ので、最大値が常に 0 になり世代の新旧を比べられなくなる (編集後の実績が
+   * 古い実績を更新できず、その投稿の差分判定が永久に成立しない)。
+   * 作るときは同じ ZIP の全アセットと同じ値を入れるので、アセット側と食い違わない。
+   */
+  readonly savedAt: number;
   readonly assets: readonly SavedAsset[];
 };
 
@@ -326,16 +335,6 @@ function isSameGeneration(existing: SavedPost, next: SavedPost): boolean {
 }
 
 /**
- * その保存実績がいつの ZIP のものかを表す時刻。
- *
- * 投稿単位の時刻を別に持たない。持つとアセット側の `savedAt` と食い違いうるうえ、
- * 食い違ったときにどちらが正しいか決められない。
- */
-function latestSavedAt(post: SavedPost): number {
-  return post.assets.reduce((max, asset) => Math.max(max, asset.savedAt), 0);
-}
-
-/**
  * 同じ投稿のカタログが 2 つあるとき、どちらを残すか決める。
  *
  * **新しい観測 (`observedAt` が大きい方) を残す。** 到着順で決めると、遅れて届いた古い観測が
@@ -421,7 +420,7 @@ function mergeSavedPost(existing: SavedPost, next: SavedPost): SavedPost {
     // 遅れて届いた古い差分が新しい世代の保存実績を丸ごと消す
     // 同値では既存を残す。`>=` にすると、同じミリ秒に終わった別世代の古い差分を再送しただけで
     // 新しい世代の保存実績が消える
-    return latestSavedAt(next) > latestSavedAt(existing) ? next : existing;
+    return next.savedAt > existing.savedAt ? next : existing;
   }
   const byIdentity = new Map(next.assets.map((asset) => [assetIdentity(asset), asset]));
   const assets: SavedAsset[] = [];
@@ -440,7 +439,9 @@ function mergeSavedPost(existing: SavedPost, next: SavedPost): SavedPost {
     if (consumed.has(assetIdentity(asset))) continue;
     assets.push(asset);
   }
-  return { ...next, assets };
+  // 同じ世代をマージしたら、新しい方の時刻を採る。古い差分の再送で時刻が巻き戻ると、
+  // その後に届いた別世代の実績との比較が狂う
+  return { ...next, savedAt: Math.max(existing.savedAt, next.savedAt), assets };
 }
 
 /**
@@ -570,7 +571,7 @@ function decodeSavedPost(value: unknown): SavedPost | null {
   }
   const revision = decodeRevision(value.revision);
   if (revision === undefined) return null;
-  if (!isCount(value.archiveFormatVersion)) return null;
+  if (!isCount(value.archiveFormatVersion) || !isCount(value.savedAt)) return null;
   const assets = decodeArray(value.assets, decodeSavedAsset);
   if (assets === null || hasDuplicate(assets, assetIdentity)) return null;
   return {
@@ -578,6 +579,7 @@ function decodeSavedPost(value: unknown): SavedPost | null {
     archiveDirectory: value.archiveDirectory,
     revision,
     archiveFormatVersion: value.archiveFormatVersion,
+    savedAt: value.savedAt,
     assets,
   };
 }

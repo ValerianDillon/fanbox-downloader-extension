@@ -44,6 +44,7 @@ function makeSaved(overrides: Partial<SavedPost> = {}): SavedPost {
     archiveDirectory: 'p1_タイトル',
     revision: REVISION,
     archiveFormatVersion: ARCHIVE_FORMAT_VERSION,
+    savedAt: 200,
     assets: [makeSavedAsset()],
     ...overrides,
   };

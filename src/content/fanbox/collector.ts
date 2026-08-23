@@ -177,6 +177,16 @@ function applyAddResult(result: AddPostResult, counts: PostFailureCounts): AddOu
  * @param signal 中断
  * @param history 差分ダウンロードの履歴。`null` を渡すと全件を取得する (Issue #56)
  */
+/**
+ * 一覧要素のうち、`post.info` を発行せずに結果を決めるのに使う値をまとめた指紋。
+ *
+ * 同じ投稿が一覧に 2 回現れたとき、この指紋が変わっていれば走査の途中で投稿が変わっている。
+ * `updatedDatetime` だけを見ると、公開範囲や料金だけが変わった場合を取りこぼす。
+ */
+function listFingerprint(revision: string | null, post: PostListItemCandidate): string {
+  return JSON.stringify([revision, post.feeRequired, post.isRestricted]);
+}
+
 export async function collect(
   creatorId: string,
   postId: string | undefined,
@@ -356,6 +366,27 @@ async function getItemsByCreator(
   const listedRevisions = new Map<string, string | null>();
   // 履歴を根拠に post.info を省いた投稿。取りこぼしではないので失敗には数えない
   const skippedByHistoryPostIds = new Set<string>();
+  // 一覧要素の内容 (突き合わせに使う 3 つ)。重複要素で食い違ったかの判定に使う
+  const listFingerprints = new Map<string, string>();
+  // post.info を発行せずに一覧の情報だけで決めた結果。食い違う重複が来たら取り消す
+  const listOnlyDecisions = new Map<string, 'ignored-free' | 'restricted' | 'history-skipped'>();
+
+  /**
+   * 一覧の情報だけで決めた結果を取り消し、この要素で改めて判断させる。
+   * 数えた失敗も戻す — 戻さないと、閲覧できるようになった投稿が「閲覧できなかった」件数に残る。
+   */
+  const undoListOnlyDecision = (postId: string) => {
+    const decision = listOnlyDecisions.get(postId);
+    if (decision === undefined) return;
+    listOnlyDecisions.delete(postId);
+    seenPostIds.delete(postId);
+    if (decision === 'restricted') {
+      postFailures.unavailable--;
+      postFailures.unavailableRestricted--;
+    } else if (decision === 'history-skipped') {
+      skippedByHistoryPostIds.delete(postId);
+    }
+  };
   let scannedAllPages = false;
   let stoppedByLimit = false;
   const counts = (): CreatorCollectCounts => ({
@@ -427,17 +458,21 @@ async function getItemsByCreator(
         if (signal.aborted) return counts();
         // 同じ投稿が一覧に 2 回来ても最初の値を採る。後勝ちにすると、同じ入力への結果が
         // 一覧の並びに依存する。
-        // **ただし値が食い違ったら「読めなかった」に倒す。** 走査の途中で編集されると
-        // ページをまたいで別の値が現れうる。先に見た古い値で省略を成立させると、
-        // 編集後の投稿が取得されないまま落ちる
+        // **ただし一覧の情報が食い違ったら、先の要素だけで決めた結果を取り消す。**
+        // 走査の途中で編集や公開範囲の変更があると、ページをまたいで別の値が現れうる。
+        // 先に見た情報で「省略」「無料なので除外」「閲覧不可」と決めてしまうと、
+        // 現在は取得すべき投稿が取得されないまま落ちる
         const listedRevision = decodeListedUpdatedDatetime(post);
-        const knownRevision = listedRevisions.get(post.id);
-        if (knownRevision === undefined) {
+        const fingerprint = listFingerprint(listedRevision, post);
+        const knownFingerprint = listFingerprints.get(post.id);
+        if (knownFingerprint === undefined) {
+          listFingerprints.set(post.id, fingerprint);
           listedRevisions.set(post.id, listedRevision);
-        } else if (knownRevision !== listedRevision) {
+        } else if (knownFingerprint !== fingerprint) {
+          listFingerprints.set(post.id, fingerprint);
+          // どちらの値が現在のものか決められないので、突き合わせには使わせない
           listedRevisions.set(post.id, null);
-          // 古い値で既に省略していたなら取り消し、この要素で post.info を発行させる
-          if (skippedByHistoryPostIds.delete(post.id)) seenPostIds.delete(post.id);
+          undoListOnlyDecision(post.id);
         }
         // ページの途中で上限に達した場合も一覧を全部見ていない。break だと最終ページでは
         // 外側のループが正常終了し、「完走した」に落ちてしまう
@@ -459,6 +494,7 @@ async function getItemsByCreator(
         // 'ignored' を返すだけで、レート制限の枠と待機時間を無駄に使う
         if (downloadManage.isIgnoreFree && post.feeRequired === 0) {
           seenPostIds.add(post.id);
+          listOnlyDecisions.set(post.id, 'ignored-free');
           apiFailedPostIds.delete(post.id);
           processed++;
           onProgress(processed, totalEstimate);
@@ -468,6 +504,7 @@ async function getItemsByCreator(
         // isRestricted になったときに空の ZIP を「失敗 0 件で完了」として出してしまう。
         if (post.isRestricted) {
           seenPostIds.add(post.id);
+          listOnlyDecisions.set(post.id, 'restricted');
           apiFailedPostIds.delete(post.id);
           postFailures.unavailable++;
           postFailures.unavailableRestricted++;
@@ -480,6 +517,7 @@ async function getItemsByCreator(
         // DownloadObject に入らないので、今回の ZIP にも含まれない (差分 ZIP の意味論)
         if (canSkipPostInfo(history, post.id, listedRevisions.get(post.id) ?? null)) {
           seenPostIds.add(post.id);
+          listOnlyDecisions.set(post.id, 'history-skipped');
           apiFailedPostIds.delete(post.id);
           skippedByHistoryPostIds.add(post.id);
           processed++;
@@ -491,6 +529,9 @@ async function getItemsByCreator(
           const result = addByPostInfo(downloadManage, await api.fetchPostInfo(post.id, signal));
           // 結果が出たので、以降の重複はもう叩かない。取り直せたなら失敗の記録も取り消す
           seenPostIds.add(post.id);
+          // post.info まで発行した結果は一覧情報だけの決定ではないので取り消さない。
+          // 取り消して 2 回登録すると投稿ディレクトリ名が重複し、preflight が ZIP 全体を拒否する
+          listOnlyDecisions.delete(post.id);
           apiFailedPostIds.delete(post.id);
           if (applyAddResult(result, postFailures) === 'added') addedPostCount++;
         } catch (e) {

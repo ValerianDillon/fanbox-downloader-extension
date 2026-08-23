@@ -53,6 +53,7 @@ function makeSavedPost(
     archiveDirectory: `${postId}-directory`,
     revision: 'revision-1',
     archiveFormatVersion: 1,
+    savedAt: 200,
     assets,
     ...overrides,
   };
@@ -156,6 +157,7 @@ describe('履歴のマージ', () => {
     const existing = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written')], { revision: 'revision-old' });
     const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 300)], {
       revision: 'revision-new',
+      savedAt: 300,
     });
     const current = mergeCreatorHistory(null, makeUpdate({ saved: [existing] }));
 
@@ -168,6 +170,7 @@ describe('履歴のマージ', () => {
     const existing = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written')], { archiveFormatVersion: 1 });
     const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 300)], {
       archiveFormatVersion: 2,
+      savedAt: 300,
     });
     const current = mergeCreatorHistory(null, makeUpdate({ saved: [existing] }));
 
@@ -260,6 +263,7 @@ describe('履歴のマージ', () => {
     const existing = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written')], { archiveDirectory: 'dir-a' });
     const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 300)], {
       archiveDirectory: 'dir-b',
+      savedAt: 300,
     });
     const current = mergeCreatorHistory(null, makeUpdate({ saved: [existing] }));
 
@@ -325,9 +329,36 @@ describe('履歴のマージ', () => {
     expect([conflicted.catalog[0].complete, resent.catalog[0].complete]).toEqual([false, false]);
   });
 
+  test('アセットを持たない投稿でも世代の新しい実績で置き換える (本文だけの投稿の差分判定が永久に成立しなくなるため)。', () => {
+    const older = makeSavedPost('post-1', [], { revision: 'r1', savedAt: 100 });
+    const newer = makeSavedPost('post-1', [], { revision: 'r2', savedAt: 200 });
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [older] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ saved: [newer] }));
+
+    expect(result.saved).toEqual([newer]);
+  });
+
+  test('同じ世代をマージしたら投稿の savedAt は新しい方を採る (古い差分の再送で時刻が巻き戻らないようにするため)。', () => {
+    const first = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'written', 100)], { savedAt: 100 });
+    const second = makeSavedPost('post-1', [makeSavedAsset('asset-2', 'written', 200)], { savedAt: 200 });
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [first] }));
+
+    const merged = mergeCreatorHistory(current, makeUpdate({ saved: [second] }));
+    const resent = mergeCreatorHistory(merged, makeUpdate({ saved: [first] }));
+
+    expect([merged.saved[0].savedAt, resent.saved[0].savedAt]).toEqual([200, 200]);
+  });
+
   test('世代が違い savedAt が同値なら後から適用した差分で置き換えない (到着順で保存実績が入れ替わらないようにするため)。', () => {
-    const first = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'written', 100)], { revision: 'r1' });
-    const second = makeSavedPost('post-1', [makeSavedAsset('asset-2', 'written', 100)], { revision: 'r2' });
+    const first = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'written', 100)], {
+      revision: 'r1',
+      savedAt: 100,
+    });
+    const second = makeSavedPost('post-1', [makeSavedAsset('asset-2', 'written', 100)], {
+      revision: 'r2',
+      savedAt: 100,
+    });
     const current = mergeCreatorHistory(null, makeUpdate({ saved: [first] }));
 
     const afterSecond = mergeCreatorHistory(current, makeUpdate({ saved: [second] }));
@@ -361,8 +392,14 @@ describe('履歴のマージ', () => {
   });
 
   test('世代の違う保存実績は新しい方だけを残す (遅れて届いた古い差分で新しい世代の実績を消さないため)。', () => {
-    const older = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written', 100)], { revision: 'r1' });
-    const newer = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 200)], { revision: 'r2' });
+    const older = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written', 100)], {
+      revision: 'r1',
+      savedAt: 100,
+    });
+    const newer = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written', 200)], {
+      revision: 'r2',
+      savedAt: 200,
+    });
     const afterNewer = mergeCreatorHistory(
       mergeCreatorHistory(null, makeUpdate({ saved: [older] })),
       makeUpdate({ saved: [newer] }),
@@ -384,8 +421,14 @@ describe('履歴のマージ', () => {
   });
 
   test('revision が null の実績は revision の分かっている実績を置き換えない (世代の分からない保存で凍結名と実績を失わないため)。', () => {
-    const known = makeSavedPost('post-1', [makeSavedAsset('asset-a', 'written', 100)], { revision: 'r1' });
-    const unknown = makeSavedPost('post-1', [makeSavedAsset('asset-b', 'written', 200)], { revision: null });
+    const known = makeSavedPost('post-1', [makeSavedAsset('asset-a', 'written', 100)], {
+      revision: 'r1',
+      savedAt: 100,
+    });
+    const unknown = makeSavedPost('post-1', [makeSavedAsset('asset-b', 'written', 200)], {
+      revision: null,
+      savedAt: 200,
+    });
     const current = mergeCreatorHistory(null, makeUpdate({ saved: [known] }));
 
     const result = mergeCreatorHistory(current, makeUpdate({ saved: [unknown] }));
@@ -394,8 +437,14 @@ describe('履歴のマージ', () => {
   });
 
   test('revision の分かっている実績は revision が null の実績を置き換える (世代を特定できる記録の方が使えるため)。', () => {
-    const unknown = makeSavedPost('post-1', [makeSavedAsset('asset-b', 'written', 200)], { revision: null });
-    const known = makeSavedPost('post-1', [makeSavedAsset('asset-a', 'written', 100)], { revision: 'r1' });
+    const unknown = makeSavedPost('post-1', [makeSavedAsset('asset-b', 'written', 200)], {
+      revision: null,
+      savedAt: 200,
+    });
+    const known = makeSavedPost('post-1', [makeSavedAsset('asset-a', 'written', 100)], {
+      revision: 'r1',
+      savedAt: 100,
+    });
     const current = mergeCreatorHistory(null, makeUpdate({ saved: [unknown] }));
 
     const result = mergeCreatorHistory(current, makeUpdate({ saved: [known] }));

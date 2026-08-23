@@ -149,6 +149,7 @@ export function buildSavedPosts(
     archiveDirectory: post.archiveDirectory,
     revision: listedRevisions.get(post.postId) ?? null,
     archiveFormatVersion: ARCHIVE_FORMAT_VERSION,
+    savedAt,
     assets: byPostIndex.get(postIndex) ?? [],
   }));
 }

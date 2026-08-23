@@ -93,6 +93,7 @@ const HISTORY: CreatorHistory = {
       archiveDirectory: `${POST_STUB.id}_${POST_STUB.title}`,
       revision: POST_STUB.updatedDatetime,
       archiveFormatVersion: ARCHIVE_FORMAT_VERSION,
+      savedAt: 2,
       assets: [
         {
           kind: 'image',
@@ -220,6 +221,90 @@ describe('collect', () => {
     const result = await collectCreator();
 
     expect([result.addedPostCount, result.listedRevisions.get('1001')]).toEqual([0, POST_STUB.updatedDatetime]);
+  });
+
+  test('無料として除外した投稿が有料に変わって二度目に来たら取得する (走査中の変更で取得対象を落とさないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: {
+        body: {
+          posts: [
+            { ...POST_STUB, feeRequired: 0 },
+            { ...POST_STUB, feeRequired: 500, updatedDatetime: '2099-01-01T00:00:00+09:00' },
+          ],
+        },
+      },
+      // 一覧と詳細で feeRequired を揃える。詳細が無料のままだと addByPostInfo が
+      // 同じ isIgnoreFree の判定で 'ignored' を返し、何を確かめているか分からなくなる
+      [POST_INFO_URL]: { body: { post: { ...POST_FULL, feeRequired: 500 } } },
+    });
+    const requested = recordRequestedUrls();
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      { ...SETTINGS, isIgnoreFree: true },
+      () => {},
+      new AbortController().signal,
+    );
+
+    expect(requested).toContain(POST_INFO_URL);
+    expect(result.addedPostCount).toBe(1);
+  });
+
+  test('閲覧不可として数えた投稿が閲覧可能で二度目に来たら取得し、失敗の件数も戻す (閲覧できる投稿を失敗に残さないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: {
+        body: {
+          posts: [
+            { ...POST_STUB, isRestricted: true },
+            { ...POST_STUB, isRestricted: false, updatedDatetime: '2099-01-01T00:00:00+09:00' },
+          ],
+        },
+      },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect([result.addedPostCount, result.postFailures.unavailable, result.postFailures.unavailableRestricted]).toEqual(
+      [1, 0, 0],
+    );
+  });
+
+  test('updatedDatetime が同じでも公開範囲だけ変わっていれば決定を取り消す (更新時刻だけを見ると取りこぼすため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: {
+        body: {
+          posts: [
+            { ...POST_STUB, isRestricted: true },
+            { ...POST_STUB, isRestricted: false },
+          ],
+        },
+      },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect([result.addedPostCount, result.postFailures.unavailable]).toEqual([1, 0]);
+  });
+
+  test('post.info まで取り込んだ投稿は食い違う重複が来ても取り直さない (二回登録すると投稿ディレクトリ名が重複するため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: {
+        body: { posts: [POST_STUB, { ...POST_STUB, updatedDatetime: '2099-01-01T00:00:00+09:00' }] },
+      },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect(result.addedPostCount).toBe(1);
+    expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(1);
   });
 
   test('同じ投稿が同じ updatedDatetime で二度来たらその値を採る (重複そのものは差分判定を妨げないため)', async () => {

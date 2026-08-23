@@ -699,8 +699,13 @@ export class OverlayController {
     if (creatorId === undefined) return;
     if (!confirm(`@${creatorId} の保存済みの記録を削除しますか (次回は全件を取得します)`)) return;
     button.disabled = true;
+    // 進行中の読み込みを無効にしてから消す。無効にしないと、削除の前に始まった読み込みが
+    // 後から解決して、消したはずの履歴をメモリ上へ戻す (その履歴で post.info を省きうる)
+    const generation = ++this.historyGeneration;
     const response = await removeCreatorHistory(creatorId);
-    if (this.state !== 'settings') return;
+    // 削除を待つ間に画面や creator が変わっていたら、こちらの状態には触らない
+    if (this.state !== 'settings' || this.pageType?.creatorId !== creatorId) return;
+    if (this.historyGeneration !== generation) return;
     if (!response.ok) {
       button.disabled = false;
       button.textContent = `削除できません: ${response.error ?? '不明な理由'}`;
