@@ -17,9 +17,10 @@ import {
   type ScanRecord,
 } from '../src/history-record';
 
-function makeCatalogPost(postId: string, assets: readonly HistoryAsset[] = []): CatalogPost {
+function makeCatalogPost(postId: string, assets: readonly HistoryAsset[] = [], observedAt = 100): CatalogPost {
   return {
     postId,
+    observedAt,
     updatedDatetime: `${postId}-updated`,
     title: `${postId} title`,
     publishedDatetime: `${postId}-published`,
@@ -272,6 +273,42 @@ describe('履歴のマージ', () => {
     expect(result.saved[0].assets).toEqual([first, second]);
   });
 
+  test('observedAt が古いカタログは新しいカタログを置き換えない (古い部分的なカタログで post.info の省略条件を成立させないため)。', () => {
+    const newer = makeCatalogPost('post-1', [makeHistoryAsset('asset-1'), makeHistoryAsset('asset-2')], 200);
+    const older = makeCatalogPost('post-1', [makeHistoryAsset('asset-1')], 100);
+    const current = mergeCreatorHistory(null, makeUpdate({ catalog: [newer] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ catalog: [older] }));
+
+    expect(result.catalog).toEqual([newer]);
+  });
+
+  test('observedAt が同じで complete が食い違うカタログは complete を false にする (どちらが正しいか決められないなら post.info を取り直させるため)。', () => {
+    const complete = makeCatalogPost('post-1', [makeHistoryAsset('asset-1')], 100);
+    const incomplete = { ...makeCatalogPost('post-1', [], 100), complete: false };
+    const current = mergeCreatorHistory(null, makeUpdate({ catalog: [complete] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ catalog: [incomplete] }));
+
+    expect(result.catalog[0].complete).toBe(false);
+  });
+
+  test('scannedAt が同じで内容が食い違う scan は完走していない方を残す (欠落を削除と誤認させないため)。', () => {
+    const completed = makeScan(400, 0);
+    const stopped: ScanRecord = { ...completed, completedFullScan: false, stoppedReason: 'transport-exhausted' };
+    const fromCompleted = mergeCreatorHistory(
+      mergeCreatorHistory(null, makeUpdate({ scan: completed })),
+      makeUpdate({ scan: stopped }),
+    );
+    const fromStopped = mergeCreatorHistory(
+      mergeCreatorHistory(null, makeUpdate({ scan: stopped })),
+      makeUpdate({ scan: completed }),
+    );
+
+    expect(fromCompleted.scan).toEqual(stopped);
+    expect(fromStopped.scan).toEqual(stopped);
+  });
+
   test('同じ postId が二度現れる差分は例外にする (適用回数で結果が変わる曖昧な入力を受け取らないため)。', () => {
     const update = makeUpdate({ catalog: [makeCatalogPost('post-1'), makeCatalogPost('post-1')] });
 
@@ -417,6 +454,47 @@ describe('履歴レコードの復号', () => {
     const post = history.saved[0];
     const { zipName: _zipName, savedAt: _savedAt, ...withoutProvenance } = post.assets[0];
     const value = { ...history, saved: [{ ...post, assets: [withoutProvenance] }] };
+
+    expect(decodeCreatorHistory(value, 'creator-1')).toBeNull();
+  });
+
+  test('completedFullScan と矛盾する走査実績は null を返す (完走していない走査を根拠に投稿の削除を判定させないため)。', () => {
+    const history = makeRichHistory();
+    const contradictions = [{ failedPageCount: 1 }, { stoppedReason: 'rate-limit-exhausted' }, { limited: true }];
+
+    for (const contradiction of contradictions) {
+      const value = { ...history, scan: { ...history.scan, ...contradiction } };
+      expect(decodeCreatorHistory(value, 'creator-1')).toBeNull();
+    }
+  });
+
+  test('未知の stoppedReason を持つ走査実績は null を返す (意味の分からない理由で完走判定を変えないため)。', () => {
+    const history = makeRichHistory();
+    const value = {
+      ...history,
+      scan: { ...history.scan, completedFullScan: false, stoppedReason: 'unknown-reason' },
+    };
+
+    expect(decodeCreatorHistory(value, 'creator-1')).toBeNull();
+  });
+
+  test('パスセグメントとして使えない archiveName や archiveDirectory は null を返す (破損した凍結名で次のダウンロードごと止めないため)。', () => {
+    const history = makeRichHistory();
+    const badNames = ['a/b', '..', 'a\u0000b', 'x%y', 'x?y', '\uD800', 'x'.repeat(300)];
+
+    for (const bad of badNames) {
+      const post = history.saved[0];
+      const withBadAsset = { ...history, saved: [{ ...post, assets: [{ ...post.assets[0], archiveName: bad }] }] };
+      const withBadDirectory = { ...history, saved: [{ ...post, archiveDirectory: bad }] };
+      expect(decodeCreatorHistory(withBadAsset, 'creator-1')).toBeNull();
+      expect(decodeCreatorHistory(withBadDirectory, 'creator-1')).toBeNull();
+    }
+  });
+
+  test('observedAt を欠いたカタログは null を返す (観測の新旧を決められない履歴で古い値を採らないため)。', () => {
+    const history = makeRichHistory();
+    const { observedAt: _observedAt, ...withoutObservedAt } = history.catalog[0];
+    const value = { ...history, catalog: [withoutObservedAt] };
 
     expect(decodeCreatorHistory(value, 'creator-1')).toBeNull();
   });

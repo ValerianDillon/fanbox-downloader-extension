@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   type CreatorHistoryUpdate,
   HISTORY_BUDGET_BYTES,
+  HISTORY_KEY_PREFIX,
   HISTORY_SCHEMA_VERSION,
   historyKeyFor,
 } from '../../src/history-record';
@@ -15,6 +16,7 @@ function makeUpdate(creatorId: string, at: number, postId: string): CreatorHisto
     catalog: [
       {
         postId,
+        observedAt: at,
         updatedDatetime: `${postId}-updated`,
         title: `${postId} title`,
         publishedDatetime: `${postId}-published`,
@@ -40,6 +42,7 @@ function makeBigHistory(creatorId: string, lastUsedAt: number) {
     catalog: [
       {
         postId: 'post-big',
+        observedAt: 1,
         updatedDatetime: null,
         title: 'x'.repeat(HISTORY_BUDGET_BYTES),
         publishedDatetime: null,
@@ -56,53 +59,53 @@ function makeBigHistory(creatorId: string, lastUsedAt: number) {
 describe('履歴の容量超過時の破棄', () => {
   test('合計が上限ちょうどなら何も捨てない (許容量を使い切っただけの正常な履歴を失わないため)。', () => {
     const entries = [
-      { creatorId: 'creator-1', lastUsedAt: 100, bytes: HISTORY_BUDGET_BYTES },
-      { creatorId: 'creator-2', lastUsedAt: 200, bytes: 0 },
+      { key: historyKeyFor('creator-1'), lastUsedAt: 100, bytes: HISTORY_BUDGET_BYTES },
+      { key: historyKeyFor('creator-2'), lastUsedAt: 200, bytes: 0 },
     ];
 
-    const result = evict(entries, 'writer');
+    const result = evict(entries, historyKeyFor('writer'));
 
     expect(result).toEqual({ kept: entries, evicted: [] });
   });
 
   test('上限を超えたら lastUsedAt の古い creator から捨てる (新しく使った履歴を優先して残すため)。', () => {
     const entries = [
-      { creatorId: 'old', lastUsedAt: 100, bytes: HISTORY_BUDGET_BYTES / 2 + 1 },
-      { creatorId: 'new', lastUsedAt: 200, bytes: HISTORY_BUDGET_BYTES / 2 + 1 },
+      { key: historyKeyFor('old'), lastUsedAt: 100, bytes: HISTORY_BUDGET_BYTES / 2 + 1 },
+      { key: historyKeyFor('new'), lastUsedAt: 200, bytes: HISTORY_BUDGET_BYTES / 2 + 1 },
     ];
 
-    const result = evict(entries, 'writer');
+    const result = evict(entries, historyKeyFor('writer'));
 
     expect(result).toEqual({ kept: [entries[1]], evicted: [entries[0]] });
   });
 
   test('protectedCreatorId の creator は候補が他にあっても捨てない (今書き込む履歴を無効にしないため)。', () => {
     const entries = [
-      { creatorId: 'protected', lastUsedAt: 100, bytes: HISTORY_BUDGET_BYTES / 2 },
-      { creatorId: 'other', lastUsedAt: 200, bytes: HISTORY_BUDGET_BYTES / 2 + 1 },
+      { key: historyKeyFor('protected'), lastUsedAt: 100, bytes: HISTORY_BUDGET_BYTES / 2 },
+      { key: historyKeyFor('other'), lastUsedAt: 200, bytes: HISTORY_BUDGET_BYTES / 2 + 1 },
     ];
 
-    const result = evict(entries, 'protected');
+    const result = evict(entries, historyKeyFor('protected'));
 
     expect(result).toEqual({ kept: [entries[0]], evicted: [entries[1]] });
   });
 
   test('protected の一件だけで上限を超える場合はそれを残して停止する (大きすぎる一件で破棄処理が無限に続かないため)。', () => {
-    const protectedEntry = { creatorId: 'protected', lastUsedAt: 100, bytes: HISTORY_BUDGET_BYTES + 1 };
+    const protectedEntry = { key: historyKeyFor('protected'), lastUsedAt: 100, bytes: HISTORY_BUDGET_BYTES + 1 };
 
-    const result = evict([protectedEntry], 'protected');
+    const result = evict([protectedEntry], historyKeyFor('protected'));
 
     expect(result).toEqual({ kept: [protectedEntry], evicted: [] });
   });
 
   test('合計が上限以下になった時点で破棄を止める (必要以上に古い履歴まで削除しないため)。', () => {
     const entries = [
-      { creatorId: 'old', lastUsedAt: 100, bytes: 5_000_000 },
-      { creatorId: 'middle', lastUsedAt: 200, bytes: 2_000_000 },
-      { creatorId: 'new', lastUsedAt: 300, bytes: 2_000_000 },
+      { key: historyKeyFor('old'), lastUsedAt: 100, bytes: 5_000_000 },
+      { key: historyKeyFor('middle'), lastUsedAt: 200, bytes: 2_000_000 },
+      { key: historyKeyFor('new'), lastUsedAt: 300, bytes: 2_000_000 },
     ];
 
-    const result = evict(entries, 'writer');
+    const result = evict(entries, historyKeyFor('writer'));
 
     expect(result).toEqual({ kept: [entries[1], entries[2]], evicted: [entries[0]] });
   });
@@ -215,6 +218,29 @@ describe('履歴ストア', () => {
     const store = new HistoryStore(createFakeLocalStorage(backing));
 
     expect(await store.read(creatorId)).toBeNull();
+  });
+
+  test('creatorId として読めない履歴キーも破棄の対象にする (接頭辞だけのキーに残った大きな値を永久に回収できなくしないため)。', async () => {
+    const orphanKey = HISTORY_KEY_PREFIX;
+    const backing = new Map<string, unknown>([[orphanKey, 'x'.repeat(HISTORY_BUDGET_BYTES)]]);
+    const storage = createFakeLocalStorage(backing);
+    const store = new HistoryStore(storage);
+
+    await store.apply(makeUpdate('creator-1', 100, 'post-1'));
+
+    const setOperations = storage.operations.filter((operation) => operation.type === 'set');
+    expect(setOperations[0].items[orphanKey]).toBeNull();
+  });
+
+  test('渡された予算が上限として使われる (storage.local の容量が 5 MiB の環境で LRU が働かないまま set だけが失敗するのを防ぐため)。', async () => {
+    const backing = new Map<string, unknown>([[historyKeyFor('old'), makeSmallHistory('old', 1)]]);
+    const storage = createFakeLocalStorage(backing);
+    const store = new HistoryStore(storage, 10);
+
+    await store.apply(makeUpdate('creator-1', 100, 'post-1'));
+
+    const setOperations = storage.operations.filter((operation) => operation.type === 'set');
+    expect(setOperations[0].items[historyKeyFor('old')]).toBeNull();
   });
 
   test('remove はレコードのキーを消す (利用者が削除した履歴を次の差分判定に残さないため)。', async () => {

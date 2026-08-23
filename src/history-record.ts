@@ -1,3 +1,5 @@
+import { describeUnusableSegment } from './archive-name-rules';
+
 /**
  * 差分ダウンロードの履歴レコード (Issue #56)。
  *
@@ -73,6 +75,15 @@ export type HistoryAsset = {
 /** 観測カタログの投稿 1 件 */
 export type CatalogPost = {
   readonly postId: string;
+  /**
+   * このカタログを観測した時刻 (epoch ms)。
+   *
+   * 遅れて届いた古い観測が新しい観測を置き換えないために持つ。
+   * 「同じ `updatedDatetime` なら中身も同じ」は API の性質への仮定であり、その仮定は
+   * 未確認である (Issue #56)。仮定が崩れたときに古い部分的なカタログで
+   * `post.info` の省略条件が成立してしまうと、未保存のアセットを永久に取りに行かなくなる。
+   */
+  readonly observedAt: number;
   /**
    * 一覧 (`post.listCreator`) が返した `updatedDatetime` を検証したもの。
    * 欠落や型不正なら null で、そのときは差分判定に使わない (通常の取得へフォールバックする)。
@@ -259,6 +270,34 @@ function upsertByPostId<T extends { readonly postId: string }>(
 }
 
 /**
+ * 同じ投稿のカタログが 2 つあるとき、どちらを残すか決める。
+ *
+ * **新しい観測 (`observedAt` が大きい方) を残す。** 到着順で決めると、遅れて届いた古い観測が
+ * 新しい観測を巻き戻す。
+ *
+ * 同じ時刻なら `complete` を両方が true のときだけ残す。同時刻に別の内容が観測されるのは
+ * 想定していないが、そのときは `post.info` を取り直させる方が安全である。
+ */
+function mergeCatalogPost(existing: CatalogPost, next: CatalogPost): CatalogPost {
+  if (next.observedAt !== existing.observedAt) return next.observedAt > existing.observedAt ? next : existing;
+  return { ...next, complete: existing.complete && next.complete };
+}
+
+/**
+ * 走査実績が 2 つあるとき、どちらを残すか決める。
+ *
+ * 新しい方を残し、時刻が同じで食い違うなら「完走していない」方に倒す。
+ * 一覧から消えた投稿を削除として扱ってよいかの判断材料なので、誤って「完走した」に
+ * 倒すと欠落を削除と誤認する。
+ */
+function pickScan(existing: ScanRecord | null, next: ScanRecord | undefined): ScanRecord | null {
+  if (next === undefined) return existing;
+  if (existing === null || next.scannedAt > existing.scannedAt) return next;
+  if (next.scannedAt < existing.scannedAt) return existing;
+  return next.completedFullScan ? existing : next;
+}
+
+/**
  * 同じアセットの結果が 2 つあるとき、どちらを残すか決める。
  *
  * **新しい方 (`savedAt` が大きい方) を残す。** 到着順で決めると、遅れて届いた古い差分が
@@ -320,27 +359,18 @@ function mergeSavedPost(existing: SavedPost, next: SavedPost): SavedPost {
  * upsert し、時刻は新しい方を採るため)。service worker は応答の直前に停止しうるので、
  * content script が同じ差分を送り直す経路がある。
  *
- * カタログには観測時刻を持たせない。遅れて届いた古いカタログが新しいカタログを置き換えても、
- * `post.info` の省略条件 (一覧の `updatedDatetime` との一致・カタログが完全・全対象に保存実績)
- * はどれも緩まないため、余分に取り直す方向にしか倒れない。
  * @throws {Error} 差分の中に同じ postId・同じアセットが複数ある場合
  */
 export function mergeCreatorHistory(current: CreatorHistory | null, update: CreatorHistoryUpdate): CreatorHistory {
   assertNoDuplicates(update);
   const base = current ?? emptyCreatorHistory(update.creatorId, update.at);
-  // scan も新しい方を採る。無条件に置き換えると、遅れて届いた古い差分が「全ページ走査した」を
-  // 巻き戻したり、逆に古い「完走した」で新しい「打ち切った」を上書きしたりする
-  const scan =
-    update.scan !== undefined && (base.scan === null || update.scan.scannedAt >= base.scan.scannedAt)
-      ? update.scan
-      : base.scan;
   return {
     schemaVersion: HISTORY_SCHEMA_VERSION,
     creatorId: update.creatorId,
     lastUsedAt: Math.max(base.lastUsedAt, update.at),
-    catalog: upsertByPostId(base.catalog, update.catalog ?? [], (_existing, next) => next),
+    catalog: upsertByPostId(base.catalog, update.catalog ?? [], mergeCatalogPost),
     saved: upsertByPostId(base.saved, update.saved ?? [], mergeSavedPost),
-    scan,
+    scan: pickScan(base.scan, update.scan),
   };
 }
 
@@ -391,11 +421,13 @@ function decodeCatalogPost(value: unknown): CatalogPost | null {
   const publishedDatetime = optionalString(value.publishedDatetime);
   if (updatedDatetime === undefined || publishedDatetime === undefined) return null;
   if (typeof value.title !== 'string' || typeof value.complete !== 'boolean') return null;
+  if (!isCount(value.observedAt)) return null;
   if (value.feeRequired !== null && !isCount(value.feeRequired)) return null;
   const assets = decodeArray(value.assets, decodeHistoryAsset);
   if (assets === null || hasDuplicate(assets, assetIdentity)) return null;
   return {
     postId: value.postId,
+    observedAt: value.observedAt,
     updatedDatetime,
     title: value.title,
     publishedDatetime,
@@ -409,17 +441,21 @@ function decodeSavedAsset(value: unknown): SavedAsset | null {
   if (!isRecord(value)) return null;
   const identity = decodeAssetIdentity(value);
   if (identity === null) return null;
-  if (typeof value.archiveName !== 'string' || value.archiveName === '') return null;
+  // 凍結名として allocator に渡るので、allocator が受け付けない名前はここで弾く。
+  // 通してしまうと allocator が例外を投げ、破損した履歴が次のダウンロードごと止める
+  if (typeof value.archiveName !== 'string' || describeUnusableSegment(value.archiveName) !== null) return null;
   const outcome = value.outcome;
   if (outcome !== 'written' && outcome !== 'failed' && outcome !== 'not-selected') return null;
-  if (typeof value.zipName !== 'string' || !isCount(value.savedAt)) return null;
+  if (typeof value.zipName !== 'string' || value.zipName === '' || !isCount(value.savedAt)) return null;
   return { ...identity, archiveName: value.archiveName, outcome, zipName: value.zipName, savedAt: value.savedAt };
 }
 
 function decodeSavedPost(value: unknown): SavedPost | null {
   if (!isRecord(value)) return null;
   if (typeof value.postId !== 'string' || value.postId === '') return null;
-  if (typeof value.archiveDirectory !== 'string' || value.archiveDirectory === '') return null;
+  if (typeof value.archiveDirectory !== 'string' || describeUnusableSegment(value.archiveDirectory) !== null) {
+    return null;
+  }
   const revision = optionalString(value.revision);
   if (revision === undefined) return null;
   if (!isCount(value.archiveFormatVersion)) return null;
@@ -440,6 +476,16 @@ function decodeScanRecord(value: unknown): ScanRecord | null {
   if (!isCount(value.failedPageCount) || !isCount(value.scannedAt)) return null;
   const stoppedReason = optionalString(value.stoppedReason);
   if (stoppedReason === undefined) return null;
+  // 打ち切りの理由は収集側の語彙に限る。未知の値を通すと、意味の分からない理由を根拠に
+  // 「完走していない」の判断が変わりうる (未知の理由が増えたら版を上げる)
+  if (stoppedReason !== null && stoppedReason !== 'rate-limit-exhausted' && stoppedReason !== 'transport-exhausted') {
+    return null;
+  }
+  // 「完走した」と「打ち切った・落ちたページがある・件数上限が付いた」は両立しない。
+  // 矛盾した実績を通すと、後段が一覧から消えた投稿を削除と誤認しうる
+  if (value.completedFullScan && (value.failedPageCount !== 0 || stoppedReason !== null || value.limited)) {
+    return null;
+  }
   return {
     completedFullScan: value.completedFullScan,
     failedPageCount: value.failedPageCount,

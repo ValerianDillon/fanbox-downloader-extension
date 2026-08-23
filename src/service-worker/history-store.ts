@@ -5,6 +5,7 @@ import {
   decodeCreatorHistory,
   estimateEntryBytes,
   HISTORY_BUDGET_BYTES,
+  HISTORY_KEY_PREFIX,
   historyKeyFor,
   mergeCreatorHistory,
 } from '../history-record';
@@ -22,7 +23,14 @@ export type HistoryStorageArea = {
 
 /** 破棄の判断に使う、保存済み 1 エントリの情報 */
 export type StoredEntry = {
-  readonly creatorId: string;
+  /**
+   * storage のキーそのもの。
+   *
+   * creatorId から組み立て直さないのは、`fbdlHistory:` のように creatorId が空のキーを
+   * 表せないため。表せないと、そこに残った大きな値が容量計算からも破棄候補からも
+   * 永久に外れ、実際の上限に当たって以後の書き込みが失敗し続ける。
+   */
+  readonly key: string;
   /** 復号できなかったレコードは 0。順序上いちばん先に捨てられる */
   readonly lastUsedAt: number;
   readonly bytes: number;
@@ -51,7 +59,16 @@ export type StoredEntry = {
 export class HistoryStore {
   private queue: Promise<unknown> = Promise.resolve();
 
-  constructor(private readonly area: HistoryStorageArea) {}
+  /**
+   * @param area 保存先
+   * @param budgetBytes 履歴に使ってよい合計バイト数。
+   *   `chrome.storage.local` の既定容量は Chrome 114 以降が 10 MiB、それ以前は 5 MiB なので、
+   *   実行時の `QUOTA_BYTES` から決めた値を渡せるようにしてある。渡さなければ 10 MiB 前提の既定値を使う
+   */
+  constructor(
+    private readonly area: HistoryStorageArea,
+    private readonly budgetBytes: number = HISTORY_BUDGET_BYTES,
+  ) {}
 
   /** creator の履歴を読む。無い・読めない場合は null */
   async read(creatorId: string): Promise<CreatorHistory | null> {
@@ -93,31 +110,33 @@ export class HistoryStore {
     const merged = mergeCreatorHistory(decodeCreatorHistory(all[key], update.creatorId), update);
     const entries: StoredEntry[] = [];
     for (const [storedKey, value] of Object.entries(all)) {
+      // 履歴の接頭辞を持つキーはすべて数える。creatorId として読めないキー
+      // (`fbdlHistory:` そのものなど) も、容量を占める以上は破棄候補に入れる
+      if (!storedKey.startsWith(HISTORY_KEY_PREFIX) || storedKey === key) continue;
       const creatorId = creatorIdFromHistoryKey(storedKey);
-      if (creatorId === null || creatorId === update.creatorId) continue;
-      const history = decodeCreatorHistory(value, creatorId);
-      entries.push({ creatorId, lastUsedAt: history?.lastUsedAt ?? 0, bytes: estimateEntryBytes(storedKey, value) });
+      const history = creatorId === null ? null : decodeCreatorHistory(value, creatorId);
+      entries.push({
+        key: storedKey,
+        lastUsedAt: history?.lastUsedAt ?? 0,
+        bytes: estimateEntryBytes(storedKey, value),
+      });
     }
-    entries.push({
-      creatorId: update.creatorId,
-      lastUsedAt: merged.lastUsedAt,
-      bytes: estimateEntryBytes(key, merged),
-    });
+    entries.push({ key, lastUsedAt: merged.lastUsedAt, bytes: estimateEntryBytes(key, merged) });
 
     // **破棄と書き込みを 1 回の set にまとめる。** 先に remove してから set すると、その間に
     // service worker が停止したり set が失敗したりしたときに、更新対象と無関係な creator の
     // 履歴だけが消えて何も書かれない。捨てる側は null を書いて中身を空にする — 復号は null を
     // 「履歴が無い」として扱うので、これだけで破棄は成立し、容量も同じ set の中で解放される
-    const { evicted } = evict(entries, update.creatorId);
+    const { evicted } = evict(entries, key, this.budgetBytes);
     const items: Record<string, unknown> = { [key]: merged };
-    for (const entry of evicted) items[historyKeyFor(entry.creatorId)] = null;
+    for (const entry of evicted) items[entry.key] = null;
     await this.area.set(items);
 
     // 空にしたキー自体の後片付け。失敗しても状態は一貫している (null は履歴が無いのと同じ) ので、
     // ここでの失敗は呼び出し元へ伝えない
     if (evicted.length > 0) {
       try {
-        await this.area.remove(evicted.map((entry) => historyKeyFor(entry.creatorId)));
+        await this.area.remove(evicted.map((entry) => entry.key));
       } catch (e) {
         console.warn('破棄した履歴のキーを削除できませんでした:', e);
       }
@@ -135,20 +154,22 @@ export class HistoryStore {
  * 今まさに書こうとしている creator (`protected`) は捨てない。捨てるとその書き込みが無意味になる。
  * それ 1 件で上限を超える場合は、超えたまま書く (`chrome.storage.local` の実際の上限は
  * `HISTORY_BUDGET_BYTES` より大きく取ってあるので、そこで直ちに失敗はしない)。
- * @param entries 保存済みの全エントリ (`protected` の分は更新後の値であること)
- * @param protectedCreatorId 捨ててはいけない creator
+ * @param entries 保存済みの全エントリ (`protectedKey` の分は更新後の値であること)
+ * @param protectedKey 捨ててはいけないキー
+ * @param budgetBytes 許す合計バイト数
  */
 export function evict(
   entries: readonly StoredEntry[],
-  protectedCreatorId: string,
+  protectedKey: string,
+  budgetBytes: number = HISTORY_BUDGET_BYTES,
 ): { kept: StoredEntry[]; evicted: StoredEntry[] } {
   const kept = [...entries];
   const evicted: StoredEntry[] = [];
   let total = kept.reduce((sum, entry) => sum + entry.bytes, 0);
-  while (total > HISTORY_BUDGET_BYTES) {
+  while (total > budgetBytes) {
     let oldest = -1;
     for (let i = 0; i < kept.length; i++) {
-      if (kept[i].creatorId === protectedCreatorId) continue;
+      if (kept[i].key === protectedKey) continue;
       // 同じ時刻なら先に現れた方を捨てる。復号できなかったレコードは lastUsedAt が 0 なので
       // いちばん先に捨てられる (読めない以上、残しても容量を占めるだけである)
       if (oldest === -1 || kept[i].lastUsedAt < kept[oldest].lastUsedAt) oldest = i;

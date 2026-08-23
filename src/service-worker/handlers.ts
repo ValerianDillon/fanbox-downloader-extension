@@ -1,5 +1,5 @@
 import { parseRetryAfterMs } from 'download-helper/api-session';
-import { decodeHistoryMessage, type HistoryResponse } from '../history-record';
+import { decodeHistoryMessage, HISTORY_BUDGET_BYTES, type HistoryResponse } from '../history-record';
 import { BackoffStore } from './backoff-store';
 import { type HistoryStorageArea, HistoryStore } from './history-store';
 
@@ -160,8 +160,22 @@ export async function handleFetchApi(url: string, store: BackoffStore = backoffS
 let historyStore: HistoryStore | undefined;
 
 function getHistoryStore(): HistoryStore {
-  historyStore ??= new HistoryStore(chrome.storage.local as unknown as HistoryStorageArea);
+  historyStore ??= new HistoryStore(chrome.storage.local as unknown as HistoryStorageArea, historyBudgetBytes());
   return historyStore;
+}
+
+/**
+ * 履歴に使ってよい合計バイト数を実行時に決める。
+ *
+ * `chrome.storage.local` の既定容量は Chrome 114 以降が 10 MiB、それ以前は 5 MiB である。
+ * 5 MiB の環境で 8 MiB を前提にすると LRU が働かないまま `set` だけが失敗し続ける。
+ * `QUOTA_BYTES` を読めない環境では既定値に倒す (読めないことを理由に書き込みを止めない)。
+ */
+function historyBudgetBytes(): number {
+  const quota = chrome.storage.local.QUOTA_BYTES;
+  if (typeof quota !== 'number' || !Number.isFinite(quota) || quota <= 0) return HISTORY_BUDGET_BYTES;
+  // Issue #51 の観測記録など、履歴以外のデータも同じ領域を使う
+  return Math.min(HISTORY_BUDGET_BYTES, Math.floor(quota * 0.8));
 }
 
 /** テスト用にストアを差し替える。通常の経路からは呼ばない */
