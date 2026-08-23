@@ -193,6 +193,19 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
     failedFileCount: 0,
   };
 
+  test('履歴の更新に失敗しても見出しは変わらない (ZIP は保存できているので「一部取得できませんでした」にしないため)', () => {
+    const message = buildCompleteMessage({ ...base, historyError: 'storage が一杯です' });
+
+    expect(message.split('\n')[0]).toBe(COMPLETE_HEADLINE);
+  });
+
+  test('履歴の更新に失敗したら次回が全件取得になることを本文に書く (黙って落とすと全件取り直す理由が分からないため)', () => {
+    const message = buildCompleteMessage({ ...base, historyError: 'storage が一杯です' });
+
+    expect(message).toContain('storage が一杯です');
+    expect(message).toContain('次回は差分ではなく全件を取得します');
+  });
+
   test('失敗ゼロ・非中断は COMPLETE_HEADLINE のみ (従来どおり)', () => {
     expect(buildCompleteMessage(base)).toBe(COMPLETE_HEADLINE);
   });

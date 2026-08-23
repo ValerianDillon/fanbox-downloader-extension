@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import type { DownloadJsonObj } from 'download-helper/download-helper';
 import { DownloadHelper, DownloadUtils } from 'download-helper/download-helper';
 import type { DownloadProgress, FileSystemFileHandle, MediaFetchAttempt } from '../src/content/downloader';
-import { assertDownloadable, downloadAsZip, fetchWithRetry } from '../src/content/downloader';
+import { downloadAsZip, fetchWithRetry, preflightDownload } from '../src/content/downloader';
 import { MEDIA_ATTEMPT_STORAGE_KEY } from '../src/content/media-attempt-log';
 import { installFakeMediaRuntime, simpleResponder } from './fake-media-port';
 // chrome.storage.local も get(key) / set(items) の契約は storage.session と同じなのでフェイクを流用する
@@ -590,7 +590,7 @@ describe('fetchWithRetry の試行記録 (Issue #18)', () => {
  * 見つかると、書くものが無いまま利用者のファイルだけが空になる。`isDownloadJsonObj` だけでは
  * 型検証しか行わず、投稿ディレクトリ名の重複のように**型検証を通る入力**が picker の後で落ちる。
  */
-describe('Issue #55: picker より前の検証 (assertDownloadable)', () => {
+describe('Issue #55: picker より前の検証 (preflightDownload)', () => {
   const helper = new DownloadHelper(new DownloadUtils());
 
   function withDuplicateDirectories(): DownloadJsonObj {
@@ -617,12 +617,12 @@ describe('Issue #55: picker より前の検証 (assertDownloadable)', () => {
 
     // isDownloadJsonObj だけに戻す退行を検出するための対比
     expect(helper.isDownloadJsonObj(obj)).toBe(true);
-    expect(() => assertDownloadable(obj)).toThrow('post.encodedName が重複しています');
+    expect(() => preflightDownload(obj)).toThrow('post.encodedName が重複しています');
   });
 
   test('正常な入力は通す', () => {
     expect(() =>
-      assertDownloadable(
+      preflightDownload(
         withManifest({
           id: 'u',
           url: '#main',

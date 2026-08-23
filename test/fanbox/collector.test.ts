@@ -105,6 +105,116 @@ describe('collect', () => {
     resetSharedBackoff();
   });
 
+  test('一覧の updatedDatetime を postId ごとに記録する (次回の差分判定を一覧の走査だけで済ませるため)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+
+    const result = await collectCreator();
+
+    expect([...result.listedRevisions]).toEqual([['1001', POST_STUB.updatedDatetime]]);
+  });
+
+  test('updatedDatetime が欠けていても収集を止めず null として記録する (最適化の情報で収集全体を落とさないため)', async () => {
+    const { updatedDatetime: _dropped, ...withoutUpdated } = POST_STUB;
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [withoutUpdated] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect([result.addedPostCount, result.listedRevisions.get('1001')]).toEqual([1, null]);
+  });
+
+  test('取り込めなかった投稿の updatedDatetime も記録する (次回その投稿を飛ばすかの判断に一覧の値が要るため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [{ ...POST_STUB, isRestricted: true }] } },
+    });
+
+    const result = await collectCreator();
+
+    expect([result.addedPostCount, result.listedRevisions.get('1001')]).toEqual([0, POST_STUB.updatedDatetime]);
+  });
+
+  test('同じ投稿が一覧に二度来たら最初の updatedDatetime を採る (同じ入力への結果が一覧の並びに依存しないようにするため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [POST_STUB, { ...POST_STUB, updatedDatetime: '2099-01-01T00:00:00+09:00' }] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect(result.listedRevisions.get('1001')).toBe(POST_STUB.updatedDatetime);
+  });
+
+  test('全ページを走査できたら完走として報告する (走査実績の整合性を保つため)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+
+    const result = await collectCreator();
+
+    expect([result.scannedCreator, result.completedFullScan, result.limited]).toEqual([true, true, false]);
+  });
+
+  test('一覧ページの取得に失敗したら完走として報告しない (欠落した投稿を削除と誤認させないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [`https://api.fanbox.cc/post.paginateCreator?creatorId=${CREATOR_ID}`]: {
+        body: { pageUrls: [LIST_PAGE_URL, `${LIST_PAGE_URL}&page=2`] },
+      },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect([result.failedPageCount, result.completedFullScan]).toEqual([1, false]);
+  });
+
+  test('件数上限に達して打ち切ったら完走として報告しない (一覧を全部見ていないため)', async () => {
+    const secondPage = `${LIST_PAGE_URL}&page=2`;
+    mockApi({
+      ...BASE_RESPONSES,
+      [`https://api.fanbox.cc/post.paginateCreator?creatorId=${CREATOR_ID}`]: {
+        body: { pageUrls: [LIST_PAGE_URL, secondPage] },
+      },
+      [secondPage]: { body: { posts: [{ ...POST_STUB, id: '1002' }] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      { ...SETTINGS, limit: 1 },
+      () => {},
+      new AbortController().signal,
+    );
+
+    expect([result.limited, result.completedFullScan]).toEqual([true, false]);
+  });
+
+  test('上限を設定しても達しなければ完走として報告する (一覧は全部見ているので削除の判断材料としては完走と変わらないため)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      { ...SETTINGS, limit: 100 },
+      () => {},
+      new AbortController().signal,
+    );
+
+    expect([result.limited, result.completedFullScan]).toEqual([false, true]);
+  });
+
+  test('単一投稿モードは creator の走査ではないと報告する (一覧を見ていない収集で走査実績を書かせないため)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+
+    const result = await collectSinglePost();
+
+    expect([result.scannedCreator, result.completedFullScan]).toEqual([false, false]);
+  });
+
   test('新形状のレスポンスから投稿を収集できる', async () => {
     mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
 

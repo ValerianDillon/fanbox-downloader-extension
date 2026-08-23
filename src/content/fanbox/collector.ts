@@ -10,6 +10,7 @@ import {
   ApiSession,
   ApiShapeError,
   DEFAULT_API_RATE_LIMIT_MS,
+  decodeListedUpdatedDatetime,
   HttpError,
   RateLimitExhaustedError,
   ResponseParseError,
@@ -69,6 +70,37 @@ export type CollectResult = {
    * 打ち切った場合もそこまでに集めた分は捨てず、不完全と明示したうえで保存できるようにする。
    */
   stoppedReason?: 'rate-limit-exhausted' | 'transport-exhausted';
+  /**
+   * 一覧が返した `updatedDatetime` (postId → 検証済みの値、読めなければ null)。
+   *
+   * 差分判定にしか使わない最適化の情報である (Issue #56)。一覧に現れた投稿はすべて入る
+   * (取り込めなかった投稿も含む) — 次回この値と突き合わせるのは一覧の走査だけで済ませたいため。
+   */
+  listedRevisions: ReadonlyMap<string, string | null>;
+  /**
+   * `post.info` の取得が HttpError で終わった投稿。
+   * 「前回失敗した分だけ再試行する」の対象になる。件数ではなく集合で持つ理由は
+   * `PostFailureCounts.apiFailed` のコメントを参照。
+   */
+  apiFailedPostIds: ReadonlySet<string>;
+  /**
+   * 収集を終えた時刻 (epoch ms)。
+   *
+   * 履歴に載せる観測時刻はこれを使う。保存時刻で代用すると、review 画面での選択に時間を
+   * かけただけで観測が新しく見え、遅れて保存した古い観測が新しい観測を上書きしうる。
+   */
+  collectedAt: number;
+  /** creator 全体の走査だったか。単一投稿モードなら false で、走査実績を記録してはいけない */
+  scannedCreator: boolean;
+  /** 投稿一覧の全ページを走査し終えたか。打ち切り・件数上限・中断で止まっていれば false */
+  completedFullScan: boolean;
+  /**
+   * 件数の上限に達して一覧の走査を打ち切ったか。
+   *
+   * 「上限を設定したか」ではない。設定しても達しなければ一覧は全部見ているので、
+   * 一覧から消えた投稿の判断材料としては完走と変わらない。
+   */
+  limited: boolean;
 };
 
 export type ProgressCallback = (current: number, total: number) => void;
@@ -172,6 +204,10 @@ export async function collect(
   let postFailures = emptyPostFailureCounts();
   let failedPageCount = 0;
   let stoppedReason: CollectResult['stoppedReason'];
+  let listedRevisions: ReadonlyMap<string, string | null> = new Map();
+  let apiFailedPostIds: ReadonlySet<string> = new Set();
+  let completedFullScan = false;
+  let limited = false;
   if (postId) {
     onProgress(0, 1);
     try {
@@ -204,6 +240,10 @@ export async function collect(
     addedPostCount = collected.addedPostCount;
     postFailures = collected.postFailures;
     failedPageCount = collected.failedPageCount;
+    listedRevisions = collected.listedRevisions;
+    apiFailedPostIds = collected.apiFailedPostIds;
+    completedFullScan = collected.completedFullScan;
+    limited = collected.limited;
     if (collected.stoppedBy) {
       // 1 件も取り込めていないなら「取得できた分」が無い。打ち切りとして返すと
       // 中身のない ZIP を「取得できた分のみ保存しています」と表示して出してしまう。
@@ -223,6 +263,15 @@ export async function collect(
     postFailures,
     failedPageCount,
     stoppedReason,
+    listedRevisions,
+    apiFailedPostIds,
+    collectedAt: Date.now(),
+    scannedCreator: postId === undefined,
+    // 打ち切りは「一覧を全部見た」を否定する。件数上限は getItemsByCreator が
+    // 走査の打ち切りとして既に反映している。走査実績の整合性 (完走したなら打ち切りも
+    // 取りこぼしも無い) は履歴側の復号が検査する
+    completedFullScan: completedFullScan && stoppedReason === undefined,
+    limited,
   };
 }
 
@@ -230,6 +279,12 @@ type CreatorCollectCounts = {
   addedPostCount: number;
   postFailures: PostFailureCounts;
   failedPageCount: number;
+  listedRevisions: ReadonlyMap<string, string | null>;
+  apiFailedPostIds: ReadonlySet<string>;
+  /** 投稿一覧の全ページを走査し終えたか */
+  completedFullScan: boolean;
+  /** 件数の上限に達して打ち切ったか */
+  limited: boolean;
   /** 再試行枠の枯渇 (レート制限または通信) で全ページを走査せずに打ち切った場合、その原因 */
   stoppedBy?: RateLimitExhaustedError | TransportExhaustedError;
 };
@@ -275,15 +330,30 @@ async function getItemsByCreator(
   // apiFailed は件数ではなく postId の集合で持つ。一覧の重複で同じ投稿を 2 回試みたとき、
   // 件数で数えると 1 つの投稿が 2 件の失敗になる。再試行で取り込めたら集合から外す
   const apiFailedPostIds = new Set<string>();
+  // 一覧が返した updatedDatetime。取り込めなかった投稿も含めて記録する (Issue #56)
+  const listedRevisions = new Map<string, string | null>();
+  let scannedAllPages = false;
+  let stoppedByLimit = false;
   const counts = (): CreatorCollectCounts => ({
     addedPostCount,
     postFailures: { ...postFailures, apiFailed: apiFailedPostIds.size },
     failedPageCount,
+    listedRevisions,
+    apiFailedPostIds,
+    // 取得に失敗したページがあれば、走査し切っていても一覧を全部見たとは言えない
+    // (そのページに載っていた投稿が丸ごと欠けている)
+    completedFullScan: scannedAllPages && failedPageCount === 0,
+    limited: stoppedByLimit,
   });
 
   for (let i = 0; i < urls.length; i++) {
     if (signal.aborted) return counts();
-    if (!downloadManage.isLimitValid()) break;
+    // 件数上限で止めた場合は全ページを走査していない。break だとループ後の
+    // 「完走した」に落ちてしまうので、ここで返す (ループ後の return と同じ値)
+    if (!downloadManage.isLimitValid()) {
+      stoppedByLimit = true;
+      return counts();
+    }
     console.log(`${i + 1}回目`);
 
     // try は一覧ページ 1 回分の取得だけを囲む。以前は投稿ループ全体 (addByPostInfo や
@@ -330,6 +400,9 @@ async function getItemsByCreator(
     try {
       for (const post of postList) {
         if (signal.aborted) return counts();
+        // 同じ投稿が一覧に 2 回来ても最初の値を採る。後勝ちにすると、同じ入力への結果が
+        // 一覧の並びに依存する
+        if (!listedRevisions.has(post.id)) listedRevisions.set(post.id, decodeListedUpdatedDatetime(post));
         if (!downloadManage.isLimitValid()) break;
         // 既に結果の出た投稿は失敗にも成功にも数えない。利用者から見て取りこぼしではない。
         // 進捗だけは進める (除外・閲覧不可・取得失敗でも進めているので、揃えないと
@@ -406,5 +479,7 @@ async function getItemsByCreator(
       throw e;
     }
   }
+  // for を最後まで回り切った場合だけここに来る (中断・件数上限・枯渇は早期 return する)
+  scannedAllPages = true;
   return counts();
 }

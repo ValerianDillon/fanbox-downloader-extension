@@ -1,9 +1,16 @@
-import type { DownloadJsonObj, PostSummary } from 'download-helper/download-helper';
+import type {
+  DownloadJsonObj,
+  DownloadManifest,
+  DownloadZipResult,
+  PostSummary,
+} from 'download-helper/download-helper';
 import type { DownloadProgress, FileSystemFileHandle } from './downloader';
-import { assertDownloadable, downloadAsZip, pickSaveHandle } from './downloader';
+import { downloadAsZip, pickSaveHandle, preflightDownload } from './downloader';
 import { ApiShapeError, type PageType, ResponseParseError } from './fanbox/api';
 import type { CollectorSettings, CollectResult, PostFailureCounts } from './fanbox/collector';
 import { collect, PostBodyInvalidError } from './fanbox/collector';
+import { applyCreatorHistory } from './history';
+import { buildHistoryUpdate } from './history-update';
 import css from './overlay.css' with { type: 'text' };
 import {
   countSelection,
@@ -166,6 +173,13 @@ export type CompleteMessageParams = {
   failedFileCount: number;
   /** 収集フェーズが再試行の上限で打ち切られた場合、その理由 */
   stoppedReason?: 'rate-limit-exhausted' | 'transport-exhausted';
+  /**
+   * 差分ダウンロードの履歴の更新に失敗した理由 (Issue #56)。成功または記録対象外なら null。
+   *
+   * ZIP は保存できているので見出しは変えない。次回の差分判定がこの回を知らないという
+   * 事実だけを本文に足す (黙って落とすと、利用者は次回に全件取り直す理由が分からない)。
+   */
+  historyError?: string | null;
 };
 
 /**
@@ -233,6 +247,16 @@ function buildFailureLines(params: CompleteMessageParams): string[] {
  * OverlayController.startCollecting の catch から別経路で表示する。
  */
 export function buildCompleteMessage(params: CompleteMessageParams): string {
+  // 履歴の更新の失敗は「取得できなかった」ではないので、見出しの判定 (failureLines) には
+  // 混ぜず、どの見出しになっても最後に足すだけにする。混ぜると、全部取得できているのに
+  // 「一部取得できませんでした」と出る
+  const historySuffix = params.historyError
+    ? `\n保存済みの記録を更新できませんでした: ${params.historyError} (次回は差分ではなく全件を取得します)`
+    : '';
+  return `${buildDownloadOutcome(params)}${historySuffix}`;
+}
+
+function buildDownloadOutcome(params: CompleteMessageParams): string {
   const failureLines = buildFailureLines(params);
   const failedSuffix = failureLines.length ? `\n${failureLines.join('\n')}` : '';
 
@@ -258,11 +282,63 @@ export function buildCompleteMessage(params: CompleteMessageParams): string {
 }
 
 /**
+ * 保存先のファイル名。
+ *
+ * 共有層の `FileSystemFileHandle` は `createWritable()` しか宣言していないので、実際の
+ * `name` は型に出てこない。利用者は picker で名前を変えられるため、こちらが渡した
+ * 既定の名前で代用すると事実と食い違う。読めたときだけ使い、読めなければ既定へ倒す。
+ */
+function zipNameOf(handle: FileSystemFileHandle, fallbackBaseName: string): string {
+  const name = (handle as { name?: unknown }).name;
+  return typeof name === 'string' && name !== '' ? name : `${fallbackBaseName}.zip`;
+}
+
+/**
+ * 差分ダウンロードの履歴を記録する (Issue #56)。失敗したらその理由を返す。
+ *
+ * **中断で終わった実行は記録しない。** 書けたと確認できていないものを保存済みとして扱わない。
+ * `downloadZip` は中断されても ZIP を閉じて正常に戻るので、ここで見ないと途中までの結果を
+ * 保存実績にしてしまう。
+ *
+ * 記録の失敗は ZIP の失敗ではないので例外にせず、完了画面に併記するための文言を返す。
+ */
+async function recordHistory(
+  ctx: ReviewContext,
+  manifest: DownloadManifest,
+  zip: DownloadZipResult,
+  zipName: string,
+  signal: AbortSignal,
+): Promise<string | null> {
+  if (signal.aborted || zip.aborted) return null;
+  try {
+    const update = buildHistoryUpdate(ctx.creatorId, ctx.result, manifest, zip.assets, zipName, Date.now());
+    const response = await applyCreatorHistory(update);
+    return response.ok ? null : (response.error ?? '不明な理由');
+  } catch (e) {
+    console.error('履歴の記録に失敗:', e);
+    return e instanceof Error ? e.message : String(e);
+  }
+}
+
+/**
  * review 画面 (収集完了からダウンロード対象の確定まで) が保持する状態 (Issue #55)。
  *
  * 収集結果 (`result`) は確定後も保持する。完了画面は収集フェーズの失敗件数も併記するため、
  * ZIP フェーズが終わった時点でも必要になる。
  */
+/**
+ * 検証を通ったダウンロード対象。
+ *
+ * `manifest` は保存実績を記録するときに `AssetKey` を引き当てるために持つ
+ * (`DownloadZipResult.assets` は archive 名でしか結果を指さない)。
+ * `preflight` が返した写しをそのまま使い、`json.manifest` を読み直さない — 検証を通った値と
+ * 記録に使う値を別々に読むと、片方だけが差し替わる余地ができる。
+ */
+type PreparedDownload = {
+  readonly json: DownloadJsonObj;
+  readonly manifest: DownloadManifest;
+};
+
 type ReviewContext = {
   readonly creatorId: string;
   readonly result: CollectResult;
@@ -278,7 +354,7 @@ type ReviewContext = {
    * ユーザアクティベーションは時間で失効するので、選択が変わるたびに先に済ませておき、
    * ハンドラは読むだけにする。
    */
-  prepared: DownloadJsonObj | null;
+  prepared: PreparedDownload | null;
   /** 導出待ちのタイマー。連続した操作で導出が何度も走るのを 1 回にまとめる */
   prepareTimer: ReturnType<typeof setTimeout> | null;
   /** review 画面に表示するエラー。選択状態は保ったまま出す */
@@ -817,8 +893,8 @@ export class OverlayController {
     if (this.review !== ctx) return;
     try {
       const json = ctx.result.downloadObject.project(toSelection(ctx.selection));
-      assertDownloadable(json);
-      ctx.prepared = json;
+      const { manifest } = preflightDownload(json);
+      ctx.prepared = { json, manifest };
       ctx.errorMessage = null;
     } catch (e) {
       console.error('ダウンロード対象の導出に失敗:', e);
@@ -1101,7 +1177,7 @@ export class OverlayController {
   private async startDownloading(
     ctx: ReviewContext,
     runId: number,
-    json: DownloadJsonObj,
+    prepared: PreparedDownload,
     saveHandle: FileSystemFileHandle,
   ) {
     // 確定した時点で選択はもう変わらない。残った導出待ちを走らせても捨てるだけになる
@@ -1138,10 +1214,19 @@ export class OverlayController {
 
       const { zip } = await downloadAsZip(
         saveHandle,
-        json,
+        prepared.json,
         downloadProgress,
         signal,
         () => this.downloadRunId === runId,
+      );
+      // 履歴の記録は現行かの判定より前に行う。ZIP を書けたという事実は、その実行が
+      // 今の画面のものかどうかに依らない (Issue #56)
+      const historyError = await recordHistory(
+        ctx,
+        prepared.manifest,
+        zip,
+        zipNameOf(saveHandle, ctx.creatorId),
+        signal,
       );
       // 状態を触る前に現行の実行かを見る。旧実行の遅延解決が新実行の画面と観測状態を
       // 上書きするのを防ぐ (中断してすぐ再実行したときに起こりうる)
@@ -1162,6 +1247,7 @@ export class OverlayController {
           failedPageCount,
           failedFileCount: zip.failedFileCount,
           stoppedReason,
+          historyError,
         }),
       );
     } catch (e) {

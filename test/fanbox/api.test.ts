@@ -3,6 +3,7 @@ import {
   ApiSession,
   ApiShapeError,
   DEFAULT_API_RATE_LIMIT_MS,
+  decodeListedUpdatedDatetime,
   detectPage,
   HttpError,
   RateLimitExhaustedError,
@@ -10,6 +11,26 @@ import {
   resetSharedBackoff,
   TransportExhaustedError,
 } from '../../src/content/fanbox/api';
+
+describe('一覧の updatedDatetime の復号', () => {
+  const item = { id: '1', isRestricted: false, feeRequired: 0 };
+
+  test('文字列ならそのまま返す (次回の差分判定で突き合わせる値なので加工しない)。', () => {
+    expect(decodeListedUpdatedDatetime({ ...item, updatedDatetime: '2024-01-01T00:00:00+09:00' } as never)).toBe(
+      '2024-01-01T00:00:00+09:00',
+    );
+  });
+
+  test('欠落や型不正は null にする (最適化の情報なので収集全体を止めないため)。', () => {
+    expect(decodeListedUpdatedDatetime(item as never)).toBeNull();
+    expect(decodeListedUpdatedDatetime({ ...item, updatedDatetime: 123 } as never)).toBeNull();
+  });
+
+  test('空文字と空白だけの文字列も null にする (編集の前後がどちらも空だと変わっていないと誤判定するため)。', () => {
+    expect(decodeListedUpdatedDatetime({ ...item, updatedDatetime: '' } as never)).toBeNull();
+    expect(decodeListedUpdatedDatetime({ ...item, updatedDatetime: '   ' } as never)).toBeNull();
+  });
+});
 
 describe('detectPage', () => {
   describe('www.fanbox.cc 形式', () => {

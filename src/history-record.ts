@@ -91,7 +91,6 @@ export type CatalogPost = {
   readonly updatedDatetime: string | null;
   readonly title: string;
   readonly publishedDatetime: string | null;
-  readonly feeRequired: number | null;
   /**
    * カタログが完全か。`post.info` を実際に取り込めた投稿だけ true になる。
    * 一覧の情報だけで飛ばした投稿・取得に失敗した投稿は false で、`post.info` の省略対象にしない。
@@ -105,8 +104,13 @@ export type CatalogPost = {
  *
  * `skipped` (中断) は持たない。中断で終わった実行はそもそも記録しないので、
  * 「中断で書けなかった」という状態がレコードに現れることはない。
+ *
+ * **選択しなかったアセットも記録しない。** `post.info` の省略条件は「今回選択された全対象に
+ * 保存実績がある」なので、記録が無いことと「選ばなかった」と記録することは同じ判断になる。
+ * 記録する側は archive 名を持たない (共有層の manifest は除外したアセットに archive 名を付けない)
+ * ため、名前が省略できる変種を足すことになり、凍結名の組み立てと衝突検査が複雑になる。
  */
-export type SavedAssetOutcome = 'written' | 'failed' | 'not-selected';
+export type SavedAssetOutcome = 'written' | 'failed';
 
 /**
  * 保存実績のアセット 1 件。
@@ -362,7 +366,7 @@ function catalogFingerprint(post: CatalogPost): string {
   const assets = [...post.assets]
     .map((asset) => [assetIdentity(asset), asset.originalName, asset.extension, asset.size ?? null] as const)
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-  return JSON.stringify([post.updatedDatetime, post.title, post.publishedDatetime, post.feeRequired, assets]);
+  return JSON.stringify([post.updatedDatetime, post.title, post.publishedDatetime, assets]);
 }
 
 /**
@@ -524,7 +528,6 @@ function decodeCatalogPost(value: unknown): CatalogPost | null {
   if (updatedDatetime === undefined || publishedDatetime === undefined) return null;
   if (typeof value.title !== 'string' || typeof value.complete !== 'boolean') return null;
   if (!isCount(value.observedAt)) return null;
-  if (value.feeRequired !== null && !isCount(value.feeRequired)) return null;
   const assets = decodeArray(value.assets, decodeHistoryAsset);
   if (assets === null || hasDuplicate(assets, assetIdentity)) return null;
   return {
@@ -533,7 +536,6 @@ function decodeCatalogPost(value: unknown): CatalogPost | null {
     updatedDatetime,
     title: value.title,
     publishedDatetime,
-    feeRequired: value.feeRequired as number | null,
     complete: value.complete,
     assets,
   };
@@ -547,7 +549,7 @@ function decodeSavedAsset(value: unknown): SavedAsset | null {
   // 通してしまうと allocator が例外を投げ、破損した履歴が次のダウンロードごと止める
   if (typeof value.archiveName !== 'string' || describeUnusableSegment(value.archiveName) !== null) return null;
   const outcome = value.outcome;
-  if (outcome !== 'written' && outcome !== 'failed' && outcome !== 'not-selected') return null;
+  if (outcome !== 'written' && outcome !== 'failed') return null;
   if (typeof value.zipName !== 'string' || value.zipName === '' || !isCount(value.savedAt)) return null;
   return { ...identity, archiveName: value.archiveName, outcome, zipName: value.zipName, savedAt: value.savedAt };
 }

@@ -24,7 +24,6 @@ function makeCatalogPost(postId: string, assets: readonly HistoryAsset[] = [], o
     updatedDatetime: `${postId}-updated`,
     title: `${postId} title`,
     publishedDatetime: `${postId}-published`,
-    feeRequired: null,
     complete: true,
     assets,
   };
@@ -459,7 +458,7 @@ describe('履歴レコードの復号', () => {
     }
   });
 
-  test('SavedAsset の outcome が定義済みの三種類以外なら null を返す (未知の結果を成功済み保存として扱わないため)。', () => {
+  test('SavedAsset の outcome が written / failed 以外なら null を返す (未知の結果を成功済み保存として扱わないため)。', () => {
     const history = makeRichHistory();
     const value = {
       ...history,

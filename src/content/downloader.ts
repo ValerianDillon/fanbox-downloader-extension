@@ -1,4 +1,9 @@
-import type { DownloadJsonObj, DownloadZipResult, FileSystemFileHandle } from 'download-helper/download-helper';
+import type {
+  DownloadJsonObj,
+  DownloadZipResult,
+  FileSystemFileHandle,
+  PreflightResult,
+} from 'download-helper/download-helper';
 import { DownloadHelper, DownloadUtils } from 'download-helper/download-helper';
 import { appendMediaAttempts } from './media-attempt-log';
 import { fetchMediaViaPort } from './media-stream';
@@ -110,11 +115,14 @@ export type DownloadProgress = {
  * 予約名との衝突を見ており、そちらは型検証を通る入力でも落ちうる (legacy allocator は投稿名が
  * `a` / `a` / `a_1` のとき `a_1` を 2 回割り当てる)。共有層の `preflight` は picker より前に
  * 走る検証をすべて持つので、それをそのまま呼ぶ。
+ * 戻り値の `manifest` は検証を通った写しで、保存実績を記録するときの `AssetKey` の引き当てに使う
+ * (`DownloadZipResult.assets` は archive 名でしか結果を指さない)。
  * @param value `DownloadObject.project()` の出力
+ * @returns 検証を通った入力と manifest
  * @throws {Error} ZIP 入力として受け付けられない場合
  */
-export function assertDownloadable(value: unknown): asserts value is DownloadJsonObj {
-  helper.preflight(value);
+export function preflightDownload(value: unknown): PreflightResult {
+  return helper.preflight(value);
 }
 
 /**
