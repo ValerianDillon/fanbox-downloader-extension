@@ -363,7 +363,6 @@ export async function recordHistory(
   manifest: DownloadManifest,
   zip: DownloadZipResult,
   zipName: string,
-  signal: AbortSignal,
 ): Promise<string | null> {
   if (zip.aborted) return null;
   try {
@@ -1470,7 +1469,7 @@ export class OverlayController {
       );
       // 履歴の記録は現行かの判定より前に行う。ZIP を書けたという事実は、その実行が
       // 今の画面のものかどうかに依らない (Issue #56)
-      const saveError = await recordHistory(ctx, prepared.manifest, zip, zipNameOf(saveHandle, ctx.creatorId), signal);
+      const saveError = await recordHistory(ctx, prepared.manifest, zip, zipNameOf(saveHandle, ctx.creatorId));
       // 収集時の観測の失敗も併せて出す。どちらが落ちても次回は差分にならないので、
       // 保存実績が書けたことだけを見て「記録は正常」と読ませない
       const historyError = joinHistoryErrors(ctx.observationError, saveError);

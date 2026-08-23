@@ -583,7 +583,6 @@ describe('Issue #56: 履歴の記録', () => {
       manifest,
       zip(false),
       'out.zip',
-      new AbortController().signal,
     );
 
     expect(error).toBeNull();
@@ -593,29 +592,20 @@ describe('Issue #56: 履歴の記録', () => {
   test('中断分岐へ入った実行は保存実績を送らない (書けたと確認できていないものを保存済みにしないため)', async () => {
     installRuntime(() => ({ ok: true }));
 
-    const error = await recordHistory(
-      { creatorId: 'creator-1', result: makeResult() },
-      manifest,
-      zip(true),
-      'out.zip',
-      new AbortController().signal,
-    );
+    const error = await recordHistory({ creatorId: 'creator-1', result: makeResult() }, manifest, zip(true), 'out.zip');
 
     expect([error, sent]).toEqual([null, []]);
   });
 
-  test('全部書き終えた後に中断されても保存実績を送る (完成した ZIP の実績を捨てて次回また全件取得しないため)', async () => {
+  test('中断分岐へ入らずに返った実行は保存実績を送る (全部書き終えた後の close() 中の中断は zip.aborted が false のまま返るため)', async () => {
     installRuntime(() => ({ ok: true }));
-    const controller = new AbortController();
-    controller.abort();
 
+    // 判断材料は zip.aborted だけである (signal は引数に取らないので参照しようがない)
     const error = await recordHistory(
       { creatorId: 'creator-1', result: makeResult() },
       manifest,
-      // 全データを書き終えた後の close() 中の中断は zip.aborted が false のまま返る
       zip(false),
       'out.zip',
-      controller.signal,
     );
 
     expect(error).toBeNull();
@@ -630,7 +620,6 @@ describe('Issue #56: 履歴の記録', () => {
       manifest,
       zip(false),
       'out.zip',
-      new AbortController().signal,
     );
 
     expect(error).toBe('storage が一杯です');
