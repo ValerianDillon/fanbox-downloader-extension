@@ -11,10 +11,14 @@ import {
   buildCompleteMessage,
   COMPLETE_HEADLINE,
   type CompleteMessageParams,
+  describePickerFailure,
   isUnsupportedResponseError,
   NOTHING_SAVED_HEADLINE,
+  OVERLAY_TRANSITIONS,
+  type OverlayState,
   PARTIAL_DOWNLOAD_MESSAGE,
   PARTIAL_FILE_FAILURE_HEADLINE,
+  PICKER_FAILED_MESSAGE,
   RATE_LIMIT_EXHAUSTED_HEADLINE,
   TRANSPORT_EXHAUSTED_HEADLINE,
   UNSUPPORTED_RESPONSE_HEADLINE,
@@ -25,38 +29,56 @@ import {
  * DOM 環境が必要なため、状態遷移ロジックのみを検証する
  */
 
-type OverlayState = 'settings' | 'collecting' | 'downloading' | 'complete';
-
-const validTransitions: Record<OverlayState, OverlayState[]> = {
-  settings: ['collecting'],
-  // collecting → complete (downloading を経由しない) は startCollecting (src/content/overlay.ts)
-  // の次の 3 箇所が使う。詳細は下の describe ブロックのコメントを参照。
-  // 1. collect() が正常に返り、addedPostCount === 0 (Issue #14: 保存できる投稿が無い)
-  // 2. collect() が ApiShapeError / ResponseParseError / PostBodyInvalidError を投げる
-  //    (Issue #14: 未対応のレスポンス形式。判定は isUnsupportedResponseError)
-  // 3. collect() がそれ以外の例外を投げる (例: addedPostCount === 0 のまま枯渇した
-  //    RateLimitExhaustedError / TransportExhaustedError、または想定外のバグ) —
-  //    catch の汎用フォールバックに落ちる
-  collecting: ['downloading', 'settings', 'complete'],
-  downloading: ['complete', 'settings'],
-  complete: ['settings'],
-};
-
+// 遷移表は実装 (src/content/overlay.ts の OVERLAY_TRANSITIONS) が SoT で、ここではその中身を
+// 仕様として固定する。実装側は setState がテストビルドでこの表に照らして検証するので、
+// 表に無い遷移をするようになれば e2e が落ちる
 function isValidTransition(from: OverlayState, to: OverlayState): boolean {
-  return validTransitions[from].includes(to);
+  return OVERLAY_TRANSITIONS[from].includes(to);
 }
 
 describe('Overlay 状態遷移', () => {
+  // 実装の表そのものを固定する。ここが緩むと、実装が新しい遷移を許すようになっても
+  // 下の個別テストが「有効」と言い続けてしまう
+  test('遷移表の内容が仕様どおりである', () => {
+    expect(OVERLAY_TRANSITIONS).toEqual({
+      settings: ['collecting'],
+      collecting: ['review', 'settings', 'complete'],
+      review: ['downloading', 'settings'],
+      downloading: ['complete', 'settings'],
+      complete: ['settings'],
+    });
+  });
+
   test('settings → collecting は有効', () => {
     expect(isValidTransition('settings', 'collecting')).toBe(true);
   });
 
-  test('collecting → downloading は有効', () => {
-    expect(isValidTransition('collecting', 'downloading')).toBe(true);
+  // Issue #55: 収集が終わっても直接 ZIP 生成へは行かず、必ず選択画面 (review) を挟む
+  test('collecting → review は有効', () => {
+    expect(isValidTransition('collecting', 'review')).toBe(true);
+  });
+
+  test('collecting → downloading は無効 (review を飛ばして ZIP 生成に入らない)', () => {
+    expect(isValidTransition('collecting', 'downloading')).toBe(false);
   });
 
   test('collecting → settings (キャンセル) は有効', () => {
     expect(isValidTransition('collecting', 'settings')).toBe(true);
+  });
+
+  // 確定ボタンのクリックで保存先を確保してから ZIP 生成に入る (Issue #55)
+  test('review → downloading は有効', () => {
+    expect(isValidTransition('review', 'downloading')).toBe(true);
+  });
+
+  test('review → settings (閉じる) は有効', () => {
+    expect(isValidTransition('review', 'settings')).toBe(true);
+  });
+
+  // 選択の確定は必ず ZIP 生成を経由する。保存先の取得に失敗しても review に留まるので、
+  // review から完了画面へ直接抜ける経路は無い
+  test('review → complete は無効', () => {
+    expect(isValidTransition('review', 'complete')).toBe(false);
   });
 
   // Issue #14: downloading を経由せず collecting → complete に直接遷移する経路が 3 つある。
@@ -95,6 +117,14 @@ describe('Overlay 状態遷移', () => {
 
   test('settings → downloading は無効', () => {
     expect(isValidTransition('settings', 'downloading')).toBe(false);
+  });
+
+  test('settings → review は無効', () => {
+    expect(isValidTransition('settings', 'review')).toBe(false);
+  });
+
+  test('complete → review は無効', () => {
+    expect(isValidTransition('complete', 'review')).toBe(false);
   });
 
   test('complete → collecting は無効', () => {
@@ -394,5 +424,32 @@ describe('Issue #14: 未対応のレスポンス形式の判定 (isUnsupportedRe
     expect(isUnsupportedResponseError(new TransportExhaustedError(url))).toBe(false);
     expect(isUnsupportedResponseError(new HttpError(url, 500))).toBe(false);
     expect(isUnsupportedResponseError(new Error('想定外のバグ'))).toBe(false);
+  });
+});
+
+/**
+ * Issue #55: 保存先の取得に失敗したときの分岐 (describePickerFailure)。
+ *
+ * `showSaveFilePicker` はネイティブダイアログを要求するためブラウザ自動化では失敗を再現できない。
+ * 分岐だけを純粋関数として切り出し、DOM 無しで固定する。
+ */
+describe('Issue #55: 保存先の取得に失敗したときの文言 (describePickerFailure)', () => {
+  test('AbortError (保存先の選択をやめた) は文言を出さない', () => {
+    expect(describePickerFailure(new DOMException('user aborted', 'AbortError'))).toBeNull();
+  });
+
+  // AbortError 以外の DOMException は「選択をやめた」ではないので、黙って戻すと
+  // 利用者は確定ボタンが効かない理由を知る手段が無くなる
+  test.each(['SecurityError', 'NotAllowedError', 'InvalidStateError'])('%s は理由を添えて文言を出す', (name) => {
+    const message = describePickerFailure(new DOMException('denied', name));
+    expect(message).toBe(`${PICKER_FAILED_MESSAGE}: denied`);
+  });
+
+  test('DOMException でない例外も文言を出す', () => {
+    expect(describePickerFailure(new Error('disk full'))).toBe(`${PICKER_FAILED_MESSAGE}: disk full`);
+  });
+
+  test('Error ですらない値も文言を出す', () => {
+    expect(describePickerFailure('boom')).toBe(`${PICKER_FAILED_MESSAGE}: boom`);
   });
 });

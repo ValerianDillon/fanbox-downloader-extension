@@ -18,9 +18,58 @@ FANBOX 固有の収集ロジックと ZIP 生成は `download-helper` に集約�
 
 content script の fetch はページ origin として扱われ、`downloads.fanbox.cc` などが CORS でブロックされる。host_permissions を持つ service worker 経由で取得する必要がある。
 
-overlay は状態マシン (`settings` → `collecting` → `downloading` → `complete`)。UI は shadow DOM でページのスタイルから隔離する。
+overlay は状態マシン (`settings` → `collecting` → `review` → `downloading` → `complete`)。UI は shadow DOM でページのスタイルから隔離する。
 
 キャンセルは AbortController。メディア転送では content script が Port を切断し、service worker がそれを受けて進行中の fetch を abort する。`sendMessage` 経路は signal と競争させて待ちを打ち切る (送信済みリクエスト自体は取り消せない)。
+
+## 収集後の対象選択 (Issue #55)
+
+収集が終わると `review` 状態で止まり、投稿 × 添付の拡張子 × カバー画像を選ばせる。
+絞り込みの意味論と導出は共有層が持つ (`Selection` / `DownloadObject.project()`)。
+拡張が担うのは選択 UI と状態遷移だけで、**生成済みの HTML を解析して直すことはしない**。
+
+- **選択の SoT は `Set<postId>` であって DOM のチェック状態ではない** (`src/content/review-model.ts`)。検索や再描画でチェックボックスの要素は入れ替わるので、DOM を SoT にすると絞り込みの操作だけで選択が変わる
+- 投稿リストには描画上限 (`POST_LIST_RENDER_LIMIT`) を設ける。選択は postId の集合に適用するので、**描画されていない投稿も一括操作の対象になる**
+- 一括操作は 全選択 / 全解除 / 検索結果の選択 / 検索結果の解除 の 4 つ。「表示中」を対象にする操作は入れない (検索一致が描画上限を超えたとき、利用者がどちらを指すのか判別できない)。反転も入れない
+- サイズの合計は断定しない。`size` は file 系のアセットにしか無く image 系とカバーには無いため、既知分と不明な件数を分けて出す。**サイズを得るための HEAD リクエストは追加しない** (Issue #51 が未解決の状態でメディアホストへの要求を増やす利益が無い)
+
+### AbortController の分離と実行世代
+
+収集用と ZIP 用で分ける。
+選択の確定を待つ区間を 1 つの controller で覆うと、「キャンセル」の意味が段階ごとに変わる。
+収集用は `collect()` が返った時点で役目を終え、ZIP 用は確定時に新しく作る。
+
+**旧実行が新実行の画面と観測状態を書き換えないよう、状態に触る前に必ず現行かを判定する。**
+中断してすぐ再実行すると、旧実行の非同期処理が遅れて解決する。
+
+- `await` の直後の最初の判定を `isCurrentCollect` / `isCurrentDownload` にする。エラー表示も publish もその後に置く
+- `downloadZip` に渡す進捗コールバックは `await` の後の判定では間に合わないので、呼び出しごとに判定する
+- ZIP の書き込みは中断されても最後まで走るため、パネルを閉じて別の収集を始めた後に旧実行の `close()` が完了しうる。確定時に採番する `downloadRunId` で判定する (`AbortController` は確定の後に作られるので、確定時に確保する保存先ハンドルからは参照できない)
+
+### 状態遷移表の置き場所
+
+遷移表 (`OVERLAY_TRANSITIONS`) は `overlay.ts` にあり、そこが SoT である。
+テスト側に手で持つと、実装が表に無い遷移をするようになってもテストは通ってしまう。
+
+- テストビルドの `setState` が表に照らして検証する。表を狭めると e2e が落ちる
+- ユニットテストは表の中身そのものを固定する。表を広げるとこちらが落ちる
+- 通常ビルドでは検証しない。遷移表の破れは開発時の誤りであって、利用者の画面を落として直すものではない
+
+### showSaveFilePicker の位置
+
+**review の確定ボタンのクリックで呼ぶ。**
+以前は「ダウンロード開始」のクリック時に呼んでいた。収集が長引くと transient activation が失効するため、収集より前に保存先を確保する必要があったからである。
+確定ボタンのクリック自体が新しいユーザアクティベーションになるので、review 画面での操作が何分続いても保存先を確保できる。
+
+- **確定ハンドラでは picker より先に await も重い処理も置かない。** 絞り込み済みの対象の導出 (`project`) と検証 (`assertDownloadable`) は、選択が変わってから `PROJECTION_DEBOUNCE_MS` の静穏時間を置いて先に済ませておく (`prepareProjection`)
+- **`showSaveFilePicker` は解決した時点で対象ファイルの中身を空にする。** 新規なら 0 バイトで作成し、既存ファイルを選べばその内容を消す (File System Access 仕様 3.4)。導出や検証で落ちる可能性を picker より前に潰さないと、書くものが無いまま利用者のファイルだけが空になる
+- 検証は共有層の `preflight` を呼ぶ。`isDownloadJsonObj` だけでは足りない — `downloadZip` は型検証の後にも投稿ディレクトリ名の重複や予約名との衝突を見ており、そちらは型検証を通る入力でも落ちうる (legacy allocator は投稿名が `a` / `a` / `a_1` のとき `a_1` を 2 回割り当てる。ValerianDillon/download-helper#52)
+- 投稿が 0 件選択のときは確定ボタンを無効にする (picker を出さない)
+- `AbortError` (選択の取りやめ) はエラー画面にせず、選択状態を保ったまま review に留まる。それ以外の失敗は review 内のエラーとして表示する
+- 収集の結果 `addedPostCount === 0` だった場合と、未対応のレスポンス形式で中断した場合は review へ進まないので、保存先も確保しない。**Issue #14 の「0 バイトの ZIP が残る」経路はこれで無くなった** (picker 成功後・`createWritable()` の前に例外が起きれば新規ファイルは残りうるので、完全に無くなったわけではない)
+
+`beforeunload` は収集の開始から完了画面まで維持する。
+review 画面で収集結果を失うのも実害は同じで、選択に時間をかけている間ほど失うものが大きい。
 
 ## メディア取得の分割転送 (Issue #22)
 
@@ -80,7 +129,7 @@ service worker が実際に `fetch` を開始した時刻を応答に載せ、�
 - `post.listCreator` の一覧レスポンスには本文が含まれないため、各投稿は `post.info` への追加リクエストを経て収集される
   - 一覧の時点で結果が決まる投稿 (`isRestricted`、「無料を省く」指定に該当する `feeRequired === 0`) は `post.info` を発行せずに飛ばす。発行しても弾かれるだけで、レート制限の枠と待機時間を消費する
   - この判断に使う `id` / `isRestricted` / `feeRequired` は一覧要素の validator で検証する。欠けたまま続けると、利用者が指定した除外が無言で効かなくなる
-- ZIP のルートに `download-manifest.json` が入る。`stringify()` は「全件を選択した projection」なので、その記録が書き出される。絞り込み UI はまだ無いので常に全件 (Issue #55 で選択できるようにする)
+- ZIP のルートに `download-manifest.json` が入る。review 画面で確定した `Selection` を `project()` に渡した結果がそのまま記録される
 
 ### 失敗の扱いはエラー型で決まる
 
