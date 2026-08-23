@@ -1,0 +1,473 @@
+import { describe, expect, test } from 'bun:test';
+import {
+  type CatalogPost,
+  type CreatorHistory,
+  type CreatorHistoryUpdate,
+  creatorIdFromHistoryKey,
+  decodeCreatorHistory,
+  decodeCreatorHistoryUpdate,
+  decodeHistoryMessage,
+  estimateEntryBytes,
+  HISTORY_SCHEMA_VERSION,
+  type HistoryAsset,
+  historyKeyFor,
+  mergeCreatorHistory,
+  type SavedAsset,
+  type SavedPost,
+  type ScanRecord,
+} from '../src/history-record';
+
+function makeCatalogPost(postId: string, assets: readonly HistoryAsset[] = []): CatalogPost {
+  return {
+    postId,
+    updatedDatetime: `${postId}-updated`,
+    title: `${postId} title`,
+    publishedDatetime: `${postId}-published`,
+    feeRequired: null,
+    complete: true,
+    assets,
+  };
+}
+
+function makeHistoryAsset(assetId: string, size?: number): HistoryAsset {
+  const asset: HistoryAsset = {
+    kind: 'image',
+    assetId,
+    originalName: `${assetId}.png`,
+    extension: 'png',
+  };
+  return size === undefined ? asset : { ...asset, size };
+}
+
+function makeSavedAsset(assetId: string, outcome: SavedAsset['outcome'], savedAt = 200): SavedAsset {
+  return { kind: 'image', assetId, archiveName: `${assetId}.png`, outcome, zipName: 'archive.zip', savedAt };
+}
+
+function makeSavedPost(
+  postId: string,
+  assets: readonly SavedAsset[] = [],
+  overrides: Partial<SavedPost> = {},
+): SavedPost {
+  return {
+    postId,
+    archiveDirectory: `${postId}-directory`,
+    revision: 'revision-1',
+    archiveFormatVersion: 1,
+    assets,
+    ...overrides,
+  };
+}
+
+function makeScan(scannedAt = 300, failedPageCount = 0): ScanRecord {
+  return {
+    completedFullScan: true,
+    failedPageCount,
+    stoppedReason: null,
+    limited: false,
+    scannedAt,
+  };
+}
+
+function makeUpdate(overrides: Partial<CreatorHistoryUpdate> = {}): CreatorHistoryUpdate {
+  return { creatorId: 'creator-1', at: 100, ...overrides };
+}
+
+function makeRichHistory(): CreatorHistory {
+  return mergeCreatorHistory(
+    null,
+    makeUpdate({
+      at: 500,
+      catalog: [makeCatalogPost('post-1', [makeHistoryAsset('asset-1', 32)])],
+      saved: [makeSavedPost('post-1', [makeSavedAsset('asset-1', 'written')])],
+      scan: makeScan(),
+    }),
+  );
+}
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+  return value;
+}
+
+describe('履歴のマージ', () => {
+  test('空の履歴へカタログを適用すると投稿が入る (最初の差分を保存済み履歴として扱えるようにするため)。', () => {
+    const post = makeCatalogPost('post-1');
+
+    const result = mergeCreatorHistory(null, makeUpdate({ catalog: [post] }));
+
+    expect(result.catalog).toEqual([post]);
+  });
+
+  test('同じ postId のカタログは元の位置で置換する (更新で投稿の並びが不必要に変わらないようにするため)。', () => {
+    const oldPost = makeCatalogPost('post-1');
+    const otherPost = makeCatalogPost('post-2');
+    const newPost = makeCatalogPost('post-1', [makeHistoryAsset('asset-1')]);
+    const current = mergeCreatorHistory(null, makeUpdate({ catalog: [oldPost, otherPost] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ catalog: [newPost] }));
+
+    expect(result.catalog).toEqual([newPost, otherPost]);
+  });
+
+  test('未知の postId のカタログは末尾へ追加する (新しく見つかった投稿を既存履歴で失わないため)。', () => {
+    const firstPost = makeCatalogPost('post-1');
+    const newPost = makeCatalogPost('post-2');
+    const current = mergeCreatorHistory(null, makeUpdate({ catalog: [firstPost] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ catalog: [newPost] }));
+
+    expect(result.catalog).toEqual([firstPost, newPost]);
+  });
+
+  test('同じ差分を二度適用しても一度の結果と同じになる (応答を受け取れず再送しても履歴が揺れないようにするため)。', () => {
+    const update = makeUpdate({
+      catalog: [makeCatalogPost('post-1')],
+      saved: [makeSavedPost('post-1', [makeSavedAsset('asset-1', 'written')])],
+      scan: makeScan(),
+    });
+
+    const once = mergeCreatorHistory(null, update);
+    const twice = mergeCreatorHistory(once, update);
+
+    expect(twice).toEqual(once);
+  });
+
+  test('lastUsedAt は既存値と update.at の大きい方を採る (古い差分の再送で LRU の順序を巻き戻さないため)。', () => {
+    const current = mergeCreatorHistory(null, makeUpdate({ at: 500 }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ at: 400 }));
+
+    expect(result.lastUsedAt).toBe(500);
+  });
+
+  test('同じ版の保存実績は別アセットだけを含む再試行でも既存の書き込み結果を残す (部分再試行で成功済みの保存を未保存扱いにしないため)。', () => {
+    const existing = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'written')]);
+    const retry = makeSavedPost('post-1', [makeSavedAsset('asset-2', 'failed')]);
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [existing] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ saved: [retry] }));
+
+    expect(result.saved[0].assets).toEqual([...existing.assets, ...retry.assets]);
+  });
+
+  test('revision が変わった保存実績は投稿ごと置換する (編集前のアセットを編集後の投稿へ持ち越さないため)。', () => {
+    const existing = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written')], { revision: 'revision-old' });
+    const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written')], { revision: 'revision-new' });
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [existing] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ saved: [updated] }));
+
+    expect(result.saved).toEqual([updated]);
+  });
+
+  test('archiveFormatVersion が変わった保存実績は投稿ごと置換する (旧形式の ZIP の実績を新形式へ持ち越さないため)。', () => {
+    const existing = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written')], { archiveFormatVersion: 1 });
+    const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written')], { archiveFormatVersion: 2 });
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [existing] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ saved: [updated] }));
+
+    expect(result.saved).toEqual([updated]);
+  });
+
+  test('同じ identity の保存結果は新しい outcome で置換する (再試行の成否を最新の観測へ反映するため)。', () => {
+    const failed = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'failed', 300)]);
+    const written = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'written', 300)]);
+    const currentFailed = mergeCreatorHistory(null, makeUpdate({ saved: [failed] }));
+    const currentWritten = mergeCreatorHistory(null, makeUpdate({ saved: [written] }));
+
+    const newerWritten = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'written', 400)]);
+    const newerFailed = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'failed', 400)]);
+    const failedToWritten = mergeCreatorHistory(currentFailed, makeUpdate({ saved: [newerWritten] }));
+    const writtenToFailed = mergeCreatorHistory(currentWritten, makeUpdate({ saved: [newerFailed] }));
+
+    expect(failedToWritten.saved[0].assets).toEqual(newerWritten.assets);
+    expect(writtenToFailed.saved[0].assets).toEqual(newerFailed.assets);
+  });
+
+  test('cover と image は assetId 相当が同じでも別アセットとして扱う (種別の違うアセットを同一視して履歴から落とさないため)。', () => {
+    const cover: SavedAsset = {
+      kind: 'cover',
+      archiveName: 'cover.jpg',
+      outcome: 'written',
+      zipName: 'archive.zip',
+      savedAt: 200,
+    };
+    const image = makeSavedAsset('same-id', 'written');
+    const existing = makeSavedPost('post-1', [cover]);
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [existing] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ saved: [makeSavedPost('post-1', [image])] }));
+
+    expect(result.saved[0].assets).toEqual([cover, image]);
+  });
+
+  test('scan は指定時だけ置換し未指定なら既存値を残す (不完全な更新で走査完了の証跡を消さないため)。', () => {
+    const oldScan = makeScan(300, 1);
+    const newScan = makeScan(400, 0);
+    const current = mergeCreatorHistory(null, makeUpdate({ scan: oldScan }));
+
+    const retained = mergeCreatorHistory(current, makeUpdate());
+    const replaced = mergeCreatorHistory(current, makeUpdate({ scan: newScan }));
+
+    expect(retained.scan).toEqual(oldScan);
+    expect(replaced.scan).toEqual(newScan);
+  });
+
+  test('scannedAt が古い scan は既存の scan を置き換えない (遅れて届いた古い差分で走査の完全性を巻き戻さないため)。', () => {
+    const newScan = makeScan(400, 0);
+    const staleScan = makeScan(300, 5);
+    const current = mergeCreatorHistory(null, makeUpdate({ scan: newScan }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ scan: staleScan }));
+
+    expect(result.scan).toEqual(newScan);
+  });
+
+  test('savedAt が古いアセットの結果は新しい結果を置き換えない (遅れて届いた古い差分で保存実績を巻き戻さないため)。', () => {
+    const newer = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'written', 400)]);
+    const stale = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'failed', 300)]);
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [newer] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ saved: [stale] }));
+
+    expect(result.saved[0].assets).toEqual(newer.assets);
+  });
+
+  test('savedAt が同じで結果が食い違うときは written でない方を残す (書けたと確認できない対象を保存済みにしないため)。', () => {
+    const written = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'written', 400)]);
+    const failed = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'failed', 400)]);
+    const fromWritten = mergeCreatorHistory(
+      mergeCreatorHistory(null, makeUpdate({ saved: [written] })),
+      makeUpdate({ saved: [failed] }),
+    );
+    const fromFailed = mergeCreatorHistory(
+      mergeCreatorHistory(null, makeUpdate({ saved: [failed] })),
+      makeUpdate({ saved: [written] }),
+    );
+
+    expect(fromWritten.saved[0].assets[0].outcome).toBe('failed');
+    expect(fromFailed.saved[0].assets[0].outcome).toBe('failed');
+  });
+
+  test('archiveDirectory が変わった保存実績は投稿ごと置換する (別のディレクトリへ書いた ZIP の実績を混ぜないため)。', () => {
+    const existing = makeSavedPost('post-1', [makeSavedAsset('asset-old', 'written')], { archiveDirectory: 'dir-a' });
+    const updated = makeSavedPost('post-1', [makeSavedAsset('asset-new', 'written')], { archiveDirectory: 'dir-b' });
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [existing] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ saved: [updated] }));
+
+    expect(result.saved).toEqual([updated]);
+  });
+
+  test('保存実績をマージしても各アセットの zipName と savedAt はそのまま残る (書いていない ZIP で書いたと主張しないため)。', () => {
+    const first: SavedAsset = { ...makeSavedAsset('asset-1', 'written', 200), zipName: 'first.zip' };
+    const second: SavedAsset = { ...makeSavedAsset('asset-2', 'written', 300), zipName: 'second.zip' };
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [makeSavedPost('post-1', [first])] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ saved: [makeSavedPost('post-1', [second])] }));
+
+    expect(result.saved[0].assets).toEqual([first, second]);
+  });
+
+  test('同じ postId が二度現れる差分は例外にする (適用回数で結果が変わる曖昧な入力を受け取らないため)。', () => {
+    const update = makeUpdate({ catalog: [makeCatalogPost('post-1'), makeCatalogPost('post-1')] });
+
+    expect(() => mergeCreatorHistory(null, update)).toThrow();
+  });
+
+  test('同じアセットが二度現れる差分は例外にする (適用回数で残るアセットが変わる曖昧な入力を受け取らないため)。', () => {
+    const post = makeSavedPost('post-1', [makeSavedAsset('asset-1', 'written'), makeSavedAsset('asset-1', 'failed')]);
+
+    expect(() => mergeCreatorHistory(null, makeUpdate({ saved: [post] }))).toThrow();
+  });
+
+  test('入力を深く凍結してもマージでき元の catalog と saved が変わらない (共有された履歴を破壊せず安全に再利用するため)。', () => {
+    const current = deepFreeze(makeRichHistory());
+    const catalogBefore = structuredClone(current.catalog);
+    const savedBefore = structuredClone(current.saved);
+
+    expect(() => mergeCreatorHistory(current, makeUpdate({ catalog: [makeCatalogPost('post-2')] }))).not.toThrow();
+
+    expect(current.catalog).toEqual(catalogBefore);
+    expect(current.saved).toEqual(savedBefore);
+  });
+});
+
+describe('履歴レコードの復号', () => {
+  test('schemaVersion が現在版と違えば null を返す (互換性のない履歴を保存済みと誤認しないため)。', () => {
+    const history = makeRichHistory();
+
+    const result = decodeCreatorHistory({ ...history, schemaVersion: HISTORY_SCHEMA_VERSION + 1 }, 'creator-1');
+
+    expect(result).toBeNull();
+  });
+
+  test('catalog 内に復号できないアセットが一つでもあれば配列全体を null にする (欠けたカタログを完全な履歴として扱わないため)。', () => {
+    const history = makeRichHistory();
+    const value = {
+      ...history,
+      catalog: [{ ...history.catalog[0], assets: [...history.catalog[0].assets, null] }],
+    };
+
+    const result = decodeCreatorHistory(value, 'creator-1');
+
+    expect(result).toBeNull();
+  });
+
+  test('cover の assetId と image の無いまたは空の assetId を拒否する (壊れた identity で別アセットを同一視しないため)。', () => {
+    const history = makeRichHistory();
+    const invalidAssets = [
+      { kind: 'cover', assetId: 'cover-id', originalName: 'cover.jpg', extension: 'jpg' },
+      { kind: 'image', originalName: 'image.png', extension: 'png' },
+      { kind: 'image', assetId: '', originalName: 'image.png', extension: 'png' },
+    ];
+
+    for (const asset of invalidAssets) {
+      const value = { ...history, catalog: [{ ...history.catalog[0], assets: [asset] }] };
+      expect(decodeCreatorHistory(value, 'creator-1')).toBeNull();
+    }
+  });
+
+  test('SavedAsset の outcome が定義済みの三種類以外なら null を返す (未知の結果を成功済み保存として扱わないため)。', () => {
+    const history = makeRichHistory();
+    const value = {
+      ...history,
+      saved: [{ ...history.saved[0], assets: [{ ...history.saved[0].assets[0], outcome: 'unknown' }] }],
+    };
+
+    const result = decodeCreatorHistory(value, 'creator-1');
+
+    expect(result).toBeNull();
+  });
+
+  test('正常なレコードは JSON の往復後も同じ履歴へ復号できる (storage の直列化で履歴の意味を変えないため)。', () => {
+    const history = makeRichHistory();
+
+    const decoded = decodeCreatorHistory(JSON.parse(JSON.stringify(history)), 'creator-1');
+
+    expect(decoded).toEqual(history);
+  });
+
+  test('lastUsedAt savedAt size failedPageCount の負数と非整数を拒否する (時刻や容量や件数の不正値で差分判定を壊さないため)。', () => {
+    type MutableNumericHistory = {
+      lastUsedAt: number;
+      catalog: Array<{ assets: Array<{ size?: number }> }>;
+      saved: Array<{ assets: Array<{ savedAt: number }> }>;
+      scan: { failedPageCount: number } | null;
+    };
+    const base = makeRichHistory();
+    const patches: Array<(value: MutableNumericHistory, invalid: number) => void> = [
+      (value, invalid) => {
+        value.lastUsedAt = invalid;
+      },
+      (value, invalid) => {
+        value.saved[0].assets[0].savedAt = invalid;
+      },
+      (value, invalid) => {
+        value.catalog[0].assets[0].size = invalid;
+      },
+      (value, invalid) => {
+        if (value.scan === null) throw new Error('fixture must contain scan');
+        value.scan.failedPageCount = invalid;
+      },
+    ];
+
+    for (const invalid of [-1, 1.5]) {
+      for (const patch of patches) {
+        const candidate = structuredClone(base) as unknown as MutableNumericHistory;
+        patch(candidate, invalid);
+        expect(decodeCreatorHistory(candidate, 'creator-1')).toBeNull();
+      }
+    }
+  });
+
+  test('scan が null のレコードを正常に受け入れる (走査実績がまだ無い履歴を保存できるようにするため)。', () => {
+    const history = { ...makeRichHistory(), scan: null };
+
+    const decoded = decodeCreatorHistory(history, 'creator-1');
+
+    expect(decoded).toEqual(history);
+  });
+  test('キーから求めた creatorId とレコードの creatorId が違えば null を返す (別の creator の保存実績を今の creator のものとして扱わないため)。', () => {
+    const history = { ...makeRichHistory(), creatorId: 'creator-2' };
+
+    expect(decodeCreatorHistory(history, 'creator-1')).toBeNull();
+  });
+
+  test('同じ postId が二度入っているレコードは null を返す (適用回数で結果が変わる履歴を読み込まないため)。', () => {
+    const history = makeRichHistory();
+    const value = { ...history, catalog: [history.catalog[0], history.catalog[0]] };
+
+    expect(decodeCreatorHistory(value, 'creator-1')).toBeNull();
+  });
+
+  test('同じアセットが二度入っている保存実績のレコードは null を返す (どちらの結果が有効か決められない履歴を信じないため)。', () => {
+    const history = makeRichHistory();
+    const post = history.saved[0];
+    const value = { ...history, saved: [{ ...post, assets: [post.assets[0], post.assets[0]] }] };
+
+    expect(decodeCreatorHistory(value, 'creator-1')).toBeNull();
+  });
+
+  test('SavedAsset に zipName と savedAt が無ければ null を返す (どの ZIP でいつ書けたか言えない実績を保存済みとして扱わないため)。', () => {
+    const history = makeRichHistory();
+    const post = history.saved[0];
+    const { zipName: _zipName, savedAt: _savedAt, ...withoutProvenance } = post.assets[0];
+    const value = { ...history, saved: [{ ...post, assets: [withoutProvenance] }] };
+
+    expect(decodeCreatorHistory(value, 'creator-1')).toBeNull();
+  });
+});
+
+describe('履歴キーの解釈', () => {
+  test('履歴キーからは creatorId を取り出し、他のキーは null にする (無関係な storage のキーを creator と誤認しないため)。', () => {
+    expect(creatorIdFromHistoryKey(historyKeyFor('creator-1'))).toBe('creator-1');
+    expect(creatorIdFromHistoryKey('fbdlMediaAttempts')).toBeNull();
+    expect(creatorIdFromHistoryKey(historyKeyFor(''))).toBeNull();
+  });
+});
+
+describe('差分とメッセージの復号', () => {
+  test('creatorId を欠いた historyRemove は復号できない (fbdlHistory:undefined を消しにいかないため)。', () => {
+    expect(decodeHistoryMessage({ type: 'historyRemove' })).toBeNull();
+    expect(decodeHistoryMessage({ type: 'historyRemove', creatorId: '' })).toBeNull();
+  });
+
+  test('未知の type のメッセージは復号できない (履歴と無関係なメッセージで storage を触らないため)。', () => {
+    expect(decodeHistoryMessage({ type: 'fetchApi', url: 'https://example.com' })).toBeNull();
+  });
+
+  test('catalog の要素が壊れている差分は復号できない (壊れた値を書き込んで次の読み出しで履歴ごと捨てないため)。', () => {
+    const update = { creatorId: 'creator-1', at: 100, catalog: [{ postId: 'post-1' }] };
+
+    expect(decodeCreatorHistoryUpdate(update)).toBeNull();
+    expect(decodeHistoryMessage({ type: 'historyApply', update })).toBeNull();
+  });
+
+  test('正常な差分は同じ内容へ復号でき historyApply として受け付ける (通常の書き込み経路を塞がないため)。', () => {
+    const update = makeUpdate({ catalog: [makeCatalogPost('post-1')], scan: makeScan() });
+
+    expect(decodeCreatorHistoryUpdate(JSON.parse(JSON.stringify(update)))).toEqual(update);
+    expect(decodeHistoryMessage({ type: 'historyApply', update })).toEqual({ type: 'historyApply', update });
+  });
+});
+
+describe('履歴容量の見積もり', () => {
+  test('キーと JSON の UTF-8 バイト数を見積もる (容量上限の判定を文字数ではなく保存量に合わせるため)。', () => {
+    const history = { ...makeRichHistory(), creatorId: 'creator-あ' };
+    const key = historyKeyFor('creator-あ');
+    const expected = new TextEncoder().encode(key + JSON.stringify(history)).length;
+
+    expect(estimateEntryBytes(key, history)).toBe(expected);
+  });
+
+  test('復号できない値でも見積もれる (読めないレコードが占める容量を破棄の判断から落とさないため)。', () => {
+    const key = historyKeyFor('creator-1');
+
+    expect(estimateEntryBytes(key, null)).toBe(new TextEncoder().encode(`${key}null`).length);
+    expect(estimateEntryBytes(key, { broken: true })).toBeGreaterThan(key.length);
+  });
+});

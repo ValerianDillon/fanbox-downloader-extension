@@ -1,0 +1,114 @@
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { applyCreatorHistory, readCreatorHistory, removeCreatorHistory } from '../src/content/history';
+import { type CreatorHistoryUpdate, historyKeyFor, mergeCreatorHistory } from '../src/history-record';
+import { createFakeLocalStorage } from './service-worker/fake-storage';
+
+describe('コンテンツスクリプトの履歴クライアント', () => {
+  const origChrome = (globalThis as { chrome?: unknown }).chrome;
+  let backing: Map<string, unknown>;
+
+  const installChrome = (value: unknown) => {
+    // biome-ignore lint/suspicious/noExplicitAny: chrome global mock
+    (globalThis as any).chrome = value;
+  };
+
+  const update: CreatorHistoryUpdate = {
+    creatorId: 'creator-1',
+    at: 100,
+    catalog: [],
+  };
+
+  beforeEach(() => {
+    backing = new Map();
+    installChrome({ storage: { local: createFakeLocalStorage(backing) } });
+  });
+
+  afterEach(() => {
+    // biome-ignore lint/suspicious/noExplicitAny: chrome global mock
+    (globalThis as any).chrome = origChrome;
+  });
+
+  test('chrome が未定義でも readCreatorHistory は null を返す (通常の Web 実行環境で履歴読み出しが停止しないため)。', async () => {
+    installChrome(undefined);
+
+    await expect(readCreatorHistory('creator-1')).resolves.toBeNull();
+  });
+
+  test('storage.local.get が reject しても readCreatorHistory は null を返す (一時的な storage 障害を再ダウンロードへ安全に倒すため)。', async () => {
+    installChrome({
+      storage: {
+        local: {
+          get: async () => {
+            throw new Error('storage.local.get failed');
+          },
+        },
+      },
+    });
+
+    await expect(readCreatorHistory('creator-1')).resolves.toBeNull();
+  });
+
+  test('保存済みの正常なレコードを readCreatorHistory で読める (content script が差分判定の材料を取得するため)。', async () => {
+    const history = mergeCreatorHistory(null, update);
+    backing.set(historyKeyFor(update.creatorId), history);
+
+    const result = await readCreatorHistory(update.creatorId);
+
+    expect(result).toEqual(history);
+  });
+
+  test('応答が { ok: true } なら applyCreatorHistory は ok: true を返す (履歴更新の成功を呼び出し元へ伝えるため)。', async () => {
+    installChrome({ runtime: { sendMessage: async () => ({ ok: true }) } });
+
+    const result = await applyCreatorHistory(update);
+
+    expect(result).toEqual({ ok: true });
+  });
+
+  test('応答が undefined なら applyCreatorHistory は ok: false を返す (listener の無い service worker を成功と誤認しないため)。', async () => {
+    installChrome({ runtime: { sendMessage: async () => undefined } });
+
+    const result = await applyCreatorHistory(update);
+
+    expect(result.ok).toBe(false);
+  });
+
+  test('応答が { ok: false, error } なら error をそのまま返す (履歴更新失敗の理由を利用者へ隠さないため)。', async () => {
+    installChrome({ runtime: { sendMessage: async () => ({ ok: false, error: '履歴 store failed' }) } });
+
+    const result = await applyCreatorHistory(update);
+
+    expect(result).toEqual({ ok: false, error: '履歴 store failed' });
+  });
+
+  test('applyCreatorHistory と removeCreatorHistory は sendMessage の reject を ok: false に畳む (通信例外で content script を未処理例外にしないため)。', async () => {
+    installChrome({
+      runtime: {
+        sendMessage: async () => {
+          throw new Error('runtime.sendMessage failed');
+        },
+      },
+    });
+
+    const applied = await applyCreatorHistory(update);
+    const removed = await removeCreatorHistory(update.creatorId);
+
+    expect([applied.ok, removed.ok]).toEqual([false, false]);
+  });
+
+  test('removeCreatorHistory は historyRemove と creatorId を含むメッセージを送る (削除対象を別 creator と取り違えないため)。', async () => {
+    let sentMessage: unknown;
+    installChrome({
+      runtime: {
+        sendMessage: async (message: unknown) => {
+          sentMessage = message;
+          return { ok: true };
+        },
+      },
+    });
+
+    await removeCreatorHistory('creator-2');
+
+    expect(sentMessage).toEqual({ type: 'historyRemove', creatorId: 'creator-2' });
+  });
+});

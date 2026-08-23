@@ -1,5 +1,5 @@
 import { MEDIA_PORT_NAME, type MediaStreamRequest } from '../media-stream-protocol';
-import { handleFetchApi } from './handlers';
+import { handleFetchApi, handleHistoryMessage } from './handlers';
 import { streamMedia } from './media-stream';
 import { trackMediaStreamForTest, wrapMediaStreamDepsForTest } from './test-hooks';
 
@@ -33,6 +33,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     handleFetchApi(message.url)
       .then(sendResponse)
       .catch((e) => sendResponse({ ok: false, status: 0, retryAfter: null, error: String(e), backoffUntil: 0 }));
+    return true;
+  }
+  // 履歴の書き込み (Issue #56)。読み出しは content script が chrome.storage.local を直接引くので
+  // ここには来ない。書き込みだけを service worker に集めるのは、タブをまたぐ read-modify-write を
+  // 単一スレッドの直列キューで守るためである (詳細は HistoryStore のコメント)。
+  if (message.type === 'historyApply' || message.type === 'historyRemove') {
+    handleHistoryMessage(message)
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true;
   }
 });

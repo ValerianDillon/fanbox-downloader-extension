@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { BackoffStore } from '../../src/service-worker/backoff-store';
-import { handleFetchApi } from '../../src/service-worker/handlers';
+import { handleFetchApi, handleHistoryMessage, setHistoryStoreForTest } from '../../src/service-worker/handlers';
 import { createFakeSessionStorage } from './fake-storage';
 
 /**
@@ -242,5 +242,80 @@ describe('handleFetchApi', () => {
     const res = await handleFetchApi('https://api.fanbox.cc/x', store);
     expect(res.status).toBe(429);
     expect(backing.get('fbdlBackoffUntil')).toBe(res.backoffUntil);
+  });
+});
+
+describe('履歴メッセージ処理', () => {
+  beforeEach(() => {
+    setHistoryStoreForTest(undefined);
+  });
+
+  afterEach(() => {
+    setHistoryStoreForTest(undefined);
+  });
+
+  test('historyApply は復号した update を store.apply へ渡す (ワイヤ越しの値をそのまま信じずに保存する形を整えるため)。', async () => {
+    let receivedUpdate: unknown;
+    const store = {
+      apply: async (update: unknown) => {
+        receivedUpdate = update;
+      },
+      remove: async () => {},
+    } as unknown as Parameters<typeof setHistoryStoreForTest>[0];
+    setHistoryStoreForTest(store);
+    const update = { creatorId: 'creator-1', at: 100, catalog: [] };
+
+    await handleHistoryMessage({ type: 'historyApply', update });
+
+    expect(receivedUpdate).toEqual(update);
+  });
+
+  test('復号できないメッセージでは store を呼ばず ok: false を返す (creatorId を欠いた要求で無関係なキーを消しにいかないため)。', async () => {
+    let called = false;
+    const store = {
+      apply: async () => {
+        called = true;
+      },
+      remove: async () => {
+        called = true;
+      },
+    } as unknown as Parameters<typeof setHistoryStoreForTest>[0];
+    setHistoryStoreForTest(store);
+
+    const response = await handleHistoryMessage({ type: 'historyRemove' });
+
+    expect([response.ok, called]).toEqual([false, false]);
+  });
+
+  test('historyRemove は受け取った creatorId で store.remove を呼ぶ (削除操作を対象 creator に確実に適用するため)。', async () => {
+    let removedCreatorId: string | undefined;
+    const store = {
+      apply: async () => {},
+      remove: async (creatorId: string) => {
+        removedCreatorId = creatorId;
+      },
+    } as unknown as Parameters<typeof setHistoryStoreForTest>[0];
+    setHistoryStoreForTest(store);
+
+    await handleHistoryMessage({ type: 'historyRemove', creatorId: 'creator-2' });
+
+    expect(removedCreatorId).toBe('creator-2');
+  });
+
+  test('store が throw しても { ok: false, error } を返す (message 応答を失って content script を待たせ続けないため)。', async () => {
+    const store = {
+      apply: async () => {
+        throw new Error('history store failed');
+      },
+      remove: async () => {},
+    } as unknown as Parameters<typeof setHistoryStoreForTest>[0];
+    setHistoryStoreForTest(store);
+
+    const response = await handleHistoryMessage({
+      type: 'historyApply',
+      update: { creatorId: 'creator-1', at: 100, catalog: [] },
+    });
+
+    expect(response).toEqual({ ok: false, error: 'Error: history store failed' });
   });
 });

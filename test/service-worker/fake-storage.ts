@@ -19,3 +19,35 @@ export function createFakeSessionStorage(backing: Map<string, unknown> = new Map
     },
   };
 }
+
+type FakeLocalStorageOperation =
+  | { type: 'get'; keys: string | string[] | null }
+  | { type: 'set'; items: Record<string, unknown> }
+  | { type: 'remove'; keys: string | string[] };
+
+/** HistoryStore が使う chrome.storage.local の操作と backing を観測できるフェイク。 */
+export function createFakeLocalStorage(backing: Map<string, unknown> = new Map()) {
+  const operations: FakeLocalStorageOperation[] = [];
+  return {
+    operations,
+    get: async (keys: string | string[] | null) => {
+      operations.push({ type: 'get', keys });
+      // null は全エントリ (chrome.storage.local.get の契約)
+      const requestedKeys = keys === null ? [...backing.keys()] : typeof keys === 'string' ? [keys] : keys;
+      const result: Record<string, unknown> = {};
+      for (const key of requestedKeys) {
+        if (backing.has(key)) result[key] = backing.get(key);
+      }
+      return result;
+    },
+    set: async (items: Record<string, unknown>) => {
+      operations.push({ type: 'set', items });
+      for (const [key, value] of Object.entries(items)) backing.set(key, value);
+    },
+    remove: async (keys: string | string[]) => {
+      operations.push({ type: 'remove', keys });
+      const keysToRemove = typeof keys === 'string' ? [keys] : keys;
+      for (const key of keysToRemove) backing.delete(key);
+    },
+  };
+}

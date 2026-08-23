@@ -1,5 +1,7 @@
 import { parseRetryAfterMs } from 'download-helper/api-session';
+import { decodeHistoryMessage, type HistoryResponse } from '../history-record';
 import { BackoffStore } from './backoff-store';
+import { type HistoryStorageArea, HistoryStore } from './history-store';
 
 /**
  * レート制限のバックオフ期限の SoT。
@@ -145,5 +147,50 @@ export async function handleFetchApi(url: string, store: BackoffStore = backoffS
     // 例外を投げないので、store へのアクセス失敗がここに紛れ込んで「通信障害」を誤って
     // 報告することはない。
     return { ok: false, status: 0, retryAfter: null, error: String(e), backoffUntil: await safeGet(store), issuedAt };
+  }
+}
+
+/**
+ * 差分ダウンロードの履歴の書き込み口 (Issue #56)。
+ *
+ * `chrome.storage.local` へのアクセスは HistoryStore の内側でしか起きないので、
+ * このモジュールを import した時点では chrome.* を参照しない (handleFetchApi と同じ理由)。
+ * 生成を遅らせているのもそのためで、chrome のグローバルスタブなしにこのファイルを読み込める。
+ */
+let historyStore: HistoryStore | undefined;
+
+function getHistoryStore(): HistoryStore {
+  historyStore ??= new HistoryStore(chrome.storage.local as unknown as HistoryStorageArea);
+  return historyStore;
+}
+
+/** テスト用にストアを差し替える。通常の経路からは呼ばない */
+export function setHistoryStoreForTest(store: HistoryStore | undefined): void {
+  historyStore = store;
+}
+
+/**
+ * 履歴の書き込み要求を処理する。
+ *
+ * **失敗を握りつぶさない。** 「ZIP は保存したが履歴の更新に失敗した」を利用者に表示するために、
+ * 呼び出し元は成否を知る必要がある。ただし例外は伝播させず応答オブジェクトに畳む
+ * (handleFetchApi と同じく、応答を返し損なうと content script が待ち続けるため)。
+ */
+export async function handleHistoryMessage(message: unknown): Promise<HistoryResponse> {
+  // ワイヤ境界では TypeScript の型が保証にならない。復号を通さずに扱うと、creatorId を欠いた
+  // historyRemove が `fbdlHistory:undefined` を消しにいく (その creatorId の履歴を実際に消しうる)
+  const decoded = decodeHistoryMessage(message);
+  if (decoded === null) return { ok: false, error: '履歴の書き込み要求として解釈できません' };
+  try {
+    const store = getHistoryStore();
+    if (decoded.type === 'historyApply') {
+      await store.apply(decoded.update);
+    } else {
+      await store.remove(decoded.creatorId);
+    }
+    return { ok: true };
+  } catch (e) {
+    console.warn('履歴の更新に失敗しました:', e);
+    return { ok: false, error: String(e) };
   }
 }
