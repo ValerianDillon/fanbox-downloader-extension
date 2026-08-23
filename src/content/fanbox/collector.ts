@@ -5,6 +5,7 @@ import {
   DownloadManage,
   type PostListItemCandidate,
 } from 'download-helper/fanbox-collector';
+import { createPostIdArchivePathAllocator } from '../archive-path';
 import {
   ApiSession,
   ApiShapeError,
@@ -145,7 +146,14 @@ export async function collect(
   for (const plan of plans) {
     feeMapper.set(plan.fee, plan.title);
   }
-  const downloadManage = new DownloadManage(creatorId, feeMapper);
+  // archive path は postId 由来で採番する。従来の採番は同名グループの件数に依存するため、
+  // 同名の投稿やアセットが増減すると過去に割り当てた名前まで変わり、複数の ZIP をまたいで
+  // 同じ投稿を同定できない (Issue #56)
+  const downloadManage = new DownloadManage(
+    creatorId,
+    feeMapper,
+    createPostIdArchivePathAllocator(DownloadManage.utils),
+  );
   downloadManage.downloadObject.setUrl(`https://www.fanbox.cc/@${creatorId}`);
   downloadManage.isIgnoreFree = settings.isIgnoreFree;
   if (settings.limit !== null && settings.limit > 0) {
@@ -257,9 +265,21 @@ async function getItemsByCreator(
   let processed = 0;
   let totalEstimate = urls.length * 10;
   let addedPostCount = 0;
+  // 一覧ページの重複などで同じ投稿が 2 回来ることがある。archive path は postId 由来なので
+  // 2 回登録すると投稿ディレクトリ名が重複し、共有層の preflight が ZIP 全体を拒否する
+  // (従来の採番は同名グループとして採番し直していたので保存できていた)。
+  // 併せて post.info の発行も 1 回で済む (レート制限の枠と待機時間を使わない)
+  const seenPostIds = new Set<string>();
   const postFailures = emptyPostFailureCounts();
   let failedPageCount = 0;
-  const counts = (): CreatorCollectCounts => ({ addedPostCount, postFailures, failedPageCount });
+  // apiFailed は件数ではなく postId の集合で持つ。一覧の重複で同じ投稿を 2 回試みたとき、
+  // 件数で数えると 1 つの投稿が 2 件の失敗になる。再試行で取り込めたら集合から外す
+  const apiFailedPostIds = new Set<string>();
+  const counts = (): CreatorCollectCounts => ({
+    addedPostCount,
+    postFailures: { ...postFailures, apiFailed: apiFailedPostIds.size },
+    failedPageCount,
+  });
 
   for (let i = 0; i < urls.length; i++) {
     if (signal.aborted) return counts();
@@ -311,10 +331,21 @@ async function getItemsByCreator(
       for (const post of postList) {
         if (signal.aborted) return counts();
         if (!downloadManage.isLimitValid()) break;
+        // 既に結果の出た投稿は失敗にも成功にも数えない。利用者から見て取りこぼしではない。
+        // 進捗だけは進める (除外・閲覧不可・取得失敗でも進めているので、揃えないと
+        // 重複を含む一覧で進捗が最後まで届かない)。
+        // 取得に失敗した投稿はここに入れない。重複側で取り直せる可能性を残す
+        if (seenPostIds.has(post.id)) {
+          processed++;
+          onProgress(processed, totalEstimate);
+          continue;
+        }
         // isIgnoreFree で除外する無料投稿は利用者が意図した除外なので数えない。
         // 一覧の時点で除外して post.info を発行しない: 発行しても addByPostInfo が同じ条件で
         // 'ignored' を返すだけで、レート制限の枠と待機時間を無駄に使う
         if (downloadManage.isIgnoreFree && post.feeRequired === 0) {
+          seenPostIds.add(post.id);
+          apiFailedPostIds.delete(post.id);
           processed++;
           onProgress(processed, totalEstimate);
           continue;
@@ -322,6 +353,8 @@ async function getItemsByCreator(
         // 閲覧できない投稿も ZIP からは欠落するので数える。数えないと、一覧が全件
         // isRestricted になったときに空の ZIP を「失敗 0 件で完了」として出してしまう。
         if (post.isRestricted) {
+          seenPostIds.add(post.id);
+          apiFailedPostIds.delete(post.id);
           postFailures.unavailable++;
           postFailures.unavailableRestricted++;
           processed++;
@@ -331,6 +364,9 @@ async function getItemsByCreator(
         // 一覧レスポンスに本文は含まれないため、投稿ごとに post.info を叩く必要がある
         try {
           const result = addByPostInfo(downloadManage, await api.fetchPostInfo(post.id, signal));
+          // 結果が出たので、以降の重複はもう叩かない。取り直せたなら失敗の記録も取り消す
+          seenPostIds.add(post.id);
+          apiFailedPostIds.delete(post.id);
           if (applyAddResult(result, postFailures) === 'added') addedPostCount++;
         } catch (e) {
           if (signal.aborted) return counts();
@@ -350,7 +386,7 @@ async function getItemsByCreator(
           // HttpError だけを投稿単位の失敗として数える (理由は上のページ単位の分岐と同じ)
           if (!(e instanceof HttpError)) throw e;
           console.error(`投稿情報の取得に失敗 (postId: ${post.id}):`, e);
-          postFailures.apiFailed++;
+          apiFailedPostIds.add(post.id);
         }
         processed++;
         onProgress(processed, totalEstimate);

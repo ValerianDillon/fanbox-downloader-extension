@@ -48,6 +48,22 @@ function mockApi(responses: Record<string, unknown | (() => ProxyApiResponse)>) 
   };
 }
 
+/**
+ * `mockApi` が組んだモックを包み、要求された URL を記録する。
+ * 「発行しなかったこと」を確かめるテストのために、応答そのものは変えない。
+ */
+function recordRequestedUrls(): string[] {
+  const requested: string[] = [];
+  // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+  const chromeMock = (globalThis as any).chrome;
+  const inner = chromeMock.runtime.sendMessage;
+  chromeMock.runtime.sendMessage = (message: { type: string; url: string }) => {
+    requested.push(message.url);
+    return inner(message);
+  };
+  return requested;
+}
+
 const SETTINGS = { isIgnoreFree: false, limit: null, apiIntervalMs: 50 };
 
 /**
@@ -99,6 +115,84 @@ describe('collect', () => {
     expect(result.postFailures.apiFailed).toBe(0);
     expect(result.failedPageCount).toBe(0);
     expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(1);
+  });
+
+  /**
+   * 一覧ページの重複などで同じ投稿が 2 回来ることがある (共有層は postId の一意性を検証せず、
+   * 収集を止めないことを優先している)。archive path は postId 由来なので、2 回登録すると
+   * 投稿ディレクトリ名が重複し、共有層の preflight が ZIP 全体を拒否する (Issue #56)。
+   */
+  test('同じ投稿が一覧に 2 回現れても 1 回しか取り込まず post.info も 1 回しか叩かない', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [POST_STUB, { ...POST_STUB }] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+    const requested = recordRequestedUrls();
+
+    const result = await collectCreator();
+
+    expect(result.addedPostCount).toBe(1);
+    expect(result.postFailures.unavailable).toBe(0);
+    expect(result.postFailures.apiFailed).toBe(0);
+    expect(requested.filter((url) => url === POST_INFO_URL)).toHaveLength(1);
+    expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(1);
+  });
+
+  // 重複排除を「試行済み」にすると、最初の試行が失敗した投稿を取り直せなくなる。
+  // 一覧の重複は同じ投稿なので、2 回目で取れるならそれを使う
+  test('最初の取得に失敗した投稿は、重複側で取り直せる', async () => {
+    let attempts = 0;
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [POST_STUB, { ...POST_STUB }] } },
+      [POST_INFO_URL]: () => {
+        attempts += 1;
+        return attempts === 1
+          ? { ok: false, status: 500, retryAfter: null }
+          : { ok: true, status: 200, retryAfter: null, body: JSON.stringify({ body: { post: POST_FULL } }) };
+      },
+    });
+
+    const result = await collectCreator();
+
+    expect(result.addedPostCount).toBe(1);
+    // 取り直せたので失敗としては数えない
+    expect(result.postFailures.apiFailed).toBe(0);
+  });
+
+  // 「結果が出たら以前の失敗を取り消す」は post.info を叩かずに確定する経路でも成り立つ必要がある。
+  // 残すと、同じ投稿が閲覧不可としても API 失敗としても数えられる
+  test('最初の取得に失敗した投稿が重複側で閲覧不可と分かったら、API 失敗としては数えない', async () => {
+    let attempts = 0;
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [POST_STUB, { ...POST_STUB, isRestricted: true }] } },
+      [POST_INFO_URL]: () => {
+        attempts += 1;
+        return { ok: false, status: 500, retryAfter: null };
+      },
+    });
+
+    const result = await collectCreator();
+
+    expect(attempts).toBe(1);
+    expect(result.postFailures.apiFailed).toBe(0);
+    expect(result.postFailures.unavailable).toBe(1);
+  });
+
+  // 件数で数えると、1 つの投稿が 2 件の失敗になる
+  test('同じ投稿が 2 回失敗しても失敗件数は 1 件になる', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [POST_STUB, { ...POST_STUB }] } },
+      [POST_INFO_URL]: () => ({ ok: false, status: 500, retryAfter: null }),
+    });
+
+    const result = await collectCreator();
+
+    expect(result.addedPostCount).toBe(0);
+    expect(result.postFailures.apiFailed).toBe(1);
   });
 
   test('投稿一覧の形状が想定外なら失敗件数に丸めず中断する', async () => {
