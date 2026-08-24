@@ -42,6 +42,31 @@ export async function readCreatorHistory(creatorId: string): Promise<CreatorHist
 }
 
 /**
+ * 差分判定に使う履歴を service worker 経由で読む (Issue #56)。
+ *
+ * **設定画面の表示用の読み出し (`readCreatorHistory`) とは分ける。**
+ * こちらは `historyRemove` と同じキューを通るので、**別のタブが削除している最中でも、
+ * 要求が届いた順に直列化される**。storage を直接引くとこの順序が保証されず、削除より後に
+ * 始めた収集が削除前の履歴で `post.info` を省きうる (確認文の「次回は全件を取得します」に反する)。
+ *
+ * 表示用まで往復にしないのは、パネルを開くたびに service worker の起動待ちが入るためである。
+ * 表示が古くても実害は無い (省略の判断には使わない)。
+ *
+ * 読めなければ null に倒す。応答が想定外・service worker が失敗を返した・例外、のいずれでも
+ * 「履歴が無い」と同じ扱いにする (再ダウンロードになるだけである)。
+ */
+export async function readCreatorHistoryForCollect(creatorId: string): Promise<CreatorHistory | null> {
+  const response = await sendHistoryMessage({ type: 'historyRead', creatorId });
+  if (!response.ok) {
+    console.warn('履歴の読み出しに失敗しました。履歴なしとして扱います:', response.error);
+    return null;
+  }
+  // service worker が復号した値でも、messaging を跨いだ後にもう一度確かめる。
+  // 古い service worker が別の形を返す可能性があり、その形のまま差分判定に使わせない
+  return decodeCreatorHistory(response.history, creatorId);
+}
+
+/**
  * 差分を service worker へ送って適用させる。
  *
  * 冪等な差分なので、応答を得られなかったときに送り直しても結果は変わらない。
@@ -67,8 +92,10 @@ async function sendHistoryMessage(message: HistoryMessage): Promise<HistoryRespo
     if (typeof response !== 'object' || response === null) {
       return { ok: false, error: '履歴の更新に対する応答が想定外です' };
     }
-    const { ok, error } = response as { ok?: unknown; error?: unknown };
-    if (ok === true) return { ok: true };
+    const { ok, error, history } = response as { ok?: unknown; error?: unknown; history?: unknown };
+    // `history` は `historyRead` の応答にだけ入る。落とすと収集用の読み出しが常に
+    // 「履歴なし」になり、差分判定が一度も成立しない
+    if (ok === true) return { ok: true, history };
     // error も検証する。キャストで通すと、文字列でない値が呼び出し側の表示処理へ流れる
     return { ok: false, error: typeof error === 'string' ? error : '履歴の更新に対する応答が想定外です' };
   } catch (e) {

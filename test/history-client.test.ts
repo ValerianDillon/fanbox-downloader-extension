@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { applyCreatorHistory, readCreatorHistory, removeCreatorHistory } from '../src/content/history';
+import {
+  applyCreatorHistory,
+  readCreatorHistory,
+  readCreatorHistoryForCollect,
+  removeCreatorHistory,
+} from '../src/content/history';
 import { type CreatorHistoryUpdate, historyKeyFor, mergeCreatorHistory } from '../src/history-record';
 import { createFakeLocalStorage } from './service-worker/fake-storage';
 
@@ -26,6 +31,38 @@ describe('コンテンツスクリプトの履歴クライアント', () => {
   afterEach(() => {
     // biome-ignore lint/suspicious/noExplicitAny: chrome global mock
     (globalThis as any).chrome = origChrome;
+  });
+
+  test('readCreatorHistoryForCollect は service worker へ historyRead を送る (削除と同じキューを通すため)。', async () => {
+    const sent: unknown[] = [];
+    installChrome({
+      runtime: {
+        sendMessage: async (message: unknown) => {
+          sent.push(message);
+          return { ok: true, history: null };
+        },
+      },
+    });
+
+    await readCreatorHistoryForCollect('creator-1');
+
+    expect(sent).toEqual([{ type: 'historyRead', creatorId: 'creator-1' }]);
+  });
+
+  test('readCreatorHistoryForCollect は応答の履歴を復号して返す (応答から落とすと差分判定が一度も成立しないため)。', async () => {
+    const history = mergeCreatorHistory(null, { creatorId: 'creator-1', at: 100 });
+    installChrome({
+      runtime: { sendMessage: async () => ({ ok: true, history: JSON.parse(JSON.stringify(history)) }) },
+    });
+
+    expect(await readCreatorHistoryForCollect('creator-1')).toEqual(history);
+  });
+
+  test('readCreatorHistoryForCollect は失敗や想定外の応答を null に倒す (読めない履歴で省略しないため)。', async () => {
+    for (const response of [{ ok: false, error: 'x' }, undefined, { ok: true, history: { broken: true } }]) {
+      installChrome({ runtime: { sendMessage: async () => response } });
+      expect(await readCreatorHistoryForCollect('creator-1')).toBeNull();
+    }
   });
 
   test('chrome が未定義でも readCreatorHistory は null を返す (通常の Web 実行環境で履歴読み出しが停止しないため)。', async () => {

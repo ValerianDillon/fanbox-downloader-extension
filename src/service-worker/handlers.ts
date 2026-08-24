@@ -199,10 +199,16 @@ export async function handleHistoryMessage(message: unknown): Promise<HistoryRes
     const store = getHistoryStore();
     if (decoded.type === 'historyApply') {
       await store.apply(decoded.update);
-    } else {
-      await store.remove(decoded.creatorId);
+      return { ok: true };
     }
-    return { ok: true };
+    if (decoded.type === 'historyRemove') {
+      await store.remove(decoded.creatorId);
+      return { ok: true };
+    }
+    // 読み出しも同じキューを通す。**別のタブが削除している最中でも、要求が届いた順に
+    // 直列化されるので、削除より後に来た読み出しは削除後の状態を見る。**
+    // content script が storage を直接引くと、この順序が保証されない
+    return { ok: true, history: await store.read(decoded.creatorId) };
   } catch (e) {
     console.warn('履歴の更新に失敗しました:', e);
     return { ok: false, error: String(e) };

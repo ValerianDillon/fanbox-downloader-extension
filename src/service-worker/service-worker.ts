@@ -35,10 +35,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .catch((e) => sendResponse({ ok: false, status: 0, retryAfter: null, error: String(e), backoffUntil: 0 }));
     return true;
   }
-  // 履歴の書き込み (Issue #56)。読み出しは content script が chrome.storage.local を直接引くので
-  // ここには来ない。書き込みだけを service worker に集めるのは、タブをまたぐ read-modify-write を
-  // 単一スレッドの直列キューで守るためである (詳細は HistoryStore のコメント)。
-  if (message.type === 'historyApply' || message.type === 'historyRemove') {
+  // 履歴の書き込みと、差分判定に使う読み出し (Issue #56)。
+  // 書き込みを service worker に集めるのはタブをまたぐ read-modify-write を単一スレッドの
+  // 直列キューで守るためで、差分判定の読み出しを通すのは削除との順序を守るためである
+  // (設定画面の表示用の読み出しは content script が storage を直接引く)。
+  if (message.type === 'historyApply' || message.type === 'historyRemove' || message.type === 'historyRead') {
     handleHistoryMessage(message)
       .then(sendResponse)
       .catch((e) => sendResponse({ ok: false, error: String(e) }));

@@ -208,6 +208,33 @@ describe('履歴ストア', () => {
     expect(history?.catalog.map((post) => post.postId)).toEqual(['post-1', 'post-2']);
   });
 
+  test('remove の後に来た read は削除後の状態を見る (別のタブが削除している最中の読み出しを直列化するため)', async () => {
+    const backing = new Map<string, unknown>();
+    const base = createFakeLocalStorage(backing);
+    let releaseRemove = () => {};
+    const held = new Promise<void>((resolve) => {
+      releaseRemove = resolve;
+    });
+    const area: HistoryStorageArea = {
+      get: base.get,
+      set: base.set,
+      remove: async (keys) => {
+        // 削除を保留し、その間に来た read がキューで待たされることを見る
+        await held;
+        await base.remove(keys);
+      },
+    };
+    const store = new HistoryStore(area);
+    await store.apply(makeUpdate('creator-1', 100, 'post-1'));
+
+    const removing = store.remove('creator-1');
+    const reading = store.read('creator-1');
+    releaseRemove();
+    await removing;
+
+    expect(await reading).toBeNull();
+  });
+
   test('read は保存値の schemaVersion が違えば null を返す (古い形式を現在の履歴として差分判定しないため)。', async () => {
     const creatorId = 'creator-1';
     const backing = new Map<string, unknown>([

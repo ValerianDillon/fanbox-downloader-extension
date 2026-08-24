@@ -10,7 +10,7 @@ import { downloadAsZip, pickSaveHandle, preflightDownload } from './downloader';
 import { ApiShapeError, type PageType, ResponseParseError } from './fanbox/api';
 import type { CollectorSettings, CollectResult, PostFailureCounts } from './fanbox/collector';
 import { collect, PostBodyInvalidError } from './fanbox/collector';
-import { applyCreatorHistory, readCreatorHistory, removeCreatorHistory } from './history';
+import { applyCreatorHistory, readCreatorHistory, readCreatorHistoryForCollect, removeCreatorHistory } from './history';
 import { acquireHistoryForCollect, historyForCollect } from './history-plan';
 import { buildObservationUpdate, buildSaveUpdate } from './history-update';
 import css from './overlay.css' with { type: 'text' };
@@ -1322,7 +1322,7 @@ export class OverlayController {
       // 保存先の確保は review の確定時なので、ここで待ってもユーザアクティベーションは失効しない
       const collectCreatorId = this.pageType.creatorId;
       const history = await acquireHistoryForCollect(this.deletingCreators.get(collectCreatorId), () =>
-        readCreatorHistory(collectCreatorId),
+        readCreatorHistoryForCollect(collectCreatorId),
       );
       if (!this.isCurrentCollect(signal)) return;
       const creatorId = this.pageType.creatorId;

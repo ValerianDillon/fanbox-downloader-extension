@@ -270,6 +270,20 @@ describe('履歴メッセージ処理', () => {
     expect(receivedUpdate).toEqual(update);
   });
 
+  test('historyRead は store.read の結果を応答に載せる (差分判定の読み出しを削除と同じキューへ通すため)。', async () => {
+    const history = { schemaVersion: 1, creatorId: 'creator-1', lastUsedAt: 1, catalog: [], saved: [], scan: null };
+    const store = {
+      apply: async () => {},
+      remove: async () => {},
+      read: async (creatorId: string) => (creatorId === 'creator-1' ? history : null),
+    } as unknown as Parameters<typeof setHistoryStoreForTest>[0];
+    setHistoryStoreForTest(store);
+
+    const response = await handleHistoryMessage({ type: 'historyRead', creatorId: 'creator-1' });
+
+    expect(response).toEqual({ ok: true, history });
+  });
+
   test('復号できないメッセージでは store を呼ばず ok: false を返す (creatorId を欠いた要求で無関係なキーを消しにいかないため)。', async () => {
     let called = false;
     const store = {

@@ -733,14 +733,16 @@ export function estimateEntryBytes(key: string, value: unknown): number {
  */
 export type HistoryMessage =
   | { readonly type: 'historyApply'; readonly update: CreatorHistoryUpdate }
-  | { readonly type: 'historyRemove'; readonly creatorId: string };
+  | { readonly type: 'historyRemove'; readonly creatorId: string }
+  | { readonly type: 'historyRead'; readonly creatorId: string };
 
 /**
  * service worker の応答。
  *
  * 失敗を握りつぶさないのは、「ZIP は保存したが履歴の更新に失敗した」を利用者に表示するため。
+ * `history` は `historyRead` のときだけ入る (復号前の値なので、受け取った側で復号する)。
  */
-export type HistoryResponse = { readonly ok: boolean; readonly error?: string };
+export type HistoryResponse = { readonly ok: boolean; readonly error?: string; readonly history?: unknown };
 
 /**
  * 受け取った値を差分として復号する。読めなければ null。
@@ -786,9 +788,9 @@ export function decodeCreatorHistoryUpdate(value: unknown): CreatorHistoryUpdate
  */
 export function decodeHistoryMessage(message: unknown): HistoryMessage | null {
   if (!isRecord(message)) return null;
-  if (message.type === 'historyRemove') {
+  if (message.type === 'historyRemove' || message.type === 'historyRead') {
     return typeof message.creatorId === 'string' && message.creatorId !== ''
-      ? { type: 'historyRemove', creatorId: message.creatorId }
+      ? { type: message.type, creatorId: message.creatorId }
       : null;
   }
   if (message.type !== 'historyApply') return null;
