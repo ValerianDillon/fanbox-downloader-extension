@@ -122,3 +122,23 @@ function hasWrittenRecord(saved: SavedPost, kind: string, assetId: string | unde
 export function historyForCollect(history: CreatorHistory | null, creatorId: string): CreatorHistory | null {
   return history?.creatorId === creatorId ? history : null;
 }
+
+/**
+ * 収集に使う履歴を取り直す (Issue #56)。
+ *
+ * **進行中の削除を待ってから読む。** 待たずに読むと、削除がまだ適用されていない storage を
+ * 読んで「削除したはずの履歴」で `post.info` を省く (確認文の「次回は全件を取得します」に反する)。
+ * 削除ボタンを無効にするだけでは、収集ボタンは押せるので防げない。
+ *
+ * 画面が持っている値を使わないのは、別のタブで削除されてもこちらのメモリ上の履歴は
+ * 消えないためである。
+ * @param pendingDelete このタブで進行中の削除の応答 (無ければ undefined)
+ * @param read storage から読む処理
+ */
+export async function acquireHistoryForCollect(
+  pendingDelete: Promise<unknown> | undefined,
+  read: () => Promise<CreatorHistory | null>,
+): Promise<CreatorHistory | null> {
+  await pendingDelete;
+  return read();
+}

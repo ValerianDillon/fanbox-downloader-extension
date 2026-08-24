@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { DownloadUtils } from 'download-helper/download-helper';
 import { ARCHIVE_FORMAT_VERSION } from '../src/content/archive-path';
 import {
+  acquireHistoryForCollect,
   buildFrozenArchiveNames,
   canSkipPostInfo,
   historyForCollect,
@@ -194,5 +195,37 @@ describe('収集に渡す履歴の選別', () => {
 
   test('履歴が無ければ null を返す (初回の収集を止めないため)。', () => {
     expect(historyForCollect(null, 'c1')).toBeNull();
+  });
+});
+
+describe('収集に使う履歴の取り直し', () => {
+  test('進行中の削除が終わってから読む (まだ適用されていない storage を読んで削除済みの履歴で省略しないため)。', async () => {
+    const order: string[] = [];
+    let resolveDelete = () => {};
+    const pendingDelete = new Promise<void>((resolve) => {
+      resolveDelete = () => {
+        order.push('delete');
+        resolve();
+      };
+    });
+
+    const acquired = acquireHistoryForCollect(pendingDelete, async () => {
+      order.push('read');
+      return null;
+    });
+    // 削除が解決するまで読みは走らない
+    await Promise.resolve();
+    expect(order).toEqual([]);
+
+    resolveDelete();
+    await acquired;
+
+    expect(order).toEqual(['delete', 'read']);
+  });
+
+  test('進行中の削除が無ければそのまま読む (通常の収集を待たせないため)。', async () => {
+    const history = makeHistory();
+
+    expect(await acquireHistoryForCollect(undefined, async () => history)).toBe(history);
   });
 });

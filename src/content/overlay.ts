@@ -11,7 +11,7 @@ import { ApiShapeError, type PageType, ResponseParseError } from './fanbox/api';
 import type { CollectorSettings, CollectResult, PostFailureCounts } from './fanbox/collector';
 import { collect, PostBodyInvalidError } from './fanbox/collector';
 import { applyCreatorHistory, readCreatorHistory, removeCreatorHistory } from './history';
-import { historyForCollect } from './history-plan';
+import { acquireHistoryForCollect, historyForCollect } from './history-plan';
 import { buildObservationUpdate, buildSaveUpdate } from './history-update';
 import css from './overlay.css' with { type: 'text' };
 import {
@@ -430,12 +430,16 @@ export class OverlayController {
   /** 履歴の読み込みの世代。遅れて解決した読み込みが新しい画面を書き換えないようにする */
   private historyGeneration = 0;
   /**
-   * 削除の応答を待っている creator。
+   * 削除の応答を待っている creator と、その応答の Promise。
    *
    * 削除の途中で始まった読み込みは、まだ消える前の storage を読む。世代だけで守ると、
    * パネルを閉じて開き直したときに新しい世代の読み込みが旧履歴を戻してしまう。
+   *
+   * Promise を持つのは、**収集がこれを待ってから読む**ため。待たずに読むと、削除が
+   * まだ適用されていない storage を読んで「削除したはずの履歴」で `post.info` を省く
+   * (確認文の「次回は全件を取得します」に反する)。
    */
-  private readonly deletingCreators = new Set<string>();
+  private readonly deletingCreators = new Map<string, Promise<unknown>>();
   /**
    * 進行中の履歴の読み込み。設定画面の表示にだけ使う。
    *
@@ -779,10 +783,11 @@ export class OverlayController {
     // 「削除したつもり」の履歴を根拠に post.info が省かれる
     const previous = this.history;
     this.history = null;
-    this.deletingCreators.add(creatorId);
+    const pending = removeCreatorHistory(creatorId);
+    this.deletingCreators.set(creatorId, pending);
     let response: HistoryResponse;
     try {
-      response = await removeCreatorHistory(creatorId);
+      response = await pending;
     } finally {
       this.deletingCreators.delete(creatorId);
     }
@@ -1313,11 +1318,12 @@ export class OverlayController {
     this.guardUnload();
 
     try {
-      // **収集の直前に storage から読み直す。** 画面に持っている値は古くなりうる —
-      // 同じ creator を別のタブで開いて記録を削除しても、こちらのメモリ上の履歴は残るので、
-      // 削除したはずの履歴を根拠に post.info を省いてしまう (「次回は全件を取得します」に反する)。
+      // 進行中の削除を待ってから storage を読み直す (理由は acquireHistoryForCollect の JSDoc)。
       // 保存先の確保は review の確定時なので、ここで待ってもユーザアクティベーションは失効しない
-      const history = await readCreatorHistory(this.pageType.creatorId);
+      const collectCreatorId = this.pageType.creatorId;
+      const history = await acquireHistoryForCollect(this.deletingCreators.get(collectCreatorId), () =>
+        readCreatorHistory(collectCreatorId),
+      );
       if (!this.isCurrentCollect(signal)) return;
       const creatorId = this.pageType.creatorId;
       const postId = this.pageType.type === 'post' ? this.pageType.postId : undefined;
