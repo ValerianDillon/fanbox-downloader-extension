@@ -241,6 +241,36 @@ describe('collect', () => {
     expect([result.addedPostCount, result.listedRevisions.get('1001')]).toEqual([1, null]);
   });
 
+  test('一覧と詳細の updatedDatetime が食い違えば突き合わせに使わない (取得できていない中身をその版で保存済みとして扱わないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [{ ...POST_STUB, updatedDatetime: '2099-01-01T00:00:00+09:00' }] } },
+      // 詳細だけ古い版を返す (エンドポイントごとのキャッシュ差を模す)
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect([result.addedPostCount, result.listedRevisions.get('1001')]).toEqual([1, null]);
+  });
+
+  test('詳細に updatedDatetime が無ければ突き合わせに使わない (同じ世代だと確認できないため)', async () => {
+    const { updatedDatetime: _dropped, ...withoutUpdated } = POST_FULL;
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: withoutUpdated } } });
+
+    const result = await collectCreator();
+
+    expect([result.addedPostCount, result.listedRevisions.get('1001')]).toEqual([1, null]);
+  });
+
+  test('一覧と詳細の updatedDatetime が一致すればその値を残す (差分判定を成立させるため)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+
+    const result = await collectCreator();
+
+    expect(result.listedRevisions.get('1001')).toBe(POST_STUB.updatedDatetime);
+  });
+
   test('取り込めなかった投稿の updatedDatetime も記録する (次回その投稿を飛ばすかの判断に一覧の値が要るため)', async () => {
     mockApi({
       ...BASE_RESPONSES,

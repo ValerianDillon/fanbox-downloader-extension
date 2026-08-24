@@ -175,6 +175,22 @@ export function decodeListedUpdatedDatetime(item: PostListItemCandidate): string
   return value;
 }
 
+/**
+ * `post.info` の投稿オブジェクトの `updatedDatetime` を読む (Issue #56)。
+ *
+ * 一覧が返した値と突き合わせて、**一覧と詳細が同じ世代を指しているか**を確かめるために使う。
+ * エンドポイントごとにキャッシュの状態が違えば、一覧が新しい版を返しているのに詳細が古い版を
+ * 返すことがありうる。そのまま一覧の値を保存実績に付けると、取得できていない中身を
+ * 「その版で保存済み」として扱い、次回その投稿を丸ごと飛ばす。
+ *
+ * 一覧側と同じく必須の validator には足さない。読めなければ「確認できなかった」として扱う。
+ */
+export function decodePostInfoUpdatedDatetime(post: PostInfoCandidate): string | null {
+  const value = (post as unknown as Record<string, unknown>).updatedDatetime;
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  return value;
+}
+
 /** 支援額タグの表示名の組み立てに使う 2 つを検証する */
 function isValidPlan(item: unknown): boolean {
   const plan = item as PlanInfo | null;

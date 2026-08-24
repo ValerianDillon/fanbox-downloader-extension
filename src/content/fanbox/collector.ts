@@ -13,6 +13,7 @@ import {
   ApiShapeError,
   DEFAULT_API_RATE_LIMIT_MS,
   decodeListedUpdatedDatetime,
+  decodePostInfoUpdatedDatetime,
   HttpError,
   RateLimitExhaustedError,
   ResponseParseError,
@@ -537,7 +538,16 @@ async function getItemsByCreator(
         }
         // 一覧レスポンスに本文は含まれないため、投稿ごとに post.info を叩く必要がある
         try {
-          const result = addByPostInfo(downloadManage, await api.fetchPostInfo(post.id, signal));
+          const info = await api.fetchPostInfo(post.id, signal);
+          // **一覧と詳細が同じ世代を指しているか確かめる。** エンドポイントごとにキャッシュの
+          // 状態が違えば、一覧が新しい版を返しているのに詳細が古い版を返すことがありうる。
+          // そのまま一覧の値を保存実績に付けると、取得できていない中身を「その版で保存済み」と
+          // 扱い、次回その投稿を丸ごと飛ばす。食い違ったら突き合わせには使わせない
+          // (今回取得できた中身は通常どおり保存する)
+          if (listedRevisions.get(post.id) !== decodePostInfoUpdatedDatetime(info)) {
+            listedRevisions.set(post.id, null);
+          }
+          const result = addByPostInfo(downloadManage, info);
           // 結果が出たので、以降の重複はもう叩かない。取り直せたなら失敗の記録も取り消す
           seenPostIds.add(post.id);
           // post.info まで発行した結果は一覧情報だけの決定ではないので取り消さない。
