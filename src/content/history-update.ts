@@ -167,6 +167,11 @@ export function buildSavedPosts(
  * @param result 収集結果
  */
 export function buildObservationUpdate(creatorId: string, result: CollectResult): CreatorHistoryUpdate {
+  // **単一投稿モードではカタログを更新しない。** 一覧を読んでいないので `updatedDatetime` を
+  // 一覧の値と突き合わせられず、書けるのは `null` だけになる。それで既存のカタログを
+  // 置き換えると、次の creator 全体の収集で省略できたはずの投稿を取り直すことになる
+  // (取りこぼす向きではないが、避けられる無駄である)
+  if (!result.scannedCreator) return { creatorId, at: result.collectedAt };
   const scan = buildScanRecord(result, result.collectedAt);
   const update: CreatorHistoryUpdate = {
     creatorId,

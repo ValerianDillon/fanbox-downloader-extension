@@ -291,10 +291,12 @@ describe('履歴の差分の組み立て', () => {
     expect('saved' in update).toBe(false);
   });
 
-  test('単一投稿モードでは観測の差分に走査実績を含めない (一覧を見ていない収集で削除の判断材料を上書きしないため)。', () => {
+  test('単一投稿モードでは観測の差分にカタログも走査実績も含めない (一覧の値と突き合わせられない revision で既存のカタログを潰さないため)。', () => {
     const result = makeResult({ scannedCreator: false, posts: [{ postId: 'p1', name: 'a', tags: [], files: [] }] });
 
-    expect('scan' in buildObservationUpdate('c1', result)).toBe(false);
+    const update = buildObservationUpdate('c1', result);
+
+    expect(update).toEqual({ creatorId: 'c1', at: COLLECTED_AT });
   });
 
   test('保存の差分には ZIP の時刻を使い、観測は含めない (観測は収集の時点で別に書いてあるため)。', () => {
