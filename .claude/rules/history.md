@@ -12,7 +12,7 @@ creator ごとの 観測カタログ / 保存実績 / scan 実績 を `chrome.st
 
 content script から Web Storage / IndexedDB を使うと FANBOX ページ側の origin になるため使わない。
 
-## 書き込みは service worker、読みは直読み
+## 書き込みは service worker、読みは用途で分ける
 
 **書き込みは service worker に一本化して直列化する。**
 拡張の service worker は 1 プロセスの単一スレッドなので、そこで直列化すれば全タブの書き込みが直列になる。
@@ -21,9 +21,11 @@ content script 側の直列化は同一タブしか守れない (`media-attempt-
 
 **キューは creator 単位ではなく 1 本。** 破棄の判断で全 creator を見るため、creator ごとに並行させると判断の材料が競合する。
 
-読みは content script が `chrome.storage.local` を直接引く。
-`get` は atomic なので書き込み途中の状態は見えない。
-読みまで往復にすると、収集の入口で service worker の起動待ちが入る。
+**読みは用途で分ける。**
+差分判定に使う読み出しは service worker のキューを通す (`historyRead`)。
+削除との順序を守るためで、理由は「収集の直前に読み直す」を参照。
+設定画面の表示用の読み出しだけが `chrome.storage.local` を直接引く。
+パネルを開くたびに service worker の起動待ちが入るのを避けるためで、表示が古くても省略の判断には使わないので実害が無い。
 
 content script が送るのは creator レコード全体ではなく**冪等な upsert 差分**にする。
 全体を送って上書きすると、同じ creator を 2 タブで開いたときに片方の更新が他方を丸ごと巻き戻す。
