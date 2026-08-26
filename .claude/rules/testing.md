@@ -14,6 +14,7 @@ paths:
 - smoke test の責務は「FAB クリック → 収集 → ファイル取得 → ZIP 生成の完走」まで
 - 分割転送 (Issue #22) は `e2e/large-media.spec.ts` が 48 MiB / 64 MiB 超のファイルを SHA-256 で照合する。50 MiB 級の fixture はリポジトリに置かずテスト実行時に生成する
 - 実ファイル保存と mtime 検証は smoke test の対象外 (`showSaveFilePicker` はネイティブダイアログを要求し自動化できない)。`publishedDatetime` の mtime 反映は `test/downloader.test.ts` でカバー
+- **失敗経路だけを assert するテストは、実装が常に失敗を返しても通る。** 値を返す関数には成功経路の値を必ず 1 件は assert する
 
 ## WSL2 headless の癖
 
