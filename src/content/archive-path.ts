@@ -5,6 +5,13 @@ import type {
   ReadonlyPostObj,
 } from 'download-helper/download-helper';
 import { assetKeyToString } from 'download-helper/download-helper';
+import {
+  byteLength,
+  describeUnusableSegment,
+  SEGMENT_MAX_BYTES,
+  toCollisionKey,
+  toWellFormed,
+} from '../archive-name-rules';
 
 /**
  * ZIP の出力形式のバージョン (Issue #56)。
@@ -17,15 +24,6 @@ import { assetKeyToString } from 'download-helper/download-helper';
  * 2 は postId 由来の採番 (このモジュール)。
  */
 export const ARCHIVE_FORMAT_VERSION = 2;
-
-/**
- * 1 つのパスセグメント全体に許す UTF-8 バイト数。
- *
- * ext4 のファイル名上限は 255 bytes で、超えると ZIP は作れても展開できない。
- * 余裕を見て 200 bytes にしてある (投稿ディレクトリ名とアセット名を連ねたパス全体の上限は
- * 共有層の `preflight` が別に見る)。
- */
-const SEGMENT_MAX_BYTES = 200;
 
 /**
  * 既に割り当て済みの archive 名。
@@ -111,31 +109,14 @@ function toSafeExtension(extension: string): string {
  * @param utils 正規化に使うユーティリティ
  */
 function assertUsableSegment(name: string, context: string, utils: DownloadUtils): void {
-  // 判定は共有層の isValidPathSegment と同じにする。Windows は末尾の空白とピリオドを取り除いて
-  // 解釈するので、'...' や '. .' も '.' や '..' と同じ扱いになる
-  const trimmedTrailing = name.replace(/[ .]+$/u, '');
-  if (trimmedTrailing === '' || trimmedTrailing === '.' || trimmedTrailing === '..') {
-    throw new Error(`${context}がパスセグメントとして使えません (${JSON.stringify(name)})`);
-  }
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: ZIP のエントリ名として不正な文字を弾く
-  if (/[/\\:\u0000-\u001f\u007f]/.test(name)) {
-    throw new Error(`${context}に使えない文字が含まれています (${JSON.stringify(name)})`);
-  }
+  // 判定の本体は `archive-name-rules.ts` にある。履歴の復号も同じ規則を使うので、ここに書き足すと
+  // 復号を通った凍結名が allocator で例外になり、次のダウンロードごと止まる
+  const unusable = describeUnusableSegment(name);
+  if (unusable !== null) throw new Error(`${context}が${unusable} (${JSON.stringify(name)})`);
+  // 正規化の判定だけはここに残る。共有層の DownloadUtils を要するため、
+  // service worker 側でも走る履歴の復号には持ち込めない
   if (utils.encodeFileName(name) !== name) {
     throw new Error(`${context}が正規化されていません (${JSON.stringify(name)})`);
-  }
-  // `%` を含む名前は ZIP の実体と HTML の参照がずれる (toNameSlug のコメント参照)。
-  // 凍結名は保存実績として固定されるので、壊れた名前を受け取った時点で拒否する
-  if (name.includes('%') || name.includes('?')) {
-    throw new Error(`${context}に % または ? が含まれています (${JSON.stringify(name)})`);
-  }
-  if (byteLength(name) > SEGMENT_MAX_BYTES) {
-    throw new Error(`${context}が長すぎます (UTF-8 ${byteLength(name)} bytes, 上限 ${SEGMENT_MAX_BYTES} bytes)`);
-  }
-  // 孤立サロゲートは書き込み時に U+FFFD へ置き換えられる。凍結名として固定すると、
-  // 記録上の名前と ZIP の実体名が違うものになる
-  if (toWellFormed(name) !== name) {
-    throw new Error(`${context}に孤立サロゲートが含まれています (${JSON.stringify(name)})`);
   }
 }
 
@@ -165,31 +146,6 @@ function assertUniqueNames(names: readonly string[], context: string): void {
 }
 
 /**
- * 名前が同じパスとして扱われるかを比べるための正規化。
- *
- * Windows と既定の macOS は大文字小文字を区別せず、Windows は末尾の空白とピリオドを取り除いて
- * 解釈する。完全一致だけで比べると、`a.bin` と `A.BIN` を別の名前として通してしまい、
- * 展開時に一方が上書きされる。共有層が予約名の比較に使っているのと同じ畳み方である。
- * @param name 比較する名前
- */
-function toCollisionKey(name: string): string {
-  // 合成済みへ寄せる。macOS の APFS は正規化を区別しないので、'é' と 'e\u0301' は
-  // 同じディレクトリに共存できない
-  return name
-    .normalize('NFC')
-    .replace(/[ .]+$/u, '')
-    .toLowerCase();
-}
-
-/**
- * UTF-8 でのバイト数を返す
- * @param value 対象の文字列
- */
-function byteLength(value: string): number {
-  return new TextEncoder().encode(value).length;
-}
-
-/**
  * UTF-8 で指定バイト数に収まるところまで切る。
  *
  * コードポイント単位で足していくのは、UTF-16 の符号単位で切るとサロゲート対が割れて
@@ -208,18 +164,6 @@ function truncateToBytes(value: string, maxBytes: number): string {
     bytes += size;
   }
   return result;
-}
-
-/**
- * 孤立サロゲートを U+FFFD へ置き換える (`String.prototype.toWellFormed` 相当)。
- *
- * ZIP のエントリ名は `TextEncoder` で UTF-8 にするが、孤立サロゲートはそこで U+FFFD へ
- * 置き換えられる。置き換え前の文字列で一意性を見ると、**書き込み時に同じバイト列になる名前を
- * 別物として通してしまう**。tsconfig の lib が es2021 なので、標準メソッドは型に無い。
- * @param value 対象の文字列
- */
-function toWellFormed(value: string): string {
-  return value.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
 }
 
 /**

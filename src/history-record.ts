@@ -1,0 +1,799 @@
+import { describeUnusableSegment, toCollisionKey } from './archive-name-rules';
+
+/**
+ * 差分ダウンロードの履歴レコード (Issue #56)。
+ *
+ * content script と service worker の両方が読むので、型・キー導出・マージ規則・復号を
+ * ここに集約する (`media-stream-protocol.ts` と同じ位置づけ)。
+ * 保存先の I/O と直列化は `service-worker/history-store.ts` が持つ。
+ *
+ * **拡張が主張できるのは「この拡張が日時 X の ZIP 生成で当該エントリの書き込み完了を確認した」
+ * という事実だけである。** その ZIP が現在も存在する、展開後のファイルが存在する、とは主張しない。
+ */
+
+/**
+ * 保存形式の版。互換性のない変更のたびに上げる。
+ *
+ * 読み出しで一致しなければ履歴を「無い」ものとして扱う。古い形を読もうとして誤った差分判定を
+ * するより、再ダウンロードになる方 (安全側) に倒す。
+ */
+export const HISTORY_SCHEMA_VERSION = 1;
+
+/**
+ * creator ごとのレコードのキー接頭辞。
+ *
+ * 接頭辞は固定長なので、`<接頭辞><creatorId>` は creatorId について単射である
+ * (別の creator が同じキーへ潰れない)。版はキーではなくレコードに載せる。キーに載せると
+ * 版を上げたときに古いキーが誰にも読まれないまま残り続ける。
+ */
+export const HISTORY_KEY_PREFIX = 'fbdlHistory:';
+
+/**
+ * 履歴に使ってよい合計バイト数。
+ *
+ * `chrome.storage.local` の既定容量は 10 MiB で、Issue #51 の観測記録 (`fbdlMediaAttempts`) と
+ * 共有する。余裕を残して 8 MiB を上限とし、超えたら creator 単位で古い方から捨てる。
+ * `unlimitedStorage` を足すかは実測してから決める。
+ */
+export const HISTORY_BUDGET_BYTES = 8 * 1024 * 1024;
+
+/** creator のレコードのキーを求める */
+export function historyKeyFor(creatorId: string): string {
+  return `${HISTORY_KEY_PREFIX}${creatorId}`;
+}
+
+/** 履歴のキーなら creatorId を返す。違うキーなら null */
+export function creatorIdFromHistoryKey(key: string): string | null {
+  if (!key.startsWith(HISTORY_KEY_PREFIX)) return null;
+  const creatorId = key.slice(HISTORY_KEY_PREFIX.length);
+  return creatorId === '' ? null : creatorId;
+}
+
+/** アセットの種別。共有層の `AssetKey.kind` と同じ語彙 */
+export type HistoryAssetKind = 'cover' | 'image' | 'file';
+
+/**
+ * 観測カタログのアセット記述子。
+ *
+ * `AssetKey` と同じ形 (kind + assetId、cover は assetId を持たない) にする。
+ * `assetKeyToString` の結果を保存しないのは、共有層の符号化に依存すると、そちらが変わったときに
+ * 過去のレコードの意味が変わるため。
+ *
+ * **URL は保存しない。** 必要になれば `post.info` を取り直せば得られるし、
+ * `https://downloads.fanbox.cc/...` の組み立て規則を拡張側の契約にしない。
+ */
+export type HistoryAsset = {
+  readonly kind: HistoryAssetKind;
+  /** cover は持たない */
+  readonly assetId?: string;
+  readonly originalName: string;
+  readonly extension: string;
+  /** file 系のアセットにしか無い */
+  readonly size?: number;
+};
+
+/** 観測カタログの投稿 1 件 */
+export type CatalogPost = {
+  readonly postId: string;
+  /**
+   * このカタログを観測した時刻 (epoch ms)。
+   *
+   * 遅れて届いた古い観測が新しい観測を置き換えないために持つ。
+   * 「同じ `updatedDatetime` なら中身も同じ」は API の性質への仮定であり、その仮定は
+   * 未確認である (Issue #56)。仮定が崩れたときに古い部分的なカタログで
+   * `post.info` の省略条件が成立してしまうと、未保存のアセットを永久に取りに行かなくなる。
+   */
+  readonly observedAt: number;
+  /**
+   * 一覧 (`post.listCreator`) が返した `updatedDatetime` を検証したもの。
+   * 欠落や型不正なら null で、そのときは差分判定に使わない (通常の取得へフォールバックする)。
+   */
+  readonly updatedDatetime: string | null;
+  readonly title: string;
+  readonly publishedDatetime: string | null;
+  /**
+   * カタログが完全か。`post.info` を実際に取り込めた投稿だけ true になる。
+   * 一覧の情報だけで飛ばした投稿・取得に失敗した投稿は false で、`post.info` の省略対象にしない。
+   */
+  readonly complete: boolean;
+  readonly assets: readonly HistoryAsset[];
+};
+
+/**
+ * アセット 1 件の保存結果。
+ *
+ * `skipped` (中断) は持たない。中断で終わった実行はそもそも記録しないので、
+ * 「中断で書けなかった」という状態がレコードに現れることはない。
+ *
+ * **選択しなかったアセットも記録しない。** `post.info` の省略条件は「今回選択された全対象に
+ * 保存実績がある」なので、記録が無いことと「選ばなかった」と記録することは同じ判断になる。
+ * 記録する側は archive 名を持たない (共有層の manifest は除外したアセットに archive 名を付けない)
+ * ため、名前が省略できる変種を足すことになり、凍結名の組み立てと衝突検査が複雑になる。
+ *
+ * `name-only` は**割り当て済みの名前だけが残っている**状態である。投稿が編集されて世代が
+ * 変わったとき、新しい世代に現れなかったアセットの実績はここへ落とす。
+ * 「保存できたか」は世代ごとの状態だが、**一度割り当てた archive 名は世代をまたいで保つ**
+ * 必要がある (変えると過去の ZIP と同じアセットを同定できなくなる)。
+ * `written` ではないので省略条件は満たさない。
+ */
+export type SavedAssetOutcome = 'written' | 'failed' | 'name-only';
+
+/**
+ * 保存実績のアセット 1 件。
+ *
+ * **保存元 (`zipName`) と保存時刻 (`savedAt`) はアセットごとに持つ。** 同じ投稿の一部だけを
+ * 別の ZIP で取り直せるので、投稿側にまとめると「ZIP A で書いたアセット」が「ZIP B で書いた」
+ * ことになってしまう。拡張が主張してよいのは実際に確認した書き込みだけである。
+ */
+export type SavedAsset = {
+  readonly kind: HistoryAssetKind;
+  /** cover は持たない */
+  readonly assetId?: string;
+  /** 投稿ディレクトリからの相対名。凍結名として次回の allocator に渡す */
+  readonly archiveName: string;
+  readonly outcome: SavedAssetOutcome;
+  /** この結果を出した ZIP のファイル名 */
+  readonly zipName: string;
+  /** この結果を出した ZIP の書き込みを終えた時刻 (epoch ms) */
+  readonly savedAt: number;
+};
+
+/** 保存実績の投稿 1 件 */
+export type SavedPost = {
+  readonly postId: string;
+  /** 投稿ディレクトリ名。凍結名として次回の allocator に渡す */
+  readonly archiveDirectory: string;
+  /**
+   * 保存した時点の `updatedDatetime`。
+   * これが今回の一覧の値と違えば投稿が編集されているので、過去の保存実績は使えない。
+   */
+  readonly revision: string | null;
+  /** 保存した時点の `ARCHIVE_FORMAT_VERSION`。違えば過去の ZIP は別の場所に入っている */
+  readonly archiveFormatVersion: number;
+  /**
+   * この実績を出した ZIP の書き込みを終えた時刻 (epoch ms)。
+   *
+   * アセット側の `savedAt` の最大値では代用できない。**本文だけの投稿はアセットを 1 つも
+   * 持たない**ので、最大値が常に 0 になり世代の新旧を比べられなくなる (編集後の実績が
+   * 古い実績を更新できず、その投稿の差分判定が永久に成立しない)。
+   * 作るときは同じ ZIP の全アセットと同じ値を入れるので、アセット側と食い違わない。
+   */
+  readonly savedAt: number;
+  readonly assets: readonly SavedAsset[];
+};
+
+/**
+ * 一覧の走査の実績。
+ *
+ * 全ページを完走していない scan、件数の上限が付いた scan、ページの取得に失敗した scan では、
+ * 一覧から消えた投稿を削除として扱ってはいけない。その判断材料になる。
+ */
+export type ScanRecord = {
+  /** 全ページを走査し終えたか */
+  readonly completedFullScan: boolean;
+  readonly failedPageCount: number;
+  /** 打ち切った理由 (`CollectResult.stoppedReason`)。完走したなら null */
+  readonly stoppedReason: string | null;
+  /** 取得件数の上限が付いていたか */
+  readonly limited: boolean;
+  readonly scannedAt: number;
+};
+
+/** creator 1 件ぶんの履歴 */
+export type CreatorHistory = {
+  readonly schemaVersion: number;
+  readonly creatorId: string;
+  /** LRU 破棄の順序に使う */
+  readonly lastUsedAt: number;
+  readonly catalog: readonly CatalogPost[];
+  readonly saved: readonly SavedPost[];
+  readonly scan: ScanRecord | null;
+};
+
+/**
+ * content script が service worker へ送る差分。
+ *
+ * **creator レコード全体ではなく差分を送る。** 全体を送って上書きすると、同じ creator を
+ * 2 タブで開いたときに片方の更新が他方を丸ごと巻き戻す。
+ * 時刻は送る側が刻む。service worker 側で `Date.now()` を読むと、同じ差分の再送で結果が変わる。
+ */
+export type CreatorHistoryUpdate = {
+  readonly creatorId: string;
+  /** この更新の時刻 (epoch ms)。`lastUsedAt` に反映する */
+  readonly at: number;
+  /** postId 単位で upsert する */
+  readonly catalog?: readonly CatalogPost[];
+  /** postId 単位で upsert する (revision・版・投稿ディレクトリが一致すればアセットをマージ、違えば置換) */
+  readonly saved?: readonly SavedPost[];
+  /** より新しい `scannedAt` のときだけ置き換える */
+  readonly scan?: ScanRecord;
+};
+
+/** 空の履歴 */
+export function emptyCreatorHistory(creatorId: string, at: number): CreatorHistory {
+  return { schemaVersion: HISTORY_SCHEMA_VERSION, creatorId, lastUsedAt: at, catalog: [], saved: [], scan: null };
+}
+
+/** アセットを投稿内で同定する鍵。`kind` と `assetId` の組が identity である */
+function assetIdentity(asset: { readonly kind: HistoryAssetKind; readonly assetId?: string }): string {
+  return asset.kind === 'cover' ? 'cover' : `${asset.kind}:${asset.assetId ?? ''}`;
+}
+
+/**
+ * 凍結名として使ったときに衝突する組が無いことを確かめる。
+ *
+ * **単体で使える名前でも、組にすると衝突する。** `same.png` と `SAME.PNG` はどちらも
+ * パスセグメントとして正しいが、Windows と既定の macOS では同じファイルを指す。
+ * allocator は凍結名を受け取った時点でこれを例外にするので、通してしまうと
+ * **破損した履歴が次のダウンロードごと止める**。
+ *
+ * 別々の差分がマージされて初めて衝突する組もあるため、復号時とマージ後の両方で確かめる。
+ * @throws {Error} 衝突する組がある場合
+ */
+function assertNoArchiveNameCollision(saved: readonly SavedPost[]): void {
+  const directories = new Set<string>();
+  for (const post of saved) {
+    const directoryKey = toCollisionKey(post.archiveDirectory);
+    if (directories.has(directoryKey)) {
+      throw new Error(`凍結名の投稿ディレクトリが衝突しています (${JSON.stringify(post.archiveDirectory)})`);
+    }
+    directories.add(directoryKey);
+    const names = new Set<string>();
+    for (const asset of post.assets) {
+      const nameKey = toCollisionKey(asset.archiveName);
+      if (names.has(nameKey)) {
+        throw new Error(
+          `凍結名のアセットが投稿の中で衝突しています (${post.postId}: ${JSON.stringify(asset.archiveName)})`,
+        );
+      }
+      names.add(nameKey);
+    }
+  }
+}
+
+/** 同じ鍵が 2 度現れるか */
+function hasDuplicate<T>(items: readonly T[], keyOf: (item: T) => string): boolean {
+  const seen = new Set<string>();
+  for (const item of items) {
+    const key = keyOf(item);
+    if (seen.has(key)) return true;
+    seen.add(key);
+  }
+  return false;
+}
+
+/**
+ * 差分の中に同じ postId・同じアセット identity が 2 度現れないことを確かめる。
+ *
+ * **重複があると upsert の結果が適用回数に依存する** (既存に無いうちは先に現れた方が残り、
+ * 既に取り込まれた後は後に現れた方で置き換わる)。冪等でなくなるので、曖昧な入力は受け取らない。
+ * 収集は `collector.ts` の `seenPostIds` で投稿の重複を除いているので、ここに重複が来るのは
+ * 組み立て側の不具合であり、黙って片方を採るより失敗させる方が実態に合う。
+ */
+function assertNoDuplicates(update: CreatorHistoryUpdate): void {
+  if (hasDuplicate(update.catalog ?? [], (post) => post.postId)) {
+    throw new Error('履歴の差分に同じ postId のカタログが複数あります');
+  }
+  if (hasDuplicate(update.saved ?? [], (post) => post.postId)) {
+    throw new Error('履歴の差分に同じ postId の保存実績が複数あります');
+  }
+  for (const post of update.catalog ?? []) {
+    if (hasDuplicate(post.assets, assetIdentity)) {
+      throw new Error(`履歴の差分に同じアセットが複数あります (カタログ ${post.postId})`);
+    }
+  }
+  for (const post of update.saved ?? []) {
+    if (hasDuplicate(post.assets, assetIdentity)) {
+      throw new Error(`履歴の差分に同じアセットが複数あります (保存実績 ${post.postId})`);
+    }
+  }
+}
+
+/**
+ * postId をキーに upsert し、既存の並びを保ったまま新しいものを末尾に足す。
+ * 並びを保つのは、同じ入力に対して同じレコードが出るようにするため (差分の再送で内容が揺れない)。
+ *
+ * 双方に postId の重複が無いことが前提である (`assertNoDuplicates` と `decodeCreatorHistory` が保証する)。
+ */
+function upsertByPostId<T extends { readonly postId: string }>(
+  current: readonly T[],
+  incoming: readonly T[],
+  merge: (existing: T, next: T) => T,
+): readonly T[] {
+  if (incoming.length === 0) return current;
+  const byPostId = new Map(incoming.map((item) => [item.postId, item]));
+  const result: T[] = [];
+  const consumed = new Set<string>();
+  for (const existing of current) {
+    const next = byPostId.get(existing.postId);
+    if (next === undefined) {
+      result.push(existing);
+      continue;
+    }
+    consumed.add(existing.postId);
+    result.push(merge(existing, next));
+  }
+  for (const item of incoming) {
+    if (consumed.has(item.postId)) continue;
+    result.push(item);
+  }
+  return result;
+}
+
+/**
+ * 2 つの保存実績が同じ投稿の同じ状態を指しているか。
+ *
+ * revision (= 保存時の `updatedDatetime`)・`ARCHIVE_FORMAT_VERSION`・投稿ディレクトリ名が
+ * すべて一致するときだけ同じ世代とみなす。
+ *
+ * **`revision` が `null` 同士は同じ世代とみなす。** `null` は「更新時刻を取得できなかった」で、
+ * 同じ状態であるとは言えない。それでもマージするのは、置換にすると単一投稿モードの保存が
+ * 過去に割り当てた凍結名を消してしまうためである。誤った省略には繋がらない —
+ * 省略は `saved.revision` が今回の一覧の値 (非 null) と一致することを要求するので、
+ * `null` の実績はどう積んでも省略を成立させない。
+ */
+function isSameGeneration(existing: SavedPost, next: SavedPost): boolean {
+  return (
+    existing.revision === next.revision &&
+    existing.archiveFormatVersion === next.archiveFormatVersion &&
+    existing.archiveDirectory === next.archiveDirectory
+  );
+}
+
+/**
+ * 世代の違う 2 つの実績から、残す方と捨てる方を決める。
+ *
+ * `revision` の分かっている方を優先する。`null` は「更新時刻を取得できなかった」で、
+ * 突き合わせに使えない (省略は非 `null` の一致を要求する)。
+ * どちらも分かっている・どちらも `null` なら新しい方を採る。同値では既存を残す —
+ * `>=` にすると、同じミリ秒に終わった別世代の古い差分を再送しただけで実績が入れ替わる。
+ */
+function pickGeneration(existing: SavedPost, next: SavedPost): [winner: SavedPost, loser: SavedPost] {
+  if (existing.revision !== null && next.revision === null) return [existing, next];
+  if (existing.revision === null && next.revision !== null) return [next, existing];
+  return next.savedAt > existing.savedAt ? [next, existing] : [existing, next];
+}
+
+/**
+ * 残す実績へ、捨てる方にしか無いアセットの**名前だけ**を引き継ぐ。
+ *
+ * 「保存できたか」は世代ごとの状態だが、**一度割り当てた archive 名は世代をまたいで保つ**。
+ * 引き継がないと、投稿が編集された回に選ばなかったアセットの名前が失われ、次に選んだときに
+ * 編集後の元名から採番し直される (過去の ZIP と同じアセットを同定できなくなる)。
+ *
+ * 引き継いだ側は `name-only` にする。前の世代で書けたことは、今の世代で書けたことを意味しない。
+ * `zipName` と `savedAt` はその名前を割り当てた実行のものを残す (事実と食い違わせない)。
+ */
+function carryOverNames(loser: SavedPost, winner: SavedPost): SavedPost {
+  // 採番規則が変わっていれば引き継がない。前の規則で決めた名前を新しい規則の記録に混ぜると、
+  // `buildFrozenArchiveNames` が版で選り分けたつもりの名前に旧規則のものが紛れる
+  if (loser.archiveFormatVersion !== winner.archiveFormatVersion) return winner;
+  const byIdentity = new Map(winner.assets.map((asset) => [assetIdentity(asset), asset]));
+  let changed = false;
+  for (const asset of loser.assets) {
+    const identity = assetIdentity(asset);
+    const current = byIdentity.get(identity);
+    // 勝った世代の結果 (written / failed) が今の名前である。名前だけの記録で上書きしない
+    if (current !== undefined && current.outcome !== 'name-only') continue;
+    // どちらも名前だけなら、後から割り当てた方を残す。**先に入っていた方を無条件に採ると、
+    // 3 世代以上で結果が到着順に依存する** (古い世代が先に届いた回だけ古い名前が残る)
+    if (current !== undefined && current.savedAt >= asset.savedAt) continue;
+    byIdentity.set(identity, { ...asset, outcome: 'name-only' });
+    changed = true;
+  }
+  // 並びは Map の挿入順 (勝った世代のアセット → 引き継いだ名前) になる。
+  // 既にある identity を置き換えても位置は動かないので、同じ入力なら同じ並びになる
+  return changed ? { ...winner, assets: [...byIdentity.values()] } : winner;
+}
+
+/**
+ * 同じ投稿のカタログが 2 つあるとき、どちらを残すか決める。
+ *
+ * **新しい観測 (`observedAt` が大きい方) を残す。** 到着順で決めると、遅れて届いた古い観測が
+ * 新しい観測を巻き戻す。
+ *
+ * 同じ時刻なら `complete` を両方が true のときだけ残す。同時刻に別の内容が観測されるのは
+ * 想定していないが、そのときは `post.info` を取り直させる方が安全である。
+ */
+function mergeCatalogPost(existing: CatalogPost, next: CatalogPost): CatalogPost {
+  if (next.observedAt !== existing.observedAt) return next.observedAt > existing.observedAt ? next : existing;
+  // 内容が同じでも `complete` は論理積にする。`next` をそのまま返すと、衝突で false に倒した
+  // 直後に同じ差分を再送しただけで `complete: true` が復活する (冪等でなくなる)
+  if (catalogFingerprint(existing) === catalogFingerprint(next)) {
+    return { ...next, complete: existing.complete && next.complete };
+  }
+  // 同時刻に別の内容が観測されている。どちらが正しいか決められないので、`post.info` を
+  // 取り直させる。`complete` を両方の論理積にするだけでは足りない — 両方が complete でも
+  // アセットの構成が違えば、片方を採った時点で存在するアセットを見失う
+  return { ...next, complete: false };
+}
+
+/**
+ * カタログの内容が同じかを比べるための正規形。
+ *
+ * `complete` と `observedAt` は含めない (それらは比べる側が扱う)。
+ * アセットは identity で並べ替える。観測ごとに並びが違っても内容が同じなら同じとみなすため。
+ */
+function catalogFingerprint(post: CatalogPost): string {
+  const assets = [...post.assets]
+    .map((asset) => [assetIdentity(asset), asset.originalName, asset.extension, asset.size ?? null] as const)
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return JSON.stringify([post.updatedDatetime, post.title, post.publishedDatetime, assets]);
+}
+
+/**
+ * 走査実績が 2 つあるとき、どちらを残すか決める。
+ *
+ * 新しい方を残し、時刻が同じで食い違うなら「完走していない」方に倒す。
+ * 一覧から消えた投稿を削除として扱ってよいかの判断材料なので、誤って「完走した」に
+ * 倒すと欠落を削除と誤認する。
+ */
+function pickScan(existing: ScanRecord | null, next: ScanRecord | undefined): ScanRecord | null {
+  if (next === undefined) return existing;
+  if (existing === null || next.scannedAt > existing.scannedAt) return next;
+  if (next.scannedAt < existing.scannedAt) return existing;
+  return next.completedFullScan ? existing : next;
+}
+
+/**
+ * 同じアセットの結果が 2 つあるとき、どちらを残すか決める。
+ *
+ * **新しい方 (`savedAt` が大きい方) を残す。** 到着順で決めると、遅れて届いた古い差分が
+ * 新しい結果を巻き戻す。`written` から `failed` へ落ちる向きも許す — 履歴が欠けて
+ * 再ダウンロードになるのは安全側だからである。
+ *
+ * 時刻が同じなら `written` でない方を残す。同じ時刻に別の結果が 2 つ出るのは想定していないが、
+ * 決め方を残しておかないと結果が入力の並びに依存する。
+ */
+function preferSavedAsset(existing: SavedAsset, next: SavedAsset): SavedAsset {
+  if (next.savedAt !== existing.savedAt) return next.savedAt > existing.savedAt ? next : existing;
+  if (existing.outcome === 'written' && next.outcome !== 'written') return next;
+  if (next.outcome === 'written' && existing.outcome !== 'written') return existing;
+  return next;
+}
+
+/**
+ * 同じ投稿の保存実績を統合する。
+ *
+ * 同じ世代 (`isSameGeneration`) のときだけアセットをマージする。前回失敗した対象だけを
+ * 再試行したときに、前回成功した対象の実績を失わないためである。
+ * 世代が違えば過去の実績は使えないので、新しい方の世代だけを残す。
+ */
+function mergeSavedPost(existing: SavedPost, next: SavedPost): SavedPost {
+  // **世代の分からない実績は、分かっている実績を置き換えない。** 単一投稿モードや
+  // `updatedDatetime` を読めなかった収集は `revision: null` になる。これを新しい方として
+  // 採ると、過去に割り当てた凍結名と保存実績が消え、次の ZIP でその投稿のアセットが
+  // 別の名前に付け替わる (複数の ZIP をまたいで同じ投稿を同定できなくなる)。
+  // 落ちるのは今回の保存の記録だけで、次回はその投稿を取り直すことになる (安全側)
+  if (!isSameGeneration(existing, next)) {
+    // 世代が違えばマージできない。勝つ世代を決めたうえで、負けた側にしか無い名前を引き継ぐ。
+    // **勝敗と名前の引き継ぎを分ける。** 一緒にすると、新しい世代が先に届いて古い差分が
+    // 遅れて着いたときだけ名前が失われる (到着順で結果が変わる)
+    const [winner, loser] = pickGeneration(existing, next);
+    return carryOverNames(loser, winner);
+  }
+  const byIdentity = new Map(next.assets.map((asset) => [assetIdentity(asset), asset]));
+  const assets: SavedAsset[] = [];
+  const consumed = new Set<string>();
+  for (const asset of existing.assets) {
+    const identity = assetIdentity(asset);
+    const replacement = byIdentity.get(identity);
+    if (replacement === undefined) {
+      assets.push(asset);
+      continue;
+    }
+    consumed.add(identity);
+    assets.push(preferSavedAsset(asset, replacement));
+  }
+  for (const asset of next.assets) {
+    if (consumed.has(assetIdentity(asset))) continue;
+    assets.push(asset);
+  }
+  // 同じ世代をマージしたら、新しい方の時刻を採る。古い差分の再送で時刻が巻き戻ると、
+  // その後に届いた別世代の実績との比較が狂う
+  return { ...next, savedAt: Math.max(existing.savedAt, next.savedAt), assets };
+}
+
+/**
+ * 差分を適用した新しい履歴を返す。入力は変更しない。
+ *
+ * **冪等である。** 同じ差分を 2 回適用しても結果は変わらない (postId とアセットの identity で
+ * upsert し、時刻は新しい方を採るため)。service worker は応答の直前に停止しうるので、
+ * content script が同じ差分を送り直す経路がある。
+ *
+ * @throws {Error} 差分の中に同じ postId・同じアセットが複数ある場合
+ */
+export function mergeCreatorHistory(current: CreatorHistory | null, update: CreatorHistoryUpdate): CreatorHistory {
+  assertNoDuplicates(update);
+  const base = current ?? emptyCreatorHistory(update.creatorId, update.at);
+  const saved = upsertByPostId(base.saved, update.saved ?? [], mergeSavedPost);
+  // マージで初めて衝突する組があるので、ここでも確かめる。例外にすれば書き込みが失敗し、
+  // 既存の履歴はそのまま残る (壊れた組を保存して次回を止めるより良い)
+  assertNoArchiveNameCollision(saved);
+  return {
+    schemaVersion: HISTORY_SCHEMA_VERSION,
+    creatorId: update.creatorId,
+    lastUsedAt: Math.max(base.lastUsedAt, update.at),
+    catalog: upsertByPostId(base.catalog, update.catalog ?? [], mergeCatalogPost),
+    saved,
+    scan: pickScan(base.scan, update.scan),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function optionalString(value: unknown): string | null | undefined {
+  if (value === null) return null;
+  return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * `updatedDatetime` と、それを写した `revision` を復号する。
+ *
+ * **空文字と空白だけの文字列は `null` ではなく復号失敗にする。** `null` (取得できなかった) として
+ * 通すと安全側に見えるが、それでは「値が壊れている」ことに気付けない。失敗にすれば履歴ごと
+ * 捨てられ、再ダウンロードになる。
+ * そのまま既知の revision として通してはいけない — 編集の前後がどちらも空文字なら
+ * `isSameGeneration` が同じ世代と判定し、`revision` が `null` 同士を別世代にした意味が失われる。
+ *
+ * 日時としての形式までは検証しない。値は突き合わせにしか使わない不透明な文字列であり
+ * (Issue #56)、FANBOX が形式を変えたときに全 creator の履歴が一斉に読めなくなる代償に見合わない。
+ */
+function decodeRevision(value: unknown): string | null | undefined {
+  const decoded = optionalString(value);
+  if (decoded === undefined) return undefined;
+  if (decoded === null) return null;
+  return decoded.trim() === '' ? undefined : decoded;
+}
+
+/** 非負の安全な整数か */
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function decodeAssetKind(value: unknown): HistoryAssetKind | undefined {
+  return value === 'cover' || value === 'image' || value === 'file' ? value : undefined;
+}
+
+/**
+ * `kind` と `assetId` の組を復号する。
+ * cover は `assetId` を持ってはならず、それ以外は非空の `assetId` が要る
+ * (identity が壊れたレコードを通すと、別のアセットを同一視しうる)。
+ */
+function decodeAssetIdentity(source: Record<string, unknown>): { kind: HistoryAssetKind; assetId?: string } | null {
+  const kind = decodeAssetKind(source.kind);
+  if (kind === undefined) return null;
+  if (kind === 'cover') return source.assetId === undefined ? { kind } : null;
+  return typeof source.assetId === 'string' && source.assetId !== '' ? { kind, assetId: source.assetId } : null;
+}
+
+function decodeHistoryAsset(value: unknown): HistoryAsset | null {
+  if (!isRecord(value)) return null;
+  const identity = decodeAssetIdentity(value);
+  if (identity === null) return null;
+  if (typeof value.originalName !== 'string' || typeof value.extension !== 'string') return null;
+  if (value.size !== undefined && !isCount(value.size)) return null;
+  const asset: HistoryAsset = { ...identity, originalName: value.originalName, extension: value.extension };
+  return value.size === undefined ? asset : { ...asset, size: value.size };
+}
+
+function decodeCatalogPost(value: unknown): CatalogPost | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.postId !== 'string' || value.postId === '') return null;
+  const updatedDatetime = decodeRevision(value.updatedDatetime);
+  const publishedDatetime = optionalString(value.publishedDatetime);
+  if (updatedDatetime === undefined || publishedDatetime === undefined) return null;
+  if (typeof value.title !== 'string' || typeof value.complete !== 'boolean') return null;
+  if (!isCount(value.observedAt)) return null;
+  const assets = decodeArray(value.assets, decodeHistoryAsset);
+  if (assets === null || hasDuplicate(assets, assetIdentity)) return null;
+  return {
+    postId: value.postId,
+    observedAt: value.observedAt,
+    updatedDatetime,
+    title: value.title,
+    publishedDatetime,
+    complete: value.complete,
+    assets,
+  };
+}
+
+function decodeSavedAsset(value: unknown): SavedAsset | null {
+  if (!isRecord(value)) return null;
+  const identity = decodeAssetIdentity(value);
+  if (identity === null) return null;
+  // 凍結名として allocator に渡るので、allocator が受け付けない名前はここで弾く。
+  // 通してしまうと allocator が例外を投げ、破損した履歴が次のダウンロードごと止める
+  if (typeof value.archiveName !== 'string' || describeUnusableSegment(value.archiveName) !== null) return null;
+  const outcome = value.outcome;
+  if (outcome !== 'written' && outcome !== 'failed' && outcome !== 'name-only') return null;
+  if (typeof value.zipName !== 'string' || value.zipName === '' || !isCount(value.savedAt)) return null;
+  return { ...identity, archiveName: value.archiveName, outcome, zipName: value.zipName, savedAt: value.savedAt };
+}
+
+function decodeSavedPost(value: unknown): SavedPost | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.postId !== 'string' || value.postId === '') return null;
+  if (typeof value.archiveDirectory !== 'string' || describeUnusableSegment(value.archiveDirectory) !== null) {
+    return null;
+  }
+  const revision = decodeRevision(value.revision);
+  if (revision === undefined) return null;
+  if (!isCount(value.archiveFormatVersion) || !isCount(value.savedAt)) return null;
+  const assets = decodeArray(value.assets, decodeSavedAsset);
+  if (assets === null || hasDuplicate(assets, assetIdentity)) return null;
+  return {
+    postId: value.postId,
+    archiveDirectory: value.archiveDirectory,
+    revision,
+    archiveFormatVersion: value.archiveFormatVersion,
+    savedAt: value.savedAt,
+    assets,
+  };
+}
+
+function decodeScanRecord(value: unknown): ScanRecord | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.completedFullScan !== 'boolean' || typeof value.limited !== 'boolean') return null;
+  if (!isCount(value.failedPageCount) || !isCount(value.scannedAt)) return null;
+  const stoppedReason = optionalString(value.stoppedReason);
+  if (stoppedReason === undefined) return null;
+  // 打ち切りの理由は収集側の語彙に限る。未知の値を通すと、意味の分からない理由を根拠に
+  // 「完走していない」の判断が変わりうる (未知の理由が増えたら版を上げる)
+  if (stoppedReason !== null && stoppedReason !== 'rate-limit-exhausted' && stoppedReason !== 'transport-exhausted') {
+    return null;
+  }
+  // 「完走した」と「打ち切った・落ちたページがある・件数上限が付いた」は両立しない。
+  // 矛盾した実績を通すと、後段が一覧から消えた投稿を削除と誤認しうる
+  if (value.completedFullScan && (value.failedPageCount !== 0 || stoppedReason !== null || value.limited)) {
+    return null;
+  }
+  return {
+    completedFullScan: value.completedFullScan,
+    failedPageCount: value.failedPageCount,
+    stoppedReason,
+    limited: value.limited,
+    scannedAt: value.scannedAt,
+  };
+}
+
+/** 1 件でも復号できなければ配列全体を捨てる (欠けた配列を「これで全部」と扱わないため) */
+function decodeArray<T>(value: unknown, decode: (item: unknown) => T | null): readonly T[] | null {
+  if (!Array.isArray(value)) return null;
+  const decoded: T[] = [];
+  for (const item of value) {
+    const one = decode(item);
+    if (one === null) return null;
+    decoded.push(one);
+  }
+  return decoded;
+}
+
+/**
+ * 保存されている値を履歴として復号する。読めなければ null を返す。
+ *
+ * **読めない値は「履歴が無い」に倒す。** 壊れた記録や古い版を部分的に信じると、実際には保存して
+ * いない対象を「前回保存済み」として飛ばしうる。無いものとして扱えば再ダウンロードになるだけである。
+ *
+ * `expectedCreatorId` を必ず突き合わせる。キーと中身がずれたレコード (壊れた記録、書き込み先の
+ * 取り違え) をそのまま返すと、**別の creator の保存実績を今の creator のものとして扱う**。
+ * postId とアセットの identity が一致すれば、保存していないアセットを保存済みと判定しうる。
+ *
+ * postId とアセットの重複も拒否する。重複があると upsert の結果が適用回数に依存し、冪等でなくなる。
+ * @param value 保存されている値
+ * @param expectedCreatorId このレコードが属するはずの creator (キーから求めたもの)
+ */
+export function decodeCreatorHistory(value: unknown, expectedCreatorId: string): CreatorHistory | null {
+  if (!isRecord(value)) return null;
+  if (value.schemaVersion !== HISTORY_SCHEMA_VERSION) return null;
+  if (typeof value.creatorId !== 'string' || value.creatorId !== expectedCreatorId) return null;
+  if (!isCount(value.lastUsedAt)) return null;
+  const catalog = decodeArray(value.catalog, decodeCatalogPost);
+  const saved = decodeArray(value.saved, decodeSavedPost);
+  if (catalog === null || saved === null) return null;
+  if (hasDuplicate(catalog, (post) => post.postId) || hasDuplicate(saved, (post) => post.postId)) return null;
+  // 凍結名として使えない組は履歴ごと捨てる。復号は「読めなければ履歴が無い」に倒す契約なので、
+  // ここでは例外にしない
+  try {
+    assertNoArchiveNameCollision(saved);
+  } catch {
+    return null;
+  }
+  const scan = value.scan === null ? null : decodeScanRecord(value.scan);
+  if (value.scan !== null && scan === null) return null;
+  return {
+    schemaVersion: HISTORY_SCHEMA_VERSION,
+    creatorId: value.creatorId,
+    lastUsedAt: value.lastUsedAt,
+    catalog,
+    saved,
+    scan,
+  };
+}
+
+/**
+ * 保存されている 1 エントリが占める容量の見積もり (UTF-8 バイト数)。
+ *
+ * `chrome.storage.local` の課金単位はキーと JSON 文字列の長さなので、それをそのまま数える。
+ * `getBytesInUse` を使わないのは、キーごとの内訳を得るには 1 キーずつ往復する必要があるためである。
+ * 厳密な一致は要らない (上限に余裕を取ってある)。
+ */
+export function estimateEntryBytes(key: string, value: unknown): number {
+  return new TextEncoder().encode(key + JSON.stringify(value ?? null)).length;
+}
+
+/**
+ * content script から service worker へ送るメッセージ。
+ *
+ * **書き込みだけが service worker を経由する。** 読み出しは content script が
+ * `chrome.storage.local` を直接引く (`get` は atomic なので書き込み途中の状態は見えない)。
+ * 読みまで往復にすると、収集の入口で service worker の起動待ちが入る。
+ */
+export type HistoryMessage =
+  | { readonly type: 'historyApply'; readonly update: CreatorHistoryUpdate }
+  | { readonly type: 'historyRemove'; readonly creatorId: string }
+  | { readonly type: 'historyRead'; readonly creatorId: string };
+
+/**
+ * service worker の応答。
+ *
+ * 失敗を握りつぶさないのは、「ZIP は保存したが履歴の更新に失敗した」を利用者に表示するため。
+ * `history` は `historyRead` のときだけ入る (復号前の値なので、受け取った側で復号する)。
+ */
+export type HistoryResponse = { readonly ok: boolean; readonly error?: string; readonly history?: unknown };
+
+/**
+ * 受け取った値を差分として復号する。読めなければ null。
+ *
+ * **ワイヤ境界では TypeScript の型が保証にならない。** ここで完全に復号しておくことで、
+ * 保存されるレコードが構築の時点で常に整った形になる。緩く通して `decodeCreatorHistory` の
+ * 側で弾く形にすると、書き込みは成功したのに次回の読み出しで履歴ごと捨てることになる。
+ */
+export function decodeCreatorHistoryUpdate(value: unknown): CreatorHistoryUpdate | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.creatorId !== 'string' || value.creatorId === '') return null;
+  if (!isCount(value.at)) return null;
+  const update: {
+    creatorId: string;
+    at: number;
+    catalog?: readonly CatalogPost[];
+    saved?: readonly SavedPost[];
+    scan?: ScanRecord;
+  } = { creatorId: value.creatorId, at: value.at };
+  if (value.catalog !== undefined) {
+    const catalog = decodeArray(value.catalog, decodeCatalogPost);
+    if (catalog === null) return null;
+    update.catalog = catalog;
+  }
+  if (value.saved !== undefined) {
+    const saved = decodeArray(value.saved, decodeSavedPost);
+    if (saved === null) return null;
+    update.saved = saved;
+  }
+  if (value.scan !== undefined) {
+    const scan = decodeScanRecord(value.scan);
+    if (scan === null) return null;
+    update.scan = scan;
+  }
+  return update;
+}
+
+/**
+ * 受け取ったメッセージを履歴の書き込み要求として復号する。読めなければ null。
+ *
+ * `creatorId` を欠いた `historyRemove` をそのまま通すと `fbdlHistory:undefined` を消しにいく
+ * (`undefined` という creatorId の履歴を実際に消しうる)。
+ */
+export function decodeHistoryMessage(message: unknown): HistoryMessage | null {
+  if (!isRecord(message)) return null;
+  if (message.type === 'historyRemove' || message.type === 'historyRead') {
+    return typeof message.creatorId === 'string' && message.creatorId !== ''
+      ? { type: message.type, creatorId: message.creatorId }
+      : null;
+  }
+  if (message.type !== 'historyApply') return null;
+  const update = decodeCreatorHistoryUpdate(message.update);
+  return update === null ? null : { type: 'historyApply', update };
+}

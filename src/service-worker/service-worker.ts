@@ -1,5 +1,5 @@
 import { MEDIA_PORT_NAME, type MediaStreamRequest } from '../media-stream-protocol';
-import { handleFetchApi } from './handlers';
+import { handleFetchApi, handleHistoryMessage } from './handlers';
 import { streamMedia } from './media-stream';
 import { trackMediaStreamForTest, wrapMediaStreamDepsForTest } from './test-hooks';
 
@@ -33,6 +33,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     handleFetchApi(message.url)
       .then(sendResponse)
       .catch((e) => sendResponse({ ok: false, status: 0, retryAfter: null, error: String(e), backoffUntil: 0 }));
+    return true;
+  }
+  // 履歴の書き込みと、差分判定に使う読み出し (Issue #56)。
+  // 書き込みを service worker に集めるのはタブをまたぐ read-modify-write を単一スレッドの
+  // 直列キューで守るためで、差分判定の読み出しを通すのは削除との順序を守るためである
+  // (設定画面の表示用の読み出しは content script が storage を直接引く)。
+  if (message.type === 'historyApply' || message.type === 'historyRemove' || message.type === 'historyRead') {
+    handleHistoryMessage(message)
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true;
   }
 });

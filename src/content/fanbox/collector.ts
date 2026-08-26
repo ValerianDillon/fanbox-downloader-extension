@@ -5,11 +5,15 @@ import {
   DownloadManage,
   type PostListItemCandidate,
 } from 'download-helper/fanbox-collector';
-import { createPostIdArchivePathAllocator } from '../archive-path';
+
+import type { CreatorHistory } from '../../history-record';
+import { canSkipPostInfo, prepareHistoryPlan } from '../history-plan';
 import {
   ApiSession,
   ApiShapeError,
   DEFAULT_API_RATE_LIMIT_MS,
+  decodeListedUpdatedDatetime,
+  decodePostInfoUpdatedDatetime,
   HttpError,
   RateLimitExhaustedError,
   ResponseParseError,
@@ -69,6 +73,44 @@ export type CollectResult = {
    * 打ち切った場合もそこまでに集めた分は捨てず、不完全と明示したうえで保存できるようにする。
    */
   stoppedReason?: 'rate-limit-exhausted' | 'transport-exhausted';
+  /**
+   * 一覧が返した `updatedDatetime` (postId → 検証済みの値、読めなければ null)。
+   *
+   * 差分判定にしか使わない最適化の情報である (Issue #56)。一覧に現れた投稿はすべて入る
+   * (取り込めなかった投稿も含む) — 次回この値と突き合わせるのは一覧の走査だけで済ませたいため。
+   */
+  listedRevisions: ReadonlyMap<string, string | null>;
+  /**
+   * 履歴を根拠に `post.info` を省いた投稿 (Issue #56)。
+   *
+   * 取りこぼしではないので失敗には数えない。今回の ZIP には含まれない (差分 ZIP は
+   * 独立した追加バッチであって、展開先に適用するパッチではない)。
+   */
+  skippedByHistoryPostIds: ReadonlySet<string>;
+  /**
+   * `post.info` の取得が HttpError で終わった投稿。
+   * 「前回失敗した分だけ再試行する」の対象になる。件数ではなく集合で持つ理由は
+   * `PostFailureCounts.apiFailed` のコメントを参照。
+   */
+  apiFailedPostIds: ReadonlySet<string>;
+  /**
+   * 収集を終えた時刻 (epoch ms)。
+   *
+   * 履歴に載せる観測時刻はこれを使う。保存時刻で代用すると、review 画面での選択に時間を
+   * かけただけで観測が新しく見え、遅れて保存した古い観測が新しい観測を上書きしうる。
+   */
+  collectedAt: number;
+  /** creator 全体の走査だったか。単一投稿モードなら false で、走査実績を記録してはいけない */
+  scannedCreator: boolean;
+  /** 投稿一覧の全ページを走査し終えたか。打ち切り・件数上限・中断で止まっていれば false */
+  completedFullScan: boolean;
+  /**
+   * 件数の上限に達して一覧の走査を打ち切ったか。
+   *
+   * 「上限を設定したか」ではない。設定しても達しなければ一覧は全部見ているので、
+   * 一覧から消えた投稿の判断材料としては完走と変わらない。
+   */
+  limited: boolean;
 };
 
 export type ProgressCallback = (current: number, total: number) => void;
@@ -127,12 +169,37 @@ function applyAddResult(result: AddPostResult, counts: PostFailureCounts): AddOu
   }
 }
 
+/**
+ * 一覧要素のうち、`post.info` を発行せずに結果を決めるのに使う値をまとめた指紋。
+ *
+ * 同じ投稿が一覧に 2 回現れたとき、この指紋が変わっていれば走査の途中で投稿が変わっている。
+ * `updatedDatetime` だけを見ると、公開範囲や料金だけが変わった場合を取りこぼす。
+ */
+function listFingerprint(revision: string | null, post: PostListItemCandidate): string {
+  return JSON.stringify([revision, post.feeRequired, post.isRestricted]);
+}
+
+/**
+ * 投稿を収集する。
+ * @param creatorId 対象の creator
+ * @param postId 指定すると単一投稿モードになる
+ * @param settings 収集の設定
+ * @param onProgress 進捗の通知
+ * @param signal 中断
+ * @param history 差分ダウンロードの履歴 (Issue #56)。凍結名は `skipPreviouslySaved` に
+ *   関わらずこれを使う
+ * @param skipPreviouslySaved 前回保存済みの投稿の `post.info` を省くか。
+ *   `false` にすると全件を取得するが、**凍結名は据え置く** — 「再取得する」と
+ *   「過去に割り当てた名前を忘れる」は別の要求である
+ */
 export async function collect(
   creatorId: string,
   postId: string | undefined,
   settings: CollectorSettings,
   onProgress: ProgressCallback,
   signal: AbortSignal,
+  history?: CreatorHistory | null,
+  skipPreviouslySaved = true,
 ): Promise<CollectResult> {
   // レート制限の状態は収集ごとに持つ。前回引き上がった間隔を次の収集に持ち越さない
   const api = new ApiSession(settings.apiIntervalMs ?? DEFAULT_API_RATE_LIMIT_MS);
@@ -148,12 +215,10 @@ export async function collect(
   }
   // archive path は postId 由来で採番する。従来の採番は同名グループの件数に依存するため、
   // 同名の投稿やアセットが増減すると過去に割り当てた名前まで変わり、複数の ZIP をまたいで
-  // 同じ投稿を同定できない (Issue #56)
-  const downloadManage = new DownloadManage(
-    creatorId,
-    feeMapper,
-    createPostIdArchivePathAllocator(DownloadManage.utils),
-  );
+  // 同じ投稿を同定できない (Issue #56)。
+  // 履歴があれば過去に割り当てた名前を据え置く。凍結名を使えなければ履歴ごと無いものとして扱う
+  const plan = prepareHistoryPlan(DownloadManage.utils, history ?? null);
+  const downloadManage = new DownloadManage(creatorId, feeMapper, plan.allocator);
   downloadManage.downloadObject.setUrl(`https://www.fanbox.cc/@${creatorId}`);
   downloadManage.isIgnoreFree = settings.isIgnoreFree;
   if (settings.limit !== null && settings.limit > 0) {
@@ -172,6 +237,11 @@ export async function collect(
   let postFailures = emptyPostFailureCounts();
   let failedPageCount = 0;
   let stoppedReason: CollectResult['stoppedReason'];
+  let listedRevisions: ReadonlyMap<string, string | null> = new Map();
+  let apiFailedPostIds: ReadonlySet<string> = new Set();
+  let skippedByHistoryPostIds: ReadonlySet<string> = new Set();
+  let completedFullScan = false;
+  let limited = false;
   if (postId) {
     onProgress(0, 1);
     try {
@@ -200,10 +270,21 @@ export async function collect(
     }
     onProgress(1, 1);
   } else {
-    const collected = await getItemsByCreator(api, downloadManage, onProgress, signal);
+    const collected = await getItemsByCreator(
+      api,
+      downloadManage,
+      onProgress,
+      signal,
+      skipPreviouslySaved ? plan.history : null,
+    );
     addedPostCount = collected.addedPostCount;
     postFailures = collected.postFailures;
     failedPageCount = collected.failedPageCount;
+    listedRevisions = collected.listedRevisions;
+    apiFailedPostIds = collected.apiFailedPostIds;
+    skippedByHistoryPostIds = collected.skippedByHistoryPostIds;
+    completedFullScan = collected.completedFullScan;
+    limited = collected.limited;
     if (collected.stoppedBy) {
       // 1 件も取り込めていないなら「取得できた分」が無い。打ち切りとして返すと
       // 中身のない ZIP を「取得できた分のみ保存しています」と表示して出してしまう。
@@ -223,6 +304,16 @@ export async function collect(
     postFailures,
     failedPageCount,
     stoppedReason,
+    listedRevisions,
+    apiFailedPostIds,
+    skippedByHistoryPostIds,
+    collectedAt: Date.now(),
+    scannedCreator: postId === undefined,
+    // 打ち切りは「一覧を全部見た」を否定する。件数上限は getItemsByCreator が
+    // 走査の打ち切りとして既に反映している。走査実績の整合性 (完走したなら打ち切りも
+    // 取りこぼしも無い) は履歴側の復号が検査する
+    completedFullScan: completedFullScan && stoppedReason === undefined,
+    limited,
   };
 }
 
@@ -230,6 +321,13 @@ type CreatorCollectCounts = {
   addedPostCount: number;
   postFailures: PostFailureCounts;
   failedPageCount: number;
+  listedRevisions: ReadonlyMap<string, string | null>;
+  apiFailedPostIds: ReadonlySet<string>;
+  skippedByHistoryPostIds: ReadonlySet<string>;
+  /** 投稿一覧の全ページを走査し終えたか */
+  completedFullScan: boolean;
+  /** 件数の上限に達して打ち切ったか */
+  limited: boolean;
   /** 再試行枠の枯渇 (レート制限または通信) で全ページを走査せずに打ち切った場合、その原因 */
   stoppedBy?: RateLimitExhaustedError | TransportExhaustedError;
 };
@@ -239,6 +337,7 @@ async function getItemsByCreator(
   downloadManage: DownloadManage,
   onProgress: ProgressCallback,
   signal: AbortSignal,
+  history: CreatorHistory | null,
 ): Promise<CreatorCollectCounts> {
   let urls: string[];
   try {
@@ -275,15 +374,54 @@ async function getItemsByCreator(
   // apiFailed は件数ではなく postId の集合で持つ。一覧の重複で同じ投稿を 2 回試みたとき、
   // 件数で数えると 1 つの投稿が 2 件の失敗になる。再試行で取り込めたら集合から外す
   const apiFailedPostIds = new Set<string>();
+  // 一覧が返した updatedDatetime。取り込めなかった投稿も含めて記録する (Issue #56)
+  const listedRevisions = new Map<string, string | null>();
+  // 履歴を根拠に post.info を省いた投稿。取りこぼしではないので失敗には数えない
+  const skippedByHistoryPostIds = new Set<string>();
+  // 一覧要素の内容 (突き合わせに使う 3 つ)。重複要素で食い違ったかの判定に使う
+  const listFingerprints = new Map<string, string>();
+  // post.info を発行せずに一覧の情報だけで決めた結果。食い違う重複が来たら取り消す
+  const listOnlyDecisions = new Map<string, 'ignored-free' | 'restricted' | 'history-skipped'>();
+
+  /**
+   * 一覧の情報だけで決めた結果を取り消し、この要素で改めて判断させる。
+   * 数えた失敗も戻す — 戻さないと、閲覧できるようになった投稿が「閲覧できなかった」件数に残る。
+   */
+  const undoListOnlyDecision = (postId: string) => {
+    const decision = listOnlyDecisions.get(postId);
+    if (decision === undefined) return;
+    listOnlyDecisions.delete(postId);
+    seenPostIds.delete(postId);
+    if (decision === 'restricted') {
+      postFailures.unavailable--;
+      postFailures.unavailableRestricted--;
+    } else if (decision === 'history-skipped') {
+      skippedByHistoryPostIds.delete(postId);
+    }
+  };
+  let scannedAllPages = false;
+  let stoppedByLimit = false;
   const counts = (): CreatorCollectCounts => ({
     addedPostCount,
     postFailures: { ...postFailures, apiFailed: apiFailedPostIds.size },
     failedPageCount,
+    listedRevisions,
+    apiFailedPostIds,
+    skippedByHistoryPostIds,
+    // 取得に失敗したページがあれば、走査し切っていても一覧を全部見たとは言えない
+    // (そのページに載っていた投稿が丸ごと欠けている)
+    completedFullScan: scannedAllPages && failedPageCount === 0,
+    limited: stoppedByLimit,
   });
 
   for (let i = 0; i < urls.length; i++) {
     if (signal.aborted) return counts();
-    if (!downloadManage.isLimitValid()) break;
+    // 件数上限で止めた場合は全ページを走査していない。break だとループ後の
+    // 「完走した」に落ちてしまうので、ここで返す (ループ後の return と同じ値)
+    if (!downloadManage.isLimitValid()) {
+      stoppedByLimit = true;
+      return counts();
+    }
     console.log(`${i + 1}回目`);
 
     // try は一覧ページ 1 回分の取得だけを囲む。以前は投稿ループ全体 (addByPostInfo や
@@ -330,7 +468,30 @@ async function getItemsByCreator(
     try {
       for (const post of postList) {
         if (signal.aborted) return counts();
-        if (!downloadManage.isLimitValid()) break;
+        // 同じ投稿が一覧に 2 回来ても最初の値を採る。後勝ちにすると、同じ入力への結果が
+        // 一覧の並びに依存する。
+        // **ただし一覧の情報が食い違ったら、先の要素だけで決めた結果を取り消す。**
+        // 走査の途中で編集や公開範囲の変更があると、ページをまたいで別の値が現れうる。
+        // 先に見た情報で「省略」「無料なので除外」「閲覧不可」と決めてしまうと、
+        // 現在は取得すべき投稿が取得されないまま落ちる
+        const listedRevision = decodeListedUpdatedDatetime(post);
+        const fingerprint = listFingerprint(listedRevision, post);
+        const knownFingerprint = listFingerprints.get(post.id);
+        if (knownFingerprint === undefined) {
+          listFingerprints.set(post.id, fingerprint);
+          listedRevisions.set(post.id, listedRevision);
+        } else if (knownFingerprint !== fingerprint) {
+          listFingerprints.set(post.id, fingerprint);
+          // どちらの値が現在のものか決められないので、突き合わせには使わせない
+          listedRevisions.set(post.id, null);
+          undoListOnlyDecision(post.id);
+        }
+        // ページの途中で上限に達した場合も一覧を全部見ていない。break だと最終ページでは
+        // 外側のループが正常終了し、「完走した」に落ちてしまう
+        if (!downloadManage.isLimitValid()) {
+          stoppedByLimit = true;
+          return counts();
+        }
         // 既に結果の出た投稿は失敗にも成功にも数えない。利用者から見て取りこぼしではない。
         // 進捗だけは進める (除外・閲覧不可・取得失敗でも進めているので、揃えないと
         // 重複を含む一覧で進捗が最後まで届かない)。
@@ -345,6 +506,7 @@ async function getItemsByCreator(
         // 'ignored' を返すだけで、レート制限の枠と待機時間を無駄に使う
         if (downloadManage.isIgnoreFree && post.feeRequired === 0) {
           seenPostIds.add(post.id);
+          listOnlyDecisions.set(post.id, 'ignored-free');
           apiFailedPostIds.delete(post.id);
           processed++;
           onProgress(processed, totalEstimate);
@@ -354,6 +516,7 @@ async function getItemsByCreator(
         // isRestricted になったときに空の ZIP を「失敗 0 件で完了」として出してしまう。
         if (post.isRestricted) {
           seenPostIds.add(post.id);
+          listOnlyDecisions.set(post.id, 'restricted');
           apiFailedPostIds.delete(post.id);
           postFailures.unavailable++;
           postFailures.unavailableRestricted++;
@@ -361,11 +524,35 @@ async function getItemsByCreator(
           onProgress(processed, totalEstimate);
           continue;
         }
+        // 前回と変わっておらず、全アセットを保存できている投稿は post.info を発行しない。
+        // これが Issue #56 で実際に API コストを減らす箇所である。省いた投稿は
+        // DownloadObject に入らないので、今回の ZIP にも含まれない (差分 ZIP の意味論)
+        if (canSkipPostInfo(history, post.id, listedRevisions.get(post.id) ?? null)) {
+          seenPostIds.add(post.id);
+          listOnlyDecisions.set(post.id, 'history-skipped');
+          apiFailedPostIds.delete(post.id);
+          skippedByHistoryPostIds.add(post.id);
+          processed++;
+          onProgress(processed, totalEstimate);
+          continue;
+        }
         // 一覧レスポンスに本文は含まれないため、投稿ごとに post.info を叩く必要がある
         try {
-          const result = addByPostInfo(downloadManage, await api.fetchPostInfo(post.id, signal));
+          const info = await api.fetchPostInfo(post.id, signal);
+          // **一覧と詳細が同じ世代を指しているか確かめる。** エンドポイントごとにキャッシュの
+          // 状態が違えば、一覧が新しい版を返しているのに詳細が古い版を返すことがありうる。
+          // そのまま一覧の値を保存実績に付けると、取得できていない中身を「その版で保存済み」と
+          // 扱い、次回その投稿を丸ごと飛ばす。食い違ったら突き合わせには使わせない
+          // (今回取得できた中身は通常どおり保存する)
+          if (listedRevisions.get(post.id) !== decodePostInfoUpdatedDatetime(info)) {
+            listedRevisions.set(post.id, null);
+          }
+          const result = addByPostInfo(downloadManage, info);
           // 結果が出たので、以降の重複はもう叩かない。取り直せたなら失敗の記録も取り消す
           seenPostIds.add(post.id);
+          // post.info まで発行した結果は一覧情報だけの決定ではないので取り消さない。
+          // 取り消して 2 回登録すると投稿ディレクトリ名が重複し、preflight が ZIP 全体を拒否する
+          listOnlyDecisions.delete(post.id);
           apiFailedPostIds.delete(post.id);
           if (applyAddResult(result, postFailures) === 'added') addedPostCount++;
         } catch (e) {
@@ -406,5 +593,7 @@ async function getItemsByCreator(
       throw e;
     }
   }
+  // for を最後まで回り切った場合だけここに来る (中断・件数上限・枯渇は早期 return する)
+  scannedAllPages = true;
   return counts();
 }

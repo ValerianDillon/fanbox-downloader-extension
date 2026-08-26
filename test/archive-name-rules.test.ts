@@ -1,0 +1,72 @@
+import { describe, expect, test } from 'bun:test';
+import { DownloadUtils } from 'download-helper/download-helper';
+import { describeUnusableSegment, SEGMENT_MAX_BYTES } from '../src/archive-name-rules';
+
+const utils = new DownloadUtils();
+
+describe('archive 名の規則', () => {
+  test('使える名前だけが共有層の encodeFileName を通しても変わらない (履歴の復号を通った凍結名が allocator で例外になるのを防ぐため)。', () => {
+    const candidates = [
+      'normal.png',
+      '日本語のファイル名.jpg',
+      'a,b',
+      'a*b',
+      'a"b',
+      'a<b',
+      'a>b',
+      'a|b',
+      'a:b',
+      'a/b',
+      'a\\b',
+      ' leading',
+      'trailing ',
+      '\tタブ',
+    ];
+
+    for (const name of candidates) {
+      if (describeUnusableSegment(name) !== null) continue;
+      // 使えると判定した名前は、共有層が書き換えないものでなければならない。
+      // 書き換わる名前を通すと、記録した名前と実際に ZIP へ書かれる名前が食い違う
+      expect([name, utils.encodeFileName(name)]).toEqual([name, name]);
+    }
+  });
+
+  test('BMP の全文字について、使えると判定した名前は encodeFileName で変わらない (共有層が変換対象を増やしたらここで気付くため)。', () => {
+    const mismatches: string[] = [];
+    for (let code = 0; code <= 0xffff; code++) {
+      // サロゲートは単体では孤立サロゲートになり、別の規則で弾かれる
+      if (code >= 0xd800 && code <= 0xdfff) continue;
+      const char = String.fromCharCode(code);
+      for (const name of [`a${char}b`, `${char}ab`, `ab${char}`]) {
+        if (describeUnusableSegment(name) !== null) continue;
+        if (utils.encodeFileName(name) !== name) mismatches.push(JSON.stringify(name));
+      }
+    }
+
+    expect(mismatches).toEqual([]);
+  });
+
+  test('共有層が書き換える文字と前後の空白を拒否する (この規則が緩んだら上の全文字検査が落ちるため)。', () => {
+    for (const name of ['a,b', 'a*b', 'a"b', 'a<b', 'a>b', 'a|b', ' leading', 'trailing ']) {
+      expect(describeUnusableSegment(name)).not.toBeNull();
+    }
+  });
+
+  test('パス区切り・制御文字・親ディレクトリ・% と ? を拒否する (ZIP のエントリ名として展開できない名前を固定しないため)。', () => {
+    for (const name of ['a/b', 'a\\b', 'a:b', 'a\u0000b', '.', '..', '...', '. .', '', 'a%b', 'a?b']) {
+      expect(describeUnusableSegment(name)).not.toBeNull();
+    }
+  });
+
+  test('UTF-8 バイト数で上限を判定する (絵文字のように 1 文字が 4 bytes の名前で ext4 の上限を超えないため)。', () => {
+    const withinLimit = '🙂'.repeat(SEGMENT_MAX_BYTES / 4);
+    const overLimit = `${withinLimit}🙂`;
+
+    expect([describeUnusableSegment(withinLimit), describeUnusableSegment(overLimit) !== null]).toEqual([null, true]);
+  });
+
+  test('孤立サロゲートを拒否する (書き込み時に U+FFFD へ置き換わり、記録上の名前と実体名が食い違うため)。', () => {
+    expect(describeUnusableSegment('a\uD800b')).not.toBeNull();
+    expect(describeUnusableSegment('a🙂b')).toBeNull();
+  });
+});

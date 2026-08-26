@@ -1,9 +1,18 @@
-import type { DownloadJsonObj, PostSummary } from 'download-helper/download-helper';
+import type {
+  DownloadJsonObj,
+  DownloadManifest,
+  DownloadZipResult,
+  PostSummary,
+} from 'download-helper/download-helper';
+import type { CreatorHistory, HistoryResponse } from '../history-record';
 import type { DownloadProgress, FileSystemFileHandle } from './downloader';
-import { assertDownloadable, downloadAsZip, pickSaveHandle } from './downloader';
+import { downloadAsZip, pickSaveHandle, preflightDownload } from './downloader';
 import { ApiShapeError, type PageType, ResponseParseError } from './fanbox/api';
 import type { CollectorSettings, CollectResult, PostFailureCounts } from './fanbox/collector';
 import { collect, PostBodyInvalidError } from './fanbox/collector';
+import { applyCreatorHistory, readCreatorHistory, readCreatorHistoryForCollect, removeCreatorHistory } from './history';
+import { acquireHistoryForCollect, historyForCollect } from './history-plan';
+import { buildObservationUpdate, buildSaveUpdate } from './history-update';
 import css from './overlay.css' with { type: 'text' };
 import {
   countSelection,
@@ -73,6 +82,14 @@ export const COMPLETE_HEADLINE = 'ダウンロードが完了しました';
  * 本文に併記される欠落の詳細行と矛盾していた)。
  */
 export const PARTIAL_FILE_FAILURE_HEADLINE = '一部取得できませんでした';
+
+/**
+ * 新しく取得するものが無かったときの見出し (Issue #56)。
+ *
+ * 「取得済み」ではなく「前回保存済み」とする。拡張が主張できるのは書き込みの完了を確認した
+ * ことまでで、その ZIP が今も存在するとは主張できない。
+ */
+export const ALREADY_SAVED_HEADLINE = '前回保存済みから更新はありませんでした';
 
 /** 収集フェーズがレート制限で打ち切られた場合の完了画面の見出し */
 export const RATE_LIMIT_EXHAUSTED_HEADLINE = 'レート制限のため途中で打ち切りました (取得できた分のみ保存しています)';
@@ -166,6 +183,19 @@ export type CompleteMessageParams = {
   failedFileCount: number;
   /** 収集フェーズが再試行の上限で打ち切られた場合、その理由 */
   stoppedReason?: 'rate-limit-exhausted' | 'transport-exhausted';
+  /**
+   * 履歴を根拠に `post.info` を省いた投稿数 (Issue #56)。
+   *
+   * 失敗ではないので見出しの判定には使わない。省いた投稿が ZIP に無い理由を書くためだけに持つ。
+   */
+  skippedByHistoryCount?: number;
+  /**
+   * 差分ダウンロードの履歴の更新に失敗した理由 (Issue #56)。成功または記録対象外なら null。
+   *
+   * ZIP は保存できているので見出しは変えない。次回の差分判定がこの回を知らないという
+   * 事実だけを本文に足す (黙って落とすと、利用者は次回に全件取り直す理由が分からない)。
+   */
+  historyError?: string | null;
 };
 
 /**
@@ -233,10 +263,28 @@ function buildFailureLines(params: CompleteMessageParams): string[] {
  * OverlayController.startCollecting の catch から別経路で表示する。
  */
 export function buildCompleteMessage(params: CompleteMessageParams): string {
+  // 履歴の更新の失敗は「取得できなかった」ではないので、見出しの判定 (failureLines) には
+  // 混ぜず、どの見出しになっても最後に足すだけにする。混ぜると、全部取得できているのに
+  // 「一部取得できませんでした」と出る
+  const historySuffix = params.historyError
+    ? `\n保存済みの記録を更新できませんでした: ${params.historyError} (今回の保存分は次回の差分判定に反映されません)`
+    : '';
+  const skipped = params.skippedByHistoryCount ?? 0;
+  // 省いた投稿は取りこぼしではないので、これも見出しの判定には混ぜない
+  const skippedSuffix = skipped > 0 ? `\n前回保存済みのため取得を省いた投稿: ${skipped} 件` : '';
+  return `${buildDownloadOutcome(params)}${skippedSuffix}${historySuffix}`;
+}
+
+function buildDownloadOutcome(params: CompleteMessageParams): string {
   const failureLines = buildFailureLines(params);
   const failedSuffix = failureLines.length ? `\n${failureLines.join('\n')}` : '';
 
   if (params.addedPostCount === 0) {
+    // 全部が「前回保存済み」で省かれたなら、取りこぼしではなく更新が無かっただけである。
+    // NOTHING_SAVED_HEADLINE のままだと、差分が無いことを失敗のように読ませてしまう
+    if ((params.skippedByHistoryCount ?? 0) > 0 && failureLines.length === 0) {
+      return ALREADY_SAVED_HEADLINE;
+    }
     return `${NOTHING_SAVED_HEADLINE}${failedSuffix}`;
   }
   if (params.stoppedReason) {
@@ -258,11 +306,94 @@ export function buildCompleteMessage(params: CompleteMessageParams): string {
 }
 
 /**
+ * 保存先のファイル名。
+ *
+ * 共有層の `FileSystemFileHandle` は `createWritable()` しか宣言していないので、実際の
+ * `name` は型に出てこない。利用者は picker で名前を変えられるため、こちらが渡した
+ * 既定の名前で代用すると事実と食い違う。読めたときだけ使い、読めなければ既定へ倒す。
+ */
+function zipNameOf(handle: FileSystemFileHandle, fallbackBaseName: string): string {
+  const name = (handle as { name?: unknown }).name;
+  return typeof name === 'string' && name !== '' ? name : `${fallbackBaseName}.zip`;
+}
+
+/**
+ * 収集時の観測と保存実績、両方の記録の失敗をひとつの文言にまとめる (Issue #56)。
+ *
+ * 片方だけを採ると、両方落ちたときにもう片方の理由が消える。同じ理由なら 1 回だけ出す
+ * (storage が一杯なら両方が同じ文言になる)。
+ */
+export function joinHistoryErrors(observationError: string | null, saveError: string | null): string | null {
+  if (observationError === null || saveError === null) return observationError ?? saveError;
+  if (observationError === saveError) return observationError;
+  return `収集の記録: ${observationError} / 保存の記録: ${saveError}`;
+}
+
+/**
+ * 差分ダウンロードの履歴を記録する (Issue #56)。失敗したらその理由を返す。
+ *
+ * **中断で終わった実行は記録しない。** 書けたと確認できていないものを保存済みとして扱わない。
+ * `downloadZip` は中断されても ZIP を閉じて正常に戻るので、ここで見ないと途中までの結果を
+ * 保存実績にしてしまう。
+ *
+ * 判断は `zip.aborted` だけで行い、`signal.aborted` は見ない。**全データを書き終えた後、
+ * `close()` の実行中に中断された場合は `zip.aborted` が false のまま返る** (共有層が
+ * 「書けているものを誤って中断と報告しない」ためにそうしている)。signal で判断すると、
+ * 完成した ZIP の実績を捨てて次回また全件取得することになる。
+ *
+ * 記録の失敗は ZIP の失敗ではないので例外にせず、完了画面に併記するための文言を返す。
+ */
+/**
+ * 収集で分かったこと (観測カタログと走査実績) を記録する (Issue #56)。失敗したらその理由を返す。
+ *
+ * ZIP を作るかに関わらず送る。理由は `buildObservationUpdate` の JSDoc を参照。
+ */
+export async function recordObservation(creatorId: string, result: CollectResult): Promise<string | null> {
+  try {
+    const response = await applyCreatorHistory(buildObservationUpdate(creatorId, result));
+    return response.ok ? null : (response.error ?? '不明な理由');
+  } catch (e) {
+    console.error('収集結果の記録に失敗:', e);
+    return e instanceof Error ? e.message : String(e);
+  }
+}
+
+export async function recordHistory(
+  ctx: Pick<ReviewContext, 'creatorId' | 'result'>,
+  manifest: DownloadManifest,
+  zip: DownloadZipResult,
+  zipName: string,
+): Promise<string | null> {
+  if (zip.aborted) return null;
+  try {
+    const update = buildSaveUpdate(ctx.creatorId, ctx.result, manifest, zip.assets, zipName, Date.now());
+    const response = await applyCreatorHistory(update);
+    return response.ok ? null : (response.error ?? '不明な理由');
+  } catch (e) {
+    console.error('履歴の記録に失敗:', e);
+    return e instanceof Error ? e.message : String(e);
+  }
+}
+
+/**
  * review 画面 (収集完了からダウンロード対象の確定まで) が保持する状態 (Issue #55)。
  *
  * 収集結果 (`result`) は確定後も保持する。完了画面は収集フェーズの失敗件数も併記するため、
  * ZIP フェーズが終わった時点でも必要になる。
  */
+/**
+ * 検証を通ったダウンロード対象。
+ *
+ * `manifest` は保存実績を記録するときに `AssetKey` を引き当てるために持つ
+ * (`DownloadZipResult.assets` は archive 名でしか結果を指さない)。
+ * `preflight` が返した写しをそのまま使い、`json.manifest` を読み直さない — 検証を通った値と
+ * 記録に使う値を別々に読むと、片方だけが差し替わる余地ができる。
+ */
+type PreparedDownload = {
+  readonly json: DownloadJsonObj;
+  readonly manifest: DownloadManifest;
+};
+
 type ReviewContext = {
   readonly creatorId: string;
   readonly result: CollectResult;
@@ -278,7 +409,14 @@ type ReviewContext = {
    * ユーザアクティベーションは時間で失効するので、選択が変わるたびに先に済ませておき、
    * ハンドラは読むだけにする。
    */
-  prepared: DownloadJsonObj | null;
+  prepared: PreparedDownload | null;
+  /**
+   * 収集時の観測 (カタログと走査実績) の記録に失敗した理由 (Issue #56)。成功なら null。
+   *
+   * 完了画面まで持ち越す。ここで落とすと、保存実績だけが記録されてカタログが古いまま残り、
+   * 次回また全件を取得することになる理由が利用者に伝わらない。
+   */
+  observationError: string | null;
   /** 導出待ちのタイマー。連続した操作で導出が何度も走るのを 1 回にまとめる */
   prepareTimer: ReturnType<typeof setTimeout> | null;
   /** review 画面に表示するエラー。選択状態は保ったまま出す */
@@ -287,6 +425,23 @@ type ReviewContext = {
 
 export class OverlayController {
   private state: OverlayState = 'settings';
+  /** 読み込み済みの差分ダウンロードの履歴 (Issue #56)。未読または無ければ null */
+  private history: CreatorHistory | null = null;
+  /** 履歴の読み込みの世代。遅れて解決した読み込みが新しい画面を書き換えないようにする */
+  private historyGeneration = 0;
+  /**
+   * 削除の応答を待っている creator と、その応答の Promise。
+   *
+   * 削除の途中で始まった読み込みは、まだ消える前の storage を読む。世代だけで守ると、
+   * パネルを閉じて開き直したときに新しい世代の読み込みが旧履歴を戻してしまう。
+   *
+   * Promise を持つのは、**収集がこれを待ってから読む**ため。待たずに読むと、削除が
+   * まだ適用されていない storage を読んで「削除したはずの履歴」で `post.info` を省く
+   * (確認文の「次回は全件を取得します」に反する)。
+   */
+  private readonly deletingCreators = new Map<string, Promise<unknown>>();
+  /** 履歴を一度でも読み終えたか。設定画面の表示を「確認中」と分けるために持つ */
+  private historyLoaded = false;
   /**
    * 収集フェーズ用と ZIP フェーズ用で AbortController を分ける (Issue #55)。
    *
@@ -371,12 +526,54 @@ export class OverlayController {
   }
 
   setPageType(pageType: PageType) {
+    // SPA 遷移で creator が変わったら、読み込み済みの履歴も進行中の読み込みも捨てる。
+    // 残すと別の creator の保存実績を根拠に post.info を省きうる (Issue #56)
+    const creatorChanged = pageType?.creatorId !== this.pageType?.creatorId;
+    if (creatorChanged) {
+      this.history = null;
+      this.historyLoaded = false;
+      this.historyGeneration++;
+    }
     this.pageType = pageType;
+    // 設定画面を開いたまま遷移したら、移った先の履歴を読み直して表示も更新する。
+    // 更新しないと、前の creator の件数を出したまま「記録を削除」がこちらの creator に効く
+    if (creatorChanged && this.state === 'settings' && this.panelEl) {
+      this.renderHistoryRow();
+      void this.loadHistory();
+    }
   }
 
   showPanel() {
     this.setState('settings');
     this.renderPanel();
+    // 履歴の読み出しは storage への往復なので、画面を出してから追いつかせる。
+    // 待ってから描画すると、パネルが開くまでに間が空く
+    void this.loadHistory();
+  }
+
+  /**
+   * 差分ダウンロードの履歴を読み込み、設定画面に反映する (Issue #56)。
+   *
+   * 読めなければ履歴が無いものとして扱う (`readCreatorHistory` が null に倒す)。
+   * 読み込み中に画面が変わっていたら描画しない。
+   */
+  private async loadHistory() {
+    const creatorId = this.pageType?.creatorId;
+    if (creatorId === undefined) {
+      this.historyLoaded = true;
+      return;
+    }
+    this.historyLoaded = false;
+    const generation = ++this.historyGeneration;
+    const history = await readCreatorHistory(creatorId);
+    // 世代だけでなく creator も突き合わせる。世代を上げずに creator が戻ってくる経路
+    // (A → B → A) では世代の一致だけでは足りない
+    if (this.historyGeneration !== generation || this.pageType?.creatorId !== creatorId) return;
+    // 削除の応答を待っている間に読んだ値は、消える前の storage のものである
+    if (this.deletingCreators.has(creatorId)) return;
+    this.history = history;
+    this.historyLoaded = true;
+    if (this.state === 'settings') this.renderHistoryRow();
   }
 
   hidePanel() {
@@ -483,6 +680,13 @@ export class OverlayController {
       this.panelEl.appendChild(intervalRow);
     }
 
+    // 履歴の行は読み込みが済んでから埋める。ここでは器だけ置く
+    const historyRow = document.createElement('div');
+    historyRow.className = 'setting-row';
+    historyRow.id = 'history-row';
+    this.panelEl.appendChild(historyRow);
+    this.renderHistoryRow();
+
     const btnRow = document.createElement('div');
     btnRow.className = 'btn-row';
     const collectBtn = document.createElement('button');
@@ -496,7 +700,9 @@ export class OverlayController {
         limit: limitInput?.value ? Number.parseInt(limitInput.value, 10) : null,
         apiIntervalMs: intervalInput?.value ? Number.parseInt(intervalInput.value, 10) : null,
       };
-      this.startCollecting(settings);
+      const ignoreHistory =
+        (this.shadowRoot.getElementById('history-ignore') as HTMLInputElement | null)?.checked ?? false;
+      this.startCollecting(settings, ignoreHistory);
     });
     btnRow.appendChild(collectBtn);
 
@@ -507,6 +713,104 @@ export class OverlayController {
     btnRow.appendChild(cancelBtn);
 
     this.panelEl.appendChild(btnRow);
+  }
+
+  /**
+   * 設定画面の履歴の行を描く (Issue #56)。
+   *
+   * **表示は「取得済み」ではなく「前回保存済み」とする。** 拡張が主張できるのは
+   * 「この拡張が日時 X の ZIP 生成で当該エントリの書き込み完了を確認した」までで、
+   * その ZIP が今も存在するとは主張できない。
+   */
+  private renderHistoryRow() {
+    const row = this.shadowRoot.getElementById('history-row');
+    if (!row) return;
+    row.innerHTML = '';
+    if (!this.historyLoaded) {
+      row.textContent = '前回保存済みの記録を確認中...';
+      return;
+    }
+    const savedCount = this.history?.saved.length ?? 0;
+    if (savedCount === 0) {
+      row.textContent = '前回保存済みの記録はありません (全件を取得します)';
+      return;
+    }
+
+    const summary = document.createElement('span');
+    summary.textContent = `前回保存済み: ${savedCount} 投稿`;
+    row.appendChild(summary);
+
+    const ignoreLabel = document.createElement('label');
+    const ignoreBox = document.createElement('input');
+    ignoreBox.type = 'checkbox';
+    ignoreBox.id = 'history-ignore';
+    ignoreLabel.appendChild(ignoreBox);
+    // 「履歴を無視して全件を取得する」と「既存の履歴を含めて再保存する」は、収集から見れば
+    // 同じ操作である (どちらも全件を取得し、その結果で記録を更新する)
+    ignoreLabel.appendChild(document.createTextNode('前回保存分も取得する'));
+    row.appendChild(ignoreLabel);
+
+    const forgetBtn = document.createElement('button');
+    forgetBtn.className = 'btn-secondary';
+    forgetBtn.id = 'history-forget';
+    forgetBtn.textContent = '記録を削除';
+    forgetBtn.addEventListener('click', () => void this.forgetHistory(forgetBtn));
+    row.appendChild(forgetBtn);
+  }
+
+  /**
+   * この creator の履歴を消す (Issue #56 の利用者の操作)。
+   *
+   * 消してよいかは利用者に確かめる。消すと次回は全件を取得することになるので、
+   * 誤操作の代償が通信量と待ち時間になる。
+   */
+  private async forgetHistory(button: HTMLButtonElement) {
+    const creatorId = this.pageType?.creatorId;
+    if (creatorId === undefined) return;
+    if (!confirm(`@${creatorId} の保存済みの記録を削除しますか (次回は全件を取得します)`)) return;
+    button.disabled = true;
+    // 進行中の読み込みを無効にしてから消す。無効にしないと、削除の前に始まった読み込みが
+    // 後から解決して、消したはずの履歴をメモリ上へ戻す (その履歴で post.info を省きうる)
+    const generation = ++this.historyGeneration;
+    // 応答を待つ間に収集を始められるので、メモリ上の履歴もここで落とす。落とさないと
+    // 「削除したつもり」の履歴を根拠に post.info が省かれる
+    const previous = this.history;
+    this.history = null;
+    const pending = removeCreatorHistory(creatorId);
+    this.deletingCreators.set(creatorId, pending);
+    let response: HistoryResponse;
+    try {
+      response = await pending;
+    } finally {
+      this.deletingCreators.delete(creatorId);
+    }
+    // 削除を待つ間に別の creator へ移っていたら、こちらの状態には触らない
+    if (this.pageType?.creatorId !== creatorId) return;
+    if (!response.ok) {
+      if (this.historyGeneration === generation) {
+        // 消せていないので元に戻す。戻さないと、履歴があるのに全件取得になる
+        this.history = previous;
+        this.historyLoaded = true;
+      } else {
+        // 世代が進んでいる = この削除の間に読み込みが走っており、その結果は
+        // `deletingCreators` で捨てられている。放っておくと storage には履歴があるのに
+        // 画面もメモリも「履歴なし」のままになるので、読み直す
+        void this.loadHistory();
+      }
+      if (this.state === 'settings') {
+        button.disabled = false;
+        button.textContent = `削除できません: ${response.error ?? '不明な理由'}`;
+      }
+      return;
+    }
+    // **削除の前に始まった読み込みをすべて無効にする。** `deletingCreators` は応答が返った
+    // 時点で外れるので、それより後に解決した読み込みは素通りして削除済みの履歴を戻してしまう。
+    // 世代を進めれば、削除より前に始まった読み込みは結果を捨てる
+    this.historyGeneration++;
+    this.history = null;
+    // 読み込みを捨てたまま「確認中」で止めない
+    this.historyLoaded = true;
+    if (this.state === 'settings') this.renderHistoryRow();
   }
 
   private renderCollecting() {
@@ -563,6 +867,15 @@ export class OverlayController {
     size.className = 'progress-text';
     size.id = 'review-size';
     this.panelEl.appendChild(size);
+
+    // 省いた投稿が一覧に出てこない理由を書く。書かないと「取りこぼした」ように見える
+    const skipped = ctx.result.skippedByHistoryPostIds.size;
+    if (skipped > 0) {
+      const skippedText = document.createElement('p');
+      skippedText.className = 'progress-text';
+      skippedText.textContent = `前回保存済みのため取得を省いた投稿: ${skipped} 件 (この ZIP には含まれません)`;
+      this.panelEl.appendChild(skippedText);
+    }
 
     const error = document.createElement('p');
     error.className = 'review-error';
@@ -817,8 +1130,8 @@ export class OverlayController {
     if (this.review !== ctx) return;
     try {
       const json = ctx.result.downloadObject.project(toSelection(ctx.selection));
-      assertDownloadable(json);
-      ctx.prepared = json;
+      const { manifest } = preflightDownload(json);
+      ctx.prepared = { json, manifest };
       ctx.errorMessage = null;
     } catch (e) {
       console.error('ダウンロード対象の導出に失敗:', e);
@@ -982,7 +1295,7 @@ export class OverlayController {
     this.renderComplete(message);
   }
 
-  private async startCollecting(settings: CollectorSettings) {
+  private async startCollecting(settings: CollectorSettings, ignoreHistory = false) {
     if (!this.pageType) return;
     resetTestState();
     // 新しい収集を始めた時点で、前の ZIP フェーズの結果は観測状態に載せてはいけない
@@ -998,6 +1311,13 @@ export class OverlayController {
     this.guardUnload();
 
     try {
+      // 進行中の削除を待ってから storage を読み直す (理由は acquireHistoryForCollect の JSDoc)。
+      // 保存先の確保は review の確定時なので、ここで待ってもユーザアクティベーションは失効しない
+      const collectCreatorId = this.pageType.creatorId;
+      const history = await acquireHistoryForCollect(this.deletingCreators.get(collectCreatorId), () =>
+        readCreatorHistoryForCollect(collectCreatorId),
+      );
+      if (!this.isCurrentCollect(signal)) return;
       const creatorId = this.pageType.creatorId;
       const postId = this.pageType.type === 'post' ? this.pageType.postId : undefined;
 
@@ -1013,6 +1333,9 @@ export class OverlayController {
           if (el) el.textContent = `投稿情報を収集中... (${current}/${total})`;
         },
         signal,
+        historyForCollect(history, creatorId),
+        // 「前回保存分も取得する」は省略だけを止める。凍結名は据え置く
+        !ignoreHistory,
       );
 
       // 状態に触る前に現行かを見る (ZIP フェーズと同じ順序)
@@ -1021,6 +1344,11 @@ export class OverlayController {
         publishTestState({ aborted: '1' });
         return;
       }
+
+      // 収集で分かったことは ZIP を作るかに関わらず記録する。全件が省かれた回は ZIP を
+      // 作らないので、ここで書かないと走査実績と最終利用時刻がその回だけ残らない
+      const observationError = await recordObservation(creatorId, result);
+      if (!this.isCurrentCollect(signal)) return;
 
       publishTestState({
         'added-post-count': String(result.addedPostCount),
@@ -1042,12 +1370,14 @@ export class OverlayController {
             postFailures: result.postFailures,
             failedPageCount: result.failedPageCount,
             failedFileCount: 0,
+            skippedByHistoryCount: result.skippedByHistoryPostIds.size,
+            historyError: observationError,
           }),
         );
         return;
       }
 
-      this.enterReview(creatorId, result);
+      this.enterReview(creatorId, result, observationError);
     } catch (e) {
       // hidePanel() や新しい収集が既に走っているなら、旧実行はここで降りる。
       // エラー表示も publish も新実行のものを上書きしてしまう
@@ -1081,7 +1411,7 @@ export class OverlayController {
   }
 
   /** 収集結果を review 画面に載せる。収集用の controller はここで役目を終える */
-  private enterReview(creatorId: string, result: CollectResult) {
+  private enterReview(creatorId: string, result: CollectResult, observationError: string | null) {
     const posts = result.downloadObject.listPosts();
     this.review = {
       creatorId,
@@ -1093,6 +1423,7 @@ export class OverlayController {
       prepared: null,
       prepareTimer: null,
       errorMessage: null,
+      observationError,
     };
     this.setState('review');
     this.renderReview();
@@ -1101,7 +1432,7 @@ export class OverlayController {
   private async startDownloading(
     ctx: ReviewContext,
     runId: number,
-    json: DownloadJsonObj,
+    prepared: PreparedDownload,
     saveHandle: FileSystemFileHandle,
   ) {
     // 確定した時点で選択はもう変わらない。残った導出待ちを走らせても捨てるだけになる
@@ -1138,11 +1469,17 @@ export class OverlayController {
 
       const { zip } = await downloadAsZip(
         saveHandle,
-        json,
+        prepared.json,
         downloadProgress,
         signal,
         () => this.downloadRunId === runId,
       );
+      // 履歴の記録は現行かの判定より前に行う。ZIP を書けたという事実は、その実行が
+      // 今の画面のものかどうかに依らない (Issue #56)
+      const saveError = await recordHistory(ctx, prepared.manifest, zip, zipNameOf(saveHandle, ctx.creatorId));
+      // 収集時の観測の失敗も併せて出す。どちらが落ちても次回は差分にならないので、
+      // 保存実績が書けたことだけを見て「記録は正常」と読ませない
+      const historyError = joinHistoryErrors(ctx.observationError, saveError);
       // 状態を触る前に現行の実行かを見る。旧実行の遅延解決が新実行の画面と観測状態を
       // 上書きするのを防ぐ (中断してすぐ再実行したときに起こりうる)
       if (this.downloadRunId !== runId || !this.isCurrentDownload(signal)) return;
@@ -1162,6 +1499,8 @@ export class OverlayController {
           failedPageCount,
           failedFileCount: zip.failedFileCount,
           stoppedReason,
+          skippedByHistoryCount: ctx.result.skippedByHistoryPostIds.size,
+          historyError,
         }),
       );
     } catch (e) {

@@ -1,4 +1,5 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
+import type { DownloadManifest, DownloadZipResult } from 'download-helper/download-helper';
 import {
   ApiShapeError,
   HttpError,
@@ -6,13 +7,16 @@ import {
   ResponseParseError,
   TransportExhaustedError,
 } from '../src/content/fanbox/api';
+import type { CollectResult } from '../src/content/fanbox/collector';
 import { PostBodyInvalidError, type PostFailureCounts } from '../src/content/fanbox/collector';
 import {
+  ALREADY_SAVED_HEADLINE,
   buildCompleteMessage,
   COMPLETE_HEADLINE,
   type CompleteMessageParams,
   describePickerFailure,
   isUnsupportedResponseError,
+  joinHistoryErrors,
   NOTHING_SAVED_HEADLINE,
   OVERLAY_TRANSITIONS,
   type OverlayState,
@@ -20,6 +24,8 @@ import {
   PARTIAL_FILE_FAILURE_HEADLINE,
   PICKER_FAILED_MESSAGE,
   RATE_LIMIT_EXHAUSTED_HEADLINE,
+  recordHistory,
+  recordObservation,
   TRANSPORT_EXHAUSTED_HEADLINE,
   UNSUPPORTED_RESPONSE_HEADLINE,
 } from '../src/content/overlay';
@@ -192,6 +198,50 @@ describe('Issue #18 / #14: 完了画面の分岐 (buildCompleteMessage)', () => 
     failedPageCount: 0,
     failedFileCount: 0,
   };
+
+  test('収集時の観測の記録に失敗したら完了画面に出す (保存実績だけ記録されて次回また全件になる理由を伝えるため)', () => {
+    const message = buildCompleteMessage({ ...base, historyError: '収集の記録に失敗' });
+
+    expect(message).toContain('収集の記録に失敗');
+  });
+
+  test('省いた投稿があっても見出しは変わらない (取りこぼしではないため)', () => {
+    const message = buildCompleteMessage({ ...base, skippedByHistoryCount: 3 });
+
+    expect(message.split('\n')[0]).toBe(COMPLETE_HEADLINE);
+    expect(message).toContain('前回保存済みのため取得を省いた投稿: 3 件');
+  });
+
+  test('全件が省かれたときは「更新はありません」にする (差分が無いことを失敗のように読ませないため)', () => {
+    const message = buildCompleteMessage({ ...base, addedPostCount: 0, skippedByHistoryCount: 5 });
+
+    expect(message.split('\n')[0]).toBe(ALREADY_SAVED_HEADLINE);
+    expect(message).toContain('前回保存済みのため取得を省いた投稿: 5 件');
+  });
+
+  test('省いた投稿があっても取りこぼしがあれば「保存していません」を出す (欠落を更新なしで隠さないため)', () => {
+    const message = buildCompleteMessage({
+      ...base,
+      addedPostCount: 0,
+      skippedByHistoryCount: 5,
+      postFailures: { ...base.postFailures, apiFailed: 1 },
+    });
+
+    expect(message.split('\n')[0]).toBe(NOTHING_SAVED_HEADLINE);
+  });
+
+  test('履歴の更新に失敗しても見出しは変わらない (ZIP は保存できているので「一部取得できませんでした」にしないため)', () => {
+    const message = buildCompleteMessage({ ...base, historyError: 'storage が一杯です' });
+
+    expect(message.split('\n')[0]).toBe(COMPLETE_HEADLINE);
+  });
+
+  test('履歴の更新に失敗したら次回が全件取得になることを本文に書く (黙って落とすと全件取り直す理由が分からないため)', () => {
+    const message = buildCompleteMessage({ ...base, historyError: 'storage が一杯です' });
+
+    expect(message).toContain('storage が一杯です');
+    expect(message).toContain('今回の保存分は次回の差分判定に反映されません');
+  });
 
   test('失敗ゼロ・非中断は COMPLETE_HEADLINE のみ (従来どおり)', () => {
     expect(buildCompleteMessage(base)).toBe(COMPLETE_HEADLINE);
@@ -451,5 +501,145 @@ describe('Issue #55: 保存先の取得に失敗したときの文言 (describeP
 
   test('Error ですらない値も文言を出す', () => {
     expect(describePickerFailure('boom')).toBe(`${PICKER_FAILED_MESSAGE}: boom`);
+  });
+});
+
+/**
+ * Issue #56: 収集・ZIP の結果が実際に履歴として送られるかの検証。
+ *
+ * 差分の組み立て (`history-update.ts`) とは別に、**送る・送らないの判断**を固定する。
+ * 組み立てだけをテストしても、呼び出しを消した退行を検出できない。
+ */
+describe('Issue #56: 履歴の記録', () => {
+  const origChrome = (globalThis as { chrome?: unknown }).chrome;
+  let sent: unknown[];
+
+  const installRuntime = (respond: () => unknown) => {
+    sent = [];
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = {
+      runtime: {
+        sendMessage: async (message: unknown) => {
+          sent.push(message);
+          return respond();
+        },
+      },
+    };
+  };
+
+  const makeResult = () =>
+    ({
+      downloadObject: { listPosts: () => [] },
+      addedPostCount: 1,
+      postFailures: {
+        unavailable: 0,
+        unavailableRestricted: 0,
+        unavailableMissingBody: 0,
+        unsupported: 0,
+        apiFailed: 0,
+      },
+      failedPageCount: 0,
+      listedRevisions: new Map(),
+      apiFailedPostIds: new Set(),
+      skippedByHistoryPostIds: new Set(),
+      collectedAt: 1000,
+      scannedCreator: true,
+      completedFullScan: true,
+      limited: false,
+    }) as unknown as CollectResult;
+
+  const manifest = { posts: [] } as unknown as DownloadManifest;
+  const zip = (aborted: boolean) =>
+    ({
+      completedPostCount: 1,
+      totalPostCount: 1,
+      writtenFileCount: 0,
+      failedFileCount: 0,
+      aborted,
+      assets: [],
+    }) as unknown as DownloadZipResult;
+
+  afterEach(() => {
+    // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
+    (globalThis as any).chrome = origChrome;
+  });
+
+  test('収集を終えたら観測を送る (ZIP を作らない回にも走査実績と最終利用時刻を残すため)', async () => {
+    installRuntime(() => ({ ok: true }));
+
+    const error = await recordObservation('creator-1', makeResult());
+
+    expect(error).toBeNull();
+    expect(sent).toEqual([
+      { type: 'historyApply', update: { creatorId: 'creator-1', at: 1000, catalog: [], scan: expect.anything() } },
+    ]);
+  });
+
+  test('ZIP を書き終えたら保存実績を送る (書けたことを次回の差分判定へ渡すため)', async () => {
+    installRuntime(() => ({ ok: true }));
+
+    const error = await recordHistory(
+      { creatorId: 'creator-1', result: makeResult() },
+      manifest,
+      zip(false),
+      'out.zip',
+    );
+
+    expect(error).toBeNull();
+    expect((sent[0] as { update: { saved?: unknown } }).update.saved).toEqual([]);
+  });
+
+  test('中断分岐へ入った実行は保存実績を送らない (書けたと確認できていないものを保存済みにしないため)', async () => {
+    installRuntime(() => ({ ok: true }));
+
+    const error = await recordHistory({ creatorId: 'creator-1', result: makeResult() }, manifest, zip(true), 'out.zip');
+
+    expect([error, sent]).toEqual([null, []]);
+  });
+
+  test('中断分岐へ入らずに返った実行は保存実績を送る (全部書き終えた後の close() 中の中断は zip.aborted が false のまま返るため)', async () => {
+    installRuntime(() => ({ ok: true }));
+
+    // 判断材料は zip.aborted だけである (signal は引数に取らないので参照しようがない)
+    const error = await recordHistory(
+      { creatorId: 'creator-1', result: makeResult() },
+      manifest,
+      zip(false),
+      'out.zip',
+    );
+
+    expect(error).toBeNull();
+    expect(sent).toHaveLength(1);
+  });
+
+  test('service worker が失敗を返したらその理由を返す (完了画面へ伝えるため)', async () => {
+    installRuntime(() => ({ ok: false, error: 'storage が一杯です' }));
+
+    const error = await recordHistory(
+      { creatorId: 'creator-1', result: makeResult() },
+      manifest,
+      zip(false),
+      'out.zip',
+    );
+
+    expect(error).toBe('storage が一杯です');
+  });
+});
+
+describe('Issue #56: 記録の失敗の文言', () => {
+  test('観測と保存の両方が落ちたらどちらも出す (片方を採るともう片方の理由が消えるため)', () => {
+    expect(joinHistoryErrors('収集が失敗', '保存が失敗')).toBe('収集の記録: 収集が失敗 / 保存の記録: 保存が失敗');
+  });
+
+  test('同じ理由なら一度だけ出す (storage が一杯なら両方が同じ文言になるため)', () => {
+    expect(joinHistoryErrors('storage が一杯です', 'storage が一杯です')).toBe('storage が一杯です');
+  });
+
+  test('片方だけならそれをそのまま出す', () => {
+    expect([joinHistoryErrors('だけ', null), joinHistoryErrors(null, 'だけ'), joinHistoryErrors(null, null)]).toEqual([
+      'だけ',
+      'だけ',
+      null,
+    ]);
   });
 });

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { ARCHIVE_FORMAT_VERSION } from '../../src/content/archive-path';
 import { ResponseParseError, resetSharedBackoff } from '../../src/content/fanbox/api';
 import { collect, PostBodyInvalidError, type ProgressCallback } from '../../src/content/fanbox/collector';
+import { type CreatorHistory, HISTORY_SCHEMA_VERSION } from '../../src/history-record';
 
 const CREATOR_ID = 'testcreator';
 const LIST_PAGE_URL = `https://api.fanbox.cc/post.listCreator?creatorId=${CREATOR_ID}&cursor=1`;
@@ -66,6 +68,48 @@ function recordRequestedUrls(): string[] {
 
 const SETTINGS = { isIgnoreFree: false, limit: null, apiIntervalMs: 50 };
 
+/** POST_STUB を「前回すべて保存できた」状態で記録した履歴 (Issue #56 の差分判定用) */
+const HISTORY: CreatorHistory = {
+  schemaVersion: HISTORY_SCHEMA_VERSION,
+  creatorId: CREATOR_ID,
+  lastUsedAt: 1,
+  catalog: [
+    {
+      postId: POST_STUB.id,
+      observedAt: 1,
+      updatedDatetime: POST_STUB.updatedDatetime,
+      title: POST_STUB.title,
+      publishedDatetime: POST_STUB.publishedDatetime,
+      complete: true,
+      assets: [
+        { kind: 'image', assetId: 'img-1', originalName: 'img', extension: 'png' },
+        { kind: 'cover', originalName: 'cover', extension: 'jpg' },
+      ],
+    },
+  ],
+  saved: [
+    {
+      postId: POST_STUB.id,
+      archiveDirectory: `${POST_STUB.id}_${POST_STUB.title}`,
+      revision: POST_STUB.updatedDatetime,
+      archiveFormatVersion: ARCHIVE_FORMAT_VERSION,
+      savedAt: 2,
+      assets: [
+        {
+          kind: 'image',
+          assetId: 'img-1',
+          archiveName: 'img_image_img-1.png',
+          outcome: 'written',
+          zipName: 'out.zip',
+          savedAt: 2,
+        },
+        { kind: 'cover', archiveName: 'cover.jpg', outcome: 'written', zipName: 'out.zip', savedAt: 2 },
+      ],
+    },
+  ],
+  scan: null,
+};
+
 /**
  * 待機を即時化する。観測できない失敗の再試行は 5 秒・15 秒の固定待機で、Retry-After のように
  * テストから短くできないため、待機時間そのものが関心事でないテストではこれで実時間を待たない。
@@ -103,6 +147,372 @@ describe('collect', () => {
     // biome-ignore lint/suspicious/noExplicitAny: chrome runtime mock
     (globalThis as any).chrome = origChrome;
     resetSharedBackoff();
+  });
+
+  test('履歴に載っている変わらない投稿は post.info を発行しない (Issue #56 で実際に API コストを減らす箇所)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+    const requested = recordRequestedUrls();
+
+    const result = await collect(CREATOR_ID, undefined, SETTINGS, () => {}, new AbortController().signal, HISTORY);
+
+    expect(requested).not.toContain(POST_INFO_URL);
+    expect([result.addedPostCount, [...result.skippedByHistoryPostIds]]).toEqual([0, ['1001']]);
+  });
+
+  test('省いた投稿は失敗にも成功にも数えない (取りこぼしではないため)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+
+    const result = await collect(CREATOR_ID, undefined, SETTINGS, () => {}, new AbortController().signal, HISTORY);
+
+    expect([result.postFailures.apiFailed, result.postFailures.unavailable, result.failedPageCount]).toEqual([0, 0, 0]);
+  });
+
+  test('skipPreviouslySaved が false なら履歴があっても全件を取得する (前回保存分も取得する の経路)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+    const requested = recordRequestedUrls();
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      SETTINGS,
+      () => {},
+      new AbortController().signal,
+      HISTORY,
+      false,
+    );
+
+    expect(requested).toContain(POST_INFO_URL);
+    expect([result.addedPostCount, result.skippedByHistoryPostIds.size]).toEqual([1, 0]);
+  });
+
+  test('skipPreviouslySaved が false でも凍結名は据え置く (再取得の指定は過去に割り当てた名前を捨てる理由にならないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      // タイトルが変わっても、凍結名を使うなら投稿ディレクトリ名は前回のままになる
+      [POST_INFO_URL]: { body: { post: { ...POST_FULL, title: '変更後のタイトル' } } },
+    });
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      SETTINGS,
+      () => {},
+      new AbortController().signal,
+      HISTORY,
+      false,
+    );
+
+    const json = JSON.parse(result.downloadObject.stringify());
+    expect(json.posts[0].encodedName).toBe(HISTORY.saved[0].archiveDirectory);
+  });
+
+  test('一覧の updatedDatetime が変わっていれば履歴があっても取得する (編集された投稿を飛ばさないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [{ ...POST_STUB, updatedDatetime: '2099-01-01T00:00:00+09:00' }] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+    const requested = recordRequestedUrls();
+
+    const result = await collect(CREATOR_ID, undefined, SETTINGS, () => {}, new AbortController().signal, HISTORY);
+
+    expect(requested).toContain(POST_INFO_URL);
+    expect(result.addedPostCount).toBe(1);
+  });
+
+  test('一覧の updatedDatetime を postId ごとに記録する (次回の差分判定を一覧の走査だけで済ませるため)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+
+    const result = await collectCreator();
+
+    expect([...result.listedRevisions]).toEqual([['1001', POST_STUB.updatedDatetime]]);
+  });
+
+  test('updatedDatetime が欠けていても収集を止めず null として記録する (最適化の情報で収集全体を落とさないため)', async () => {
+    const { updatedDatetime: _dropped, ...withoutUpdated } = POST_STUB;
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [withoutUpdated] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect([result.addedPostCount, result.listedRevisions.get('1001')]).toEqual([1, null]);
+  });
+
+  test('一覧と詳細の updatedDatetime が食い違えば突き合わせに使わない (取得できていない中身をその版で保存済みとして扱わないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [{ ...POST_STUB, updatedDatetime: '2099-01-01T00:00:00+09:00' }] } },
+      // 詳細だけ古い版を返す (エンドポイントごとのキャッシュ差を模す)
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect([result.addedPostCount, result.listedRevisions.get('1001')]).toEqual([1, null]);
+  });
+
+  test('詳細に updatedDatetime が無ければ突き合わせに使わない (同じ世代だと確認できないため)', async () => {
+    const { updatedDatetime: _dropped, ...withoutUpdated } = POST_FULL;
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: withoutUpdated } } });
+
+    const result = await collectCreator();
+
+    expect([result.addedPostCount, result.listedRevisions.get('1001')]).toEqual([1, null]);
+  });
+
+  test('一覧と詳細の updatedDatetime が一致すればその値を残す (差分判定を成立させるため)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+
+    const result = await collectCreator();
+
+    expect(result.listedRevisions.get('1001')).toBe(POST_STUB.updatedDatetime);
+  });
+
+  test('取り込めなかった投稿の updatedDatetime も記録する (次回その投稿を飛ばすかの判断に一覧の値が要るため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [{ ...POST_STUB, isRestricted: true }] } },
+    });
+
+    const result = await collectCreator();
+
+    expect([result.addedPostCount, result.listedRevisions.get('1001')]).toEqual([0, POST_STUB.updatedDatetime]);
+  });
+
+  test('一覧だけの決定を取り消しても進捗は最後まで届く (取り消しで進捗を戻すと途中で止まって見えるため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: {
+        body: {
+          posts: [
+            { ...POST_STUB, isRestricted: true },
+            { ...POST_STUB, isRestricted: false },
+          ],
+        },
+      },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+    const progress: Array<[number, number]> = [];
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      SETTINGS,
+      (current, total) => progress.push([current, total]),
+      new AbortController().signal,
+    );
+
+    expect(progress[progress.length - 1]).toEqual([2, 2]);
+    expect([...result.apiFailedPostIds]).toEqual([]);
+  });
+
+  test('無料として除外した投稿が有料に変わって二度目に来たら取得する (走査中の変更で取得対象を落とさないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: {
+        body: {
+          posts: [
+            { ...POST_STUB, feeRequired: 0 },
+            { ...POST_STUB, feeRequired: 500, updatedDatetime: '2099-01-01T00:00:00+09:00' },
+          ],
+        },
+      },
+      // 一覧と詳細で feeRequired を揃える。詳細が無料のままだと addByPostInfo が
+      // 同じ isIgnoreFree の判定で 'ignored' を返し、何を確かめているか分からなくなる
+      [POST_INFO_URL]: { body: { post: { ...POST_FULL, feeRequired: 500 } } },
+    });
+    const requested = recordRequestedUrls();
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      { ...SETTINGS, isIgnoreFree: true },
+      () => {},
+      new AbortController().signal,
+    );
+
+    expect(requested).toContain(POST_INFO_URL);
+    expect(result.addedPostCount).toBe(1);
+  });
+
+  test('閲覧不可として数えた投稿が閲覧可能で二度目に来たら取得し、失敗の件数も戻す (閲覧できる投稿を失敗に残さないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: {
+        body: {
+          posts: [
+            { ...POST_STUB, isRestricted: true },
+            { ...POST_STUB, isRestricted: false, updatedDatetime: '2099-01-01T00:00:00+09:00' },
+          ],
+        },
+      },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect([result.addedPostCount, result.postFailures.unavailable, result.postFailures.unavailableRestricted]).toEqual(
+      [1, 0, 0],
+    );
+  });
+
+  test('updatedDatetime が同じでも公開範囲だけ変わっていれば決定を取り消す (更新時刻だけを見ると取りこぼすため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: {
+        body: {
+          posts: [
+            { ...POST_STUB, isRestricted: true },
+            { ...POST_STUB, isRestricted: false },
+          ],
+        },
+      },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect([result.addedPostCount, result.postFailures.unavailable]).toEqual([1, 0]);
+  });
+
+  test('post.info まで取り込んだ投稿は食い違う重複が来ても取り直さない (二回登録すると投稿ディレクトリ名が重複するため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: {
+        body: { posts: [POST_STUB, { ...POST_STUB, updatedDatetime: '2099-01-01T00:00:00+09:00' }] },
+      },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect(result.addedPostCount).toBe(1);
+    expect(JSON.parse(result.downloadObject.stringify()).posts).toHaveLength(1);
+  });
+
+  test('同じ投稿が同じ updatedDatetime で二度来たらその値を採る (重複そのものは差分判定を妨げないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [POST_STUB, POST_STUB] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect(result.listedRevisions.get('1001')).toBe(POST_STUB.updatedDatetime);
+  });
+
+  test('同じ投稿の updatedDatetime が食い違ったら読めなかった扱いにする (走査中の編集を古い値で省略しないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [POST_STUB, { ...POST_STUB, updatedDatetime: '2099-01-01T00:00:00+09:00' }] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect(result.listedRevisions.get('1001')).toBeNull();
+  });
+
+  test('古い値で省略した投稿は、食い違う重複が来たら取り消して取得する (編集後の投稿を落とさないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [POST_STUB, { ...POST_STUB, updatedDatetime: '2099-01-01T00:00:00+09:00' }] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+    const requested = recordRequestedUrls();
+
+    const result = await collect(CREATOR_ID, undefined, SETTINGS, () => {}, new AbortController().signal, HISTORY);
+
+    expect(requested).toContain(POST_INFO_URL);
+    expect([result.addedPostCount, result.skippedByHistoryPostIds.size]).toEqual([1, 0]);
+  });
+
+  test('全ページを走査できたら完走として報告する (走査実績の整合性を保つため)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+
+    const result = await collectCreator();
+
+    expect([result.scannedCreator, result.completedFullScan, result.limited]).toEqual([true, true, false]);
+  });
+
+  test('一覧ページの取得に失敗したら完走として報告しない (欠落した投稿を削除と誤認させないため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [`https://api.fanbox.cc/post.paginateCreator?creatorId=${CREATOR_ID}`]: {
+        body: { pageUrls: [LIST_PAGE_URL, `${LIST_PAGE_URL}&page=2`] },
+      },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collectCreator();
+
+    expect([result.failedPageCount, result.completedFullScan]).toEqual([1, false]);
+  });
+
+  test('件数上限に達して打ち切ったら完走として報告しない (一覧を全部見ていないため)', async () => {
+    const secondPage = `${LIST_PAGE_URL}&page=2`;
+    mockApi({
+      ...BASE_RESPONSES,
+      [`https://api.fanbox.cc/post.paginateCreator?creatorId=${CREATOR_ID}`]: {
+        body: { pageUrls: [LIST_PAGE_URL, secondPage] },
+      },
+      [secondPage]: { body: { posts: [{ ...POST_STUB, id: '1002' }] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      { ...SETTINGS, limit: 1 },
+      () => {},
+      new AbortController().signal,
+    );
+
+    expect([result.limited, result.completedFullScan]).toEqual([true, false]);
+  });
+
+  test('同じページの途中で上限に達しても完走として報告しない (最終ページでは外側のループが正常終了してしまうため)', async () => {
+    mockApi({
+      ...BASE_RESPONSES,
+      [LIST_PAGE_URL]: { body: { posts: [POST_STUB, { ...POST_STUB, id: '1002' }] } },
+      [POST_INFO_URL]: { body: { post: POST_FULL } },
+    });
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      { ...SETTINGS, limit: 1 },
+      () => {},
+      new AbortController().signal,
+    );
+
+    expect([result.limited, result.completedFullScan]).toEqual([true, false]);
+  });
+
+  test('上限を設定しても達しなければ完走として報告する (一覧は全部見ているので削除の判断材料としては完走と変わらないため)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+
+    const result = await collect(
+      CREATOR_ID,
+      undefined,
+      { ...SETTINGS, limit: 100 },
+      () => {},
+      new AbortController().signal,
+    );
+
+    expect([result.limited, result.completedFullScan]).toEqual([false, true]);
+  });
+
+  test('単一投稿モードは creator の走査ではないと報告する (一覧を見ていない収集で走査実績を書かせないため)', async () => {
+    mockApi({ ...BASE_RESPONSES, [POST_INFO_URL]: { body: { post: POST_FULL } } });
+
+    const result = await collectSinglePost();
+
+    expect([result.scannedCreator, result.completedFullScan]).toEqual([false, false]);
   });
 
   test('新形状のレスポンスから投稿を収集できる', async () => {

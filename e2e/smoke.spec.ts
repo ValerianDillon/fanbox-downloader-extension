@@ -1,6 +1,7 @@
 import { rm } from 'node:fs/promises';
 import { expect, test } from '@playwright/test';
 import {
+  CREATOR_ID,
   EXPECTED_FETCHED_URLS,
   EXPECTED_ZIP_ENTRIES,
   LIST_PAGE_RESPONSE,
@@ -83,6 +84,109 @@ test('FANBOX creator ページ: 収集から ZIP 生成まで完走する', asyn
     const parsed = parseZip(zipBytes);
     const entryNames = [...parsed.entries.map((e) => e.name)].sort();
     expect(entryNames).toEqual(EXPECTED_ZIP_ENTRIES);
+
+    // Issue #56: 収集と ZIP の結果が実際に履歴として書かれるところまでを見る。
+    // 差分の組み立て (test/history-update.ts) と送信の判断 (test/overlay.test.ts) を
+    // 個別に固定しても、overlay からの呼び出しを消した退行は検出できない。
+    // service worker 側の storage を直接読むことで、収集 → overlay → service worker →
+    // storage の配線全体を一度に確かめる
+    const history = await session.serviceWorker.evaluate(async (creatorId: string) => {
+      const key = `fbdlHistory:${creatorId}`;
+      const stored = await chrome.storage.local.get(key);
+      const record = stored[key] as
+        | { catalog?: unknown[]; saved?: { assets?: { outcome?: string }[] }[]; scan?: { completedFullScan?: boolean } }
+        | undefined;
+      return {
+        catalogCount: record?.catalog?.length ?? 0,
+        savedCount: record?.saved?.length ?? 0,
+        writtenCount:
+          record?.saved?.reduce(
+            (total, post) => total + (post.assets ?? []).filter((asset) => asset.outcome === 'written').length,
+            0,
+          ) ?? 0,
+        completedFullScan: record?.scan?.completedFullScan ?? null,
+      };
+    }, CREATOR_ID);
+
+    expect(history).toEqual({
+      catalogCount: 2,
+      savedCount: 2,
+      // 取得系のエントリ (カバー + 本文アセット) の数。投稿ディレクトリ直下の生成物
+      // (index.html / info.json / info.txt) とルートの固定ファイルは含めない
+      writtenCount: EXPECTED_ZIP_ENTRIES.filter(
+        (name) =>
+          name.split('/').length === 3 && !name.endsWith('/') && !/\/(index\.html|info\.json|info\.txt)$/.test(name),
+      ).length,
+      completedFullScan: true,
+    });
+  } finally {
+    await context.close();
+    await rm(userDataDir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Issue #56 の中心要件の回帰テスト: 2 回目の収集で、前回と変わらない投稿の `post.info` を
+ * 発行しないこと。
+ *
+ * 単体テストは「省略できる条件」(`test/history-plan.test.ts`) と「履歴の組み立て」
+ * (`test/history-update.test.ts`) を別々に固定しているが、次の配線はどれも押さえていない。
+ *
+ * - 収集の開始時に storage から履歴を読むこと
+ * - 読んだ履歴を `collect()` へ渡すこと
+ * - 全件が省かれたとき review へ進まず「更新はありませんでした」と表示すること
+ * - 全件省略の回でも既存のカタログと保存実績が失われないこと
+ *
+ * 同じブラウザコンテキストで 2 回収集し、2 回目に `post.info` が要求されないことを見る。
+ */
+test('2 回目の収集では前回保存済みの投稿の post.info を発行しない (Issue #56)', async () => {
+  const session = await launchAndStartCollecting(JSON_RESPONSES, 'diff');
+  const { context, page, overlay, userDataDir } = session;
+
+  try {
+    await confirmReview(session);
+    await expect
+      .poll(() => page.evaluate(readTestState), { timeout: 30_000 })
+      .toMatchObject({ overlayState: 'complete', zipDone: '1' });
+
+    const beforeSecond = await session.serviceWorker.evaluate(async (creatorId: string) => {
+      const key = `fbdlHistory:${creatorId}`;
+      const stored = await chrome.storage.local.get(key);
+      return JSON.stringify(stored[key]);
+    }, CREATOR_ID);
+
+    // 完了画面を閉じ、同じページから 2 回目の収集を始める
+    await overlay.getByRole('button', { name: '閉じる' }).click();
+    await page.locator('#fanbox-downloader-ext-fab button').click();
+    // 履歴の読み込みが済むまで「記録を削除」は現れない
+    await expect(overlay.locator('#history-forget')).toBeVisible({ timeout: 10_000 });
+
+    const requestedAfter: string[] = [];
+    await context.route('https://api.fanbox.cc/post.info**', async (route) => {
+      requestedAfter.push(route.request().url());
+      await route.fallback();
+    });
+    await overlay.getByRole('button', { name: '投稿を収集' }).click();
+
+    await expect
+      .poll(() => page.evaluate(readTestState), { timeout: 30_000 })
+      .toMatchObject({ overlayState: 'complete' });
+
+    // 変わっていないので post.info は 1 回も出ず、ZIP も作らない
+    expect(requestedAfter).toEqual([]);
+    const state = await page.evaluate(readTestState);
+    expect(state.addedPostCount).toBe('0');
+    await expect(overlay.locator('p')).toContainText('前回保存済みから更新はありませんでした');
+
+    // 全件省略の回でも既存の記録は失われない
+    const afterSecond = await session.serviceWorker.evaluate(async (creatorId: string) => {
+      const key = `fbdlHistory:${creatorId}`;
+      const stored = await chrome.storage.local.get(key);
+      const record = stored[key] as { catalog?: unknown[]; saved?: unknown[] } | undefined;
+      return { catalogCount: record?.catalog?.length ?? 0, savedCount: record?.saved?.length ?? 0 };
+    }, CREATOR_ID);
+    expect(afterSecond).toEqual({ catalogCount: 2, savedCount: 2 });
+    expect(beforeSecond).not.toBeUndefined();
   } finally {
     await context.close();
     await rm(userDataDir, { recursive: true, force: true });

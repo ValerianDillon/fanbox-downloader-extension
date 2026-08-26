@@ -156,6 +156,41 @@ function isValidPostListItem(item: unknown): boolean {
   );
 }
 
+/**
+ * 一覧要素の `updatedDatetime` を読む (Issue #56)。
+ *
+ * **必須の validator (`isValidPostListItem`) には足さない。** これは差分判定という最適化のための
+ * 情報でしかなく、欠落や型不正で収集全体を止める理由にならない。読めなければ null を返し、
+ * その投稿だけ通常の取得へフォールバックさせる。
+ *
+ * 空文字と空白だけの文字列も読めなかった扱いにする。突き合わせに使う値なので、
+ * 編集の前後がどちらも空文字だと「変わっていない」と誤判定する。
+ *
+ * `PostListItemCandidate` は index signature を持たない (未検証のフィールドを型に出さないため)
+ * ので、生の値として読み直す。
+ */
+export function decodeListedUpdatedDatetime(item: PostListItemCandidate): string | null {
+  const value = (item as unknown as Record<string, unknown>).updatedDatetime;
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  return value;
+}
+
+/**
+ * `post.info` の投稿オブジェクトの `updatedDatetime` を読む (Issue #56)。
+ *
+ * 一覧が返した値と突き合わせて、**一覧と詳細が同じ世代を指しているか**を確かめるために使う。
+ * エンドポイントごとにキャッシュの状態が違えば、一覧が新しい版を返しているのに詳細が古い版を
+ * 返すことがありうる。そのまま一覧の値を保存実績に付けると、取得できていない中身を
+ * 「その版で保存済み」として扱い、次回その投稿を丸ごと飛ばす。
+ *
+ * 一覧側と同じく必須の validator には足さない。読めなければ「確認できなかった」として扱う。
+ */
+export function decodePostInfoUpdatedDatetime(post: PostInfoCandidate): string | null {
+  const value = (post as unknown as Record<string, unknown>).updatedDatetime;
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  return value;
+}
+
 /** 支援額タグの表示名の組み立てに使う 2 つを検証する */
 function isValidPlan(item: unknown): boolean {
   const plan = item as PlanInfo | null;
