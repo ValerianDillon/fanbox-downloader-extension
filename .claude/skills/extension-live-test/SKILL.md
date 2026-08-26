@@ -100,6 +100,8 @@ headless Chromium は UA が `HeadlessChrome/...` になり、Cloudflare のボ�
 
 **unwrap のパスはエンドポイントごとに違う。** 投稿やプランが `body` 直下に入るエンドポイントは無い — `post.info` は `body.post`、`post.listCreator` は `body.posts`、`post.paginateCreator` は `body.pageUrls`、`plan.listSupporting` は `body.plans` である。正しいパスは `src/content/fanbox/api.ts` の各 `fetchXxx` が SoT。
 
+**1 段浅く読んでも例外にはならない。** 存在しないパスは `undefined` になり、`JSON.stringify` がキーごと落とすので、「API がそのフィールドを返していない」という観測に見える。フィールドの有無を実機で判定するときは、先に生のレスポンス本文を出して形を確かめる。
+
 ## 拡張が発行した API 要求を数える
 
 **chrome-devtools MCP の `list_network_requests` に拡張の API 要求は出ない。** content script の fetch は service worker のプロキシを通るため、ページのネットワークログにはページ自身の要求しか現れない。「2 回目の収集で `post.info` が減るか」のように発行数そのものを検証したいときは使えない。
