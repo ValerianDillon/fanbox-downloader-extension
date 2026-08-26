@@ -100,6 +100,8 @@ headless Chromium は UA が `HeadlessChrome/...` になり、Cloudflare のボ�
 
 **unwrap のパスはエンドポイントごとに違う。** 投稿やプランが `body` 直下に入るエンドポイントは無い — `post.info` は `body.post`、`post.listCreator` は `body.posts`、`post.paginateCreator` は `body.pageUrls`、`plan.listSupporting` は `body.plans` である。正しいパスは `src/content/fanbox/api.ts` の各 `fetchXxx` が SoT。
 
+**セッションが切れていても status は 200 のままになる。** 拡張の service worker からの fetch は `credentials` を指定しなくても Cookie が乗る (`credentials: 'omit'` を明示したときだけ落ちる)。Cookie が無い状態で支援中クリエイターの有料投稿の `post.info` を叩くと、status 200 のまま `body.post.isRestricted` が `true` になり、中身だけが落ちる。一方 `plan.listSupporting` のようにアカウントに紐づくエンドポイントは 400 を返す。status だけを見て「取得できた」と判断しない。
+
 **1 段浅く読んでも例外にはならない。** 存在しないパスは `undefined` になり、`JSON.stringify` がキーごと落とすので、「API がそのフィールドを返していない」という観測に見える。フィールドの有無を実機で判定するときは、先に生のレスポンス本文を出して形を確かめる。
 
 ## 拡張が発行した API 要求を数える
