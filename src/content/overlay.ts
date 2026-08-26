@@ -440,13 +440,6 @@ export class OverlayController {
    * (確認文の「次回は全件を取得します」に反する)。
    */
   private readonly deletingCreators = new Map<string, Promise<unknown>>();
-  /**
-   * 進行中の履歴の読み込み。設定画面の表示にだけ使う。
-   *
-   * 収集はこれを待たず、開始の直前に storage から読み直す。画面に持っている値は
-   * 別のタブの削除で古くなりうるので、待っても正しい値になるとは限らない。
-   */
-  private historyLoad: Promise<void> = Promise.resolve();
   /** 履歴を一度でも読み終えたか。設定画面の表示を「確認中」と分けるために持つ */
   private historyLoaded = false;
   /**
@@ -546,7 +539,7 @@ export class OverlayController {
     // 更新しないと、前の creator の件数を出したまま「記録を削除」がこちらの creator に効く
     if (creatorChanged && this.state === 'settings' && this.panelEl) {
       this.renderHistoryRow();
-      this.historyLoad = this.loadHistory();
+      void this.loadHistory();
     }
   }
 
@@ -555,7 +548,7 @@ export class OverlayController {
     this.renderPanel();
     // 履歴の読み出しは storage への往復なので、画面を出してから追いつかせる。
     // 待ってから描画すると、パネルが開くまでに間が空く
-    this.historyLoad = this.loadHistory();
+    void this.loadHistory();
   }
 
   /**
@@ -802,7 +795,7 @@ export class OverlayController {
         // 世代が進んでいる = この削除の間に読み込みが走っており、その結果は
         // `deletingCreators` で捨てられている。放っておくと storage には履歴があるのに
         // 画面もメモリも「履歴なし」のままになるので、読み直す
-        this.historyLoad = this.loadHistory();
+        void this.loadHistory();
       }
       if (this.state === 'settings') {
         button.disabled = false;
