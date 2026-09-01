@@ -153,6 +153,7 @@ jobs:
         shell: bash
         env:
           ASSET_NAME: ${{ needs.build.outputs.asset_name }}
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_NOTICE: |-
             この拡張は非公式であり、ピクシブ株式会社が開発、配布、承認するものではありません。
