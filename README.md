@@ -5,9 +5,27 @@ pixiv FANBOX の投稿を ZIP として一括ダウンロードする Chrome 拡
 [fanbox-downloader](https://github.com/ValerianDillon/fanbox-downloader) のブックマークレット版を Chrome 拡張に移行したもの。
 `host_permissions` による CORS 回避により、1 クリックでデータ収集からZIPダウンロードまで完結する。
 
+## 利用上の注意
+
+本拡張は非公式であり、ピクシブ株式会社が開発、配布、承認するものではない。
+利用者自身が現在のアカウントで正当に閲覧できる投稿を個人用に保存する用途を想定している。
+アクセス権限の回避、取得したコンテンツの再配布、第三者の権利を侵害する利用には使用しないこと。
+本拡張を利用したアクセスと取得物の管理には、[pixivおよびpixivFANBOXの利用規約](https://policies.pixiv.net/)と各クリエイターが定めた条件が適用される。
+本リポジトリの MIT License は拡張のソースコードにだけ適用され、取得した投稿コンテンツの利用権を付与しない。
+
 ## インストール
 
 Chrome Web Store には未公開。ローカルからサイドロードする。
+
+### Release ZIP を使う
+
+1. [Releases](https://github.com/ValerianDillon/fanbox-downloader-extension/releases) から対象バージョンの `fanbox-downloader-extension-vX.Y.Z.zip` をダウンロードする
+2. ZIP を任意のディレクトリへ展開する
+3. `chrome://extensions` を開く
+4. 「デベロッパーモード」を有効化する
+5. 「パッケージ化されていない拡張機能を読み込む」から、ZIP を展開したディレクトリを選択する
+
+### ソースからビルドする
 
 ```bash
 git clone https://github.com/ValerianDillon/fanbox-downloader-extension.git
@@ -17,8 +35,8 @@ bun run build
 ```
 
 1. `chrome://extensions` を開く
-2. 「デベロッパーモード」を有効化
-3. 「パッケージ化されていない拡張機能を読み込む」→ `dist/` ディレクトリを選択
+2. 「デベロッパーモード」を有効化する
+3. 「パッケージ化されていない拡張機能を読み込む」から `dist/` ディレクトリを選択する
 
 ## 使い方
 
