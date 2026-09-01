@@ -29,6 +29,6 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "download-helper": "github:ValerianDillon/download-helper#e0d3809"
+    "download-helper": "github:ValerianDillon/download-helper#v11.0.0"
   }
 }

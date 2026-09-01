@@ -5,7 +5,7 @@
     "": {
       "name": "fanbox-downloader-extension",
       "dependencies": {
-        "download-helper": "github:ValerianDillon/download-helper#e0d3809",
+        "download-helper": "github:ValerianDillon/download-helper#v11.0.0",
       },
       "devDependencies": {
         "@biomejs/biome": "^2.0.0",
@@ -94,7 +94,7 @@
 
     "bun-types": ["bun-types@1.3.14", "https://npm.flatt.tech/bun-types/-/bun-types-1.3.14.tgz", { "dependencies": { "@types/node": "*" } }, "sha512-4N0ig0fEomHt5R0KCFWjovxow98rIoRwKolrYdCcknNwMekCXRnWEUvgu5soYV8QXtVsrUD8B95MBOZGPvr6KQ=="],
 
-    "download-helper": ["download-helper@github:ValerianDillon/download-helper#e0d3809", { "dependencies": { "@zip.js/zip.js": "^2.9.0" } }, "ValerianDillon-download-helper-e0d3809", "sha512-j8nffgWpLBcFMhiCMiT3KrSXBiL9LbvZVazs2mq43Cie+4w84f/7BAZ+MXhTqyYB5Jo4gqCJfGPmxe521NiYkw=="],
+    "download-helper": ["download-helper@github:ValerianDillon/download-helper#60900cc", { "dependencies": { "@zip.js/zip.js": "^2.9.0" } }, "ValerianDillon-download-helper-60900cc", "sha512-JlTUNk5gznmpsJQGAeF9EKdbgoAKcc4WiNC9k/72Vx4MsIibUB0bABwthYX+Zp0KfP/06nPzP/2F8yzWg8Q8Ug=="],
 
     "fsevents": ["fsevents@2.3.2", "https://npm.flatt.tech/fsevents/-/fsevents-2.3.2.tgz", { "os": "darwin" }, "sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA=="],
 
