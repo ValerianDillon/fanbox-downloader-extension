@@ -312,7 +312,7 @@ export class ApiSession {
       if (signal?.aborted || e instanceof RateLimitExhaustedError || e instanceof TransportExhaustedError) throw e;
       // プラン名は表示の補助なので、HTTP エラーやレスポンス形状の不一致
       // (ApiShapeError / ResponseParseError) は握りつぶして続行する
-      // (CLAUDE.md 「形状が想定と違うとき、プラン名とタグは表示の補助なので握りつぶして
+      // (`.claude/rules/fanbox-api.md`「形状が想定と違うとき、プラン名とタグは表示の補助なので握りつぶして
       // 続行し、投稿一覧と投稿詳細は ApiShapeError で中断する」の方針)。
       // それ以外の想定外の例外 (validator や内部処理のバグ等) まで飲み込むと、
       // 他の経路 (collector.ts) で採用した陽性判定の方針と矛盾し、こちらのバグが

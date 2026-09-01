@@ -666,7 +666,7 @@ describe('レスポンスのアンラップ', () => {
 
   // プラン名・タグは表示の補助なので、通信/HTTP の失敗 (HttpError) も
   // 形状不一致 (ApiShapeError) と同様に握りつぶして続行してよい
-  // (CLAUDE.md 「プラン名とタグは表示の補助なので握りつぶして続行し」の方針)
+  // (`.claude/rules/fanbox-api.md`「プラン名とタグは表示の補助なので握りつぶして続行し」の方針)
   test('fetchPlans は HttpError (HTTP 失敗) も握りつぶして空配列を返す', async () => {
     nextResponse = { ok: false, status: 500, retryAfter: null };
     expect(await api.fetchPlans('c')).toEqual([]);

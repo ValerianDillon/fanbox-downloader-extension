@@ -75,7 +75,7 @@ function parseArgs(argv: string[]): Options {
  * スクリプトをキャッシュ (ScriptCache) から起動することがある。その場合、ディスクから毎回
  * 注入される新版の content script と、キャッシュされた旧版 service worker との間でワイヤ契約
  * (src/media-stream-protocol.ts) が食い違い、Port 接続が「Receiving end does not exist」で
- * 全件失敗する (詳細は CLAUDE.md / SKILL.md「診断」節)。永続プロファイルを使い回す
+ * 全件失敗する (詳細は AGENTS.md / SKILL.md「診断」節)。永続プロファイルを使い回す
  * ランチャーの性質上、SW を変更するたびにこの不整合が起き得るため毎回削除して踏まない
  * ようにする。Cookie はプロファイル内の別ディレクトリ (Default/Cookies 等) にあるため
  * このディレクトリを消しても消えない。
@@ -91,7 +91,7 @@ function clearServiceWorkerCache(profileDir: string): void {
 /**
  * WSLg の DISPLAY / WAYLAND_DISPLAY を引き継いだまま headless Chromium を起動すると、
  * 最初の requestAnimationFrame の配送が 60〜100 秒止まる (e2e/smoke.spec.ts の browserEnv()
- * と同じ既知の問題、詳細は CLAUDE.md 参照)。headless 時のみ取り除く。headed 時は WSLg の
+ * と同じ既知の問題、詳細は AGENTS.md 参照)。headless 時のみ取り除く。headed 時は WSLg の
  * ウィンドウ表示に必要なため引き継ぐ。
  */
 function launchEnv(headed: boolean): Record<string, string> {

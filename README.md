@@ -59,7 +59,7 @@ bun run test:smoke  # 拡張の smoke test (Playwright, headless Chromium)
 テストビルド (`dist-test/`) を実際に Chromium (headless, WSL2 で動作確認済み) に読み込み、FAB クリックから収集・ZIP 生成までの一連の流れを検証する。
 検証範囲は「収集の完走・全ファイル取得成功・ZIP の妥当性 (エントリ一致・EOCD の整合性)」までである。
 実ファイルへの保存 (`showSaveFilePicker` はネイティブダイアログのためブラウザ自動化では扱えない) と、ZIP エントリの mtime 反映 (`test/downloader.test.ts` でカバー済み) は対象外である。
-詳細は `CLAUDE.md` の「smoke test (Playwright)」を参照。
+詳細は `AGENTS.md` の「smoke test (Playwright)」を参照。
 
 ## 技術スタック
 
