@@ -1,4 +1,4 @@
-import { assetKeyToString, type DownloadUtils } from 'download-helper/download-helper';
+import { assetKeyToString, type DownloadUtils, type PostSummary } from 'download-helper/download-helper';
 import type { CreatorHistory, SavedPost } from '../history-record';
 import { ARCHIVE_FORMAT_VERSION, createPostIdArchivePathAllocator, type FrozenArchiveNames } from './archive-path';
 
@@ -106,6 +106,38 @@ function hasWrittenRecord(saved: SavedPost, kind: string, assetId: string | unde
   return saved.assets.some((asset) => asset.outcome === 'written' && asset.kind === kind && asset.assetId === assetId);
 }
 
+export type SavedContentSelection = {
+  readonly extensions: ReadonlySet<string>;
+  readonly includeCover: boolean;
+  readonly includeBody: boolean;
+};
+
+/** 現在のコンテンツ条件で残る対象を、この投稿の同じ世代ですべて保存済みか判定する。 */
+export function isPostSavedForSelection(
+  history: CreatorHistory | null,
+  post: PostSummary,
+  listedUpdatedDatetime: string | null,
+  selection: SavedContentSelection,
+): boolean {
+  const selectedFiles = post.files.filter((file) => selection.extensions.has(file.extension));
+  const hasPayload =
+    selection.includeBody || (selection.includeCover && post.cover !== undefined) || selectedFiles.length > 0;
+  if (!hasPayload || history === null || listedUpdatedDatetime === null) return false;
+  const catalog = history.catalog.find((item) => item.postId === post.postId);
+  if (catalog === undefined || !catalog.complete || catalog.updatedDatetime !== listedUpdatedDatetime) return false;
+  const saved = history.saved.find((item) => item.postId === post.postId);
+  if (
+    saved === undefined ||
+    saved.archiveFormatVersion !== ARCHIVE_FORMAT_VERSION ||
+    saved.revision !== listedUpdatedDatetime
+  ) {
+    return false;
+  }
+  if (selection.includeBody && !saved.bodyWritten) return false;
+  if (selection.includeCover && post.cover && !hasWrittenRecord(saved, 'cover', undefined)) return false;
+  return selectedFiles.every((file) => hasWrittenRecord(saved, file.key.kind, file.key.assetId));
+}
+
 /**
  * 収集に渡してよい履歴を選ぶ (Issue #56)。
  *
@@ -113,9 +145,9 @@ function hasWrittenRecord(saved: SavedPost, kind: string, assetId: string | unde
  * 始めるまでの間に別の creator へ遷移しうる。creator の違う履歴を渡すと、postId が
  * たまたま一致した投稿について**別の creator の保存実績を根拠に `post.info` を省く**。
  *
- * 「前回保存分も取得する」の指定はここでは見ない。**再取得の指定は凍結名を捨てる理由に
- * ならない**ためで、その指定は `collect` の `skipPreviouslySaved` が受け取る。
- * 混ぜると、再取得を選んだだけで投稿とアセットの archive 名が付け替わる。
+ * 投稿詳細を再取得するかはここでは見ない。**再取得は凍結名を捨てる理由にならない**ためで、
+ * 製品の収集フローは常に詳細を取得しながら、この関数が返す履歴を archive 名にだけ使う。
+ * 混ぜると、再取得しただけで投稿とアセットの archive 名が付け替わる。
  * @param history 読み込み済みの履歴
  * @param creatorId これから収集する creator
  */

@@ -150,6 +150,7 @@ export function buildSavedPosts(
     revision: listedRevisions.get(post.postId) ?? null,
     archiveFormatVersion: ARCHIVE_FORMAT_VERSION,
     savedAt,
+    bodyWritten: manifest.selection.includeBody,
     assets: byPostIndex.get(postIndex) ?? [],
   }));
 }

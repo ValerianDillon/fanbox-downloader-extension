@@ -14,6 +14,10 @@ export type { FileSystemFileHandle } from 'download-helper/download-helper';
 const utils = new DownloadUtils();
 const helper = new DownloadHelper(utils);
 
+/** 同時に取得するメディア数の既定値。設定画面では 1〜4 の範囲で変更できる。 */
+export const DEFAULT_MEDIA_CONCURRENCY = 3;
+export const MAX_MEDIA_CONCURRENCY = 4;
+
 /** ZIP フェーズの 1 回のメディア取得試行の記録 (Issue #18 第 1 段階の観測用契約) */
 export type MediaFetchAttempt = {
   /** 取得先ホスト名 (downloads.fanbox.cc / *.pximg.net 等)。URL 解析に失敗した場合は 'unknown' */
@@ -86,12 +90,17 @@ export async function fetchWithRetry(
         at: Date.now(),
       };
       attempts.push(attempt);
-      console.info(attempt);
+      console.info('[FBDL] メディア取得', attempt);
       if (result.blob) return result.blob;
     }
     if (signal?.aborted) return null;
     if (i < retries) {
-      console.error(`取得失敗 (retry ${i + 1}, status ${result?.status ?? '不明'}): ${name}, ${url}`);
+      console.warn('[FBDL] メディア取得を再試行', {
+        name,
+        status: result?.status ?? 0,
+        retry: i + 1,
+        maxRetries: retries,
+      });
       await utils.sleep(1000);
     }
   }
@@ -103,6 +112,104 @@ export type DownloadProgress = {
   onLog: (message: string) => void;
   onRemainTime: (time: string) => void;
 };
+
+/** 共有層の短い進捗ログを、対象と段階が分かる表示へ整える。 */
+export function formatDownloadLog(message: string): string {
+  const start = /^@(.+) 投稿:(\d+) ファイル:(\d+)$/u.exec(message);
+  if (start) return `ZIP 作成開始: @${start[1]} / 投稿 ${start[2]} 件 / 添付 ${start[3]} 件`;
+  const post = /^(.*) \((\d+)\/(\d+)\)$/u.exec(message);
+  if (post && !post[1].startsWith('download ')) return `投稿 ${post[2]}/${post[3]}: ${post[1]}`;
+  const file = /^download (.*) \((\d+)\/(\d+)\)$/u.exec(message);
+  if (file) return `取得 ${file[2]}/${file[3]}: ${file[1]}`;
+  const cover = /^download (.+)$/u.exec(message);
+  if (cover) return `取得: ${cover[1]}`;
+  const failed = /^(.+)のダウンロードに失敗$/u.exec(message);
+  if (failed) return `取得失敗: ${failed[1]}`;
+  if (message === '完了') return 'ZIP 作成完了';
+  const completedWithFailures = /^完了 \((\d+)件のダウンロードに失敗\)$/u.exec(message);
+  if (completedWithFailures) return `ZIP 作成完了: ${completedWithFailures[1]} 件取得失敗`;
+  return message;
+}
+
+type FetchFile = NonNullable<Parameters<DownloadHelper['downloadZip']>[4]>['fetchFile'];
+
+type MediaJob = {
+  readonly url: string;
+  readonly name: string;
+  readonly kind: 'cover' | 'file';
+};
+
+/** ZIP の書き込み順を保ったまま、先のメディアを指定数だけ先行取得する。 */
+export function createConcurrentFetchFile(
+  downloadObj: DownloadJsonObj,
+  fetchFile: NonNullable<FetchFile>,
+  requestedConcurrency: number,
+  signal: AbortSignal,
+): NonNullable<FetchFile> {
+  const jobs: MediaJob[] = [];
+  for (const post of downloadObj.posts) {
+    if (post.cover) jobs.push({ url: post.cover.url, name: post.cover.name, kind: 'cover' });
+    for (const file of post.files) jobs.push({ url: file.url, name: file.encodedName, kind: 'file' });
+  }
+  type Settled = { ok: true; value: Blob | null } | { ok: false; error: unknown };
+  const deferred = jobs.map(() => {
+    let resolve!: (value: Settled) => void;
+    const promise = new Promise<Settled>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve, started: false };
+  });
+  const concurrency = Math.max(1, Math.min(MAX_MEDIA_CONCURRENCY, Math.trunc(requestedConcurrency) || 1));
+  let active = 0;
+  let nextToStart = 0;
+  let nextToConsume = 0;
+  let poolStarted = false;
+  const resolvePendingAsAborted = () => {
+    for (const item of deferred) {
+      if (!item.started) {
+        item.started = true;
+        item.resolve({ ok: true, value: null });
+      }
+    }
+  };
+  const pump = () => {
+    if (signal.aborted) {
+      resolvePendingAsAborted();
+      return;
+    }
+    while (active < concurrency && nextToStart < jobs.length) {
+      const index = nextToStart++;
+      const job = jobs[index];
+      const item = deferred[index];
+      item.started = true;
+      active++;
+      void fetchFile(job.url, job.name, { kind: job.kind })
+        .then((value) => item.resolve({ ok: true, value }))
+        .catch((error: unknown) => item.resolve({ ok: false, error }))
+        .finally(() => {
+          active--;
+          pump();
+        });
+    }
+  };
+  signal.addEventListener('abort', resolvePendingAsAborted, { once: true });
+  return async (url, name, context) => {
+    // downloadZip が writable と ZIP writer を準備する前に通信を始めない。
+    // 最初の fetchFile 呼び出しを並列取得開始の合図にする。
+    if (!poolStarted) {
+      poolStarted = true;
+      pump();
+    }
+    const index = nextToConsume++;
+    const job = jobs[index];
+    if (job === undefined || job.url !== url || job.name !== name || job.kind !== context.kind) {
+      throw new Error(`メディア取得順が ZIP の書き込み計画と一致しません (${name})`);
+    }
+    const result = await deferred[index].promise;
+    if (!result.ok) throw result.error;
+    return result.value;
+  };
+}
 
 /**
  * ZIP 入力として受け付けられるかを、保存先を確保する前に確かめる。
@@ -149,7 +256,7 @@ export async function pickSaveHandle(
  * projection の結果を ZIP ファイルとして書き出す
  *
  * 受け取るのは `DownloadObject.project()` の出力そのもので、文字列を経由しない。呼び出し側は
- * picker を開く前に `assertDownloadable` で検証済みなので、ここで再び文字列に落として読み直すと
+ * picker を開く前に `preflightDownload` で検証済みなので、ここで再び文字列に落として読み直すと
  * 検証した値と書き出す値が別のオブジェクトになる。
  *
  * 戻り値の `zip` (DownloadZipResult) が対象単位の最終的な失敗集計 (カバー画像含む、中断由来は
@@ -164,12 +271,14 @@ export async function downloadAsZip(
   progress: DownloadProgress,
   signal: AbortSignal,
   shouldPublish?: () => boolean,
+  mediaConcurrency = DEFAULT_MEDIA_CONCURRENCY,
 ): Promise<DownloadAsZipResult> {
   const attempts: MediaFetchAttempt[] = [];
-  const fetchFile = wrapFetchFileForTest(
+  const directFetchFile = wrapFetchFileForTest(
     (url, name, context) => fetchWithRetry(url, name, 1, signal, context.kind, attempts),
     shouldPublish,
   );
+  const fetchFile = createConcurrentFetchFile(downloadObj, directFetchFile, mediaConcurrency, signal);
   try {
     const zip = await helper.downloadZip(downloadObj, progress.onProgress, progress.onLog, progress.onRemainTime, {
       handle,

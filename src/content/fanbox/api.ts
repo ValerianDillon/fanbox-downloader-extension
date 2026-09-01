@@ -22,6 +22,7 @@ import { sendMessageAbortable } from '../messaging';
 export { HttpError, RateLimitExhaustedError, ResponseParseError, TransportExhaustedError };
 
 export const DEFAULT_API_RATE_LIMIT_MS = 500;
+export const API_MESSAGE_TIMEOUT_MS = 35_000;
 /**
  * 利用者が指定できる基準間隔の下限。再試行の待機やバックオフ、適応スロットルの
  * パラメータは共有セッション (download-helper/api-session) が持つ。
@@ -94,7 +95,7 @@ type ApiFetchResponse = {
  * 指示を読めない (ValerianDillon/fanbox-downloader#3 の 2026-08-20 の実測)。
  */
 async function proxyFetchApi(url: string, signal?: AbortSignal): Promise<ApiFetchResponse> {
-  return sendMessageAbortable<ApiFetchResponse>({ type: 'fetchApi', url }, signal);
+  return sendMessageAbortable<ApiFetchResponse>({ type: 'fetchApi', url }, signal, API_MESSAGE_TIMEOUT_MS);
 }
 
 /**

@@ -3,14 +3,14 @@
  * 実 FANBOX (https://www.fanbox.cc/) を相手に、coding agent が拡張の実機テストを行うための
  * ランチャー。Playwright 管理の Chromium (channel: 'chromium') に dist/ の拡張を読み込んだ
  * 永続コンテキストを起動し、CDP (Chrome DevTools Protocol) を外部にポート公開する。
- * これを `chrome-devtools-mcp` (--browser-url) から操作する。
+ * これを `agent-browser --cdp <port>` から操作する。
  *
  * branded Chrome は --load-extension が廃止されているため使わない
  * (e2e/smoke.spec.ts と同じく Playwright 管理の Chromium を使う)。
  *
  * 使い方: bun scripts/live-browser.ts [--headed] [--port <n>] [--profile <dir>] [--keep-sw-cache]
  *
- * 詳細な運用手順は .claude/skills/extension-live-test/SKILL.md を参照。
+ * 詳細な運用手順は .agents/skills/extension-live-test/SKILL.md を参照。
  */
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -142,10 +142,11 @@ async function main() {
   console.log(`  mode         : ${options.headed ? 'headed' : 'headless'}`);
   console.log(`  extension    : ${extensionPath}`);
   console.log('');
-  console.log('chrome-devtools MCP から操作する場合は、次のコマンドで登録してください:');
-  console.log(
-    `  claude mcp add --scope local chrome-devtools -- npx chrome-devtools-mcp@latest --browser-url=${cdpEndpoint}`,
-  );
+  console.log('agent-browser から操作する例:');
+  console.log(`  agent-browser --session fanbox-live --cdp ${options.port} snapshot -i`);
+  console.log('');
+  console.log('service worker を直接調べる例:');
+  console.log(`  bun scripts/live-cdp-eval.ts sw 'chrome.runtime.onConnect.hasListeners()' --port ${options.port}`);
   console.log('');
   console.log('終了するには Ctrl+C (SIGINT) を送るか、このプロセスを SIGTERM で止めてください。');
 

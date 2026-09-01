@@ -21,9 +21,10 @@ import {
  * 記録しておかないと、実際には別の場所に入っている過去の ZIP を根拠に取得を省いてしまう。
  *
  * 1 は共有層の `createLegacyArchivePathAllocator` による従来の採番 (同名グループの件数に依存)。
- * 2 は postId 由来の採番 (このモジュール)。
+ * 2 は postId と元ファイル名を含む採番。
+ * 3 は `<タイトル> [<postId>]` と投稿内の数字連番による採番。
  */
-export const ARCHIVE_FORMAT_VERSION = 2;
+export const ARCHIVE_FORMAT_VERSION = 3;
 
 /**
  * 既に割り当て済みの archive 名。
@@ -46,28 +47,23 @@ export type FrozenArchiveNames = {
 /** `toSafeIdentity` が符号化しない文字 */
 const SAFE_IDENTITY_CHARS = /^[A-Za-z0-9-]$/;
 
-/**
- * `toSafeExtension` が符号化しない文字。
- * `.` を残すのは `tar.gz` のような複合拡張子を壊さないためで、`_` は含めないので
- * 識別子との切れ目は曖昧にならない。
- */
+/** archive 名の拡張子でそのまま使える文字。 */
 const SAFE_EXTENSION_CHARS = /^[A-Za-z0-9-.]$/;
 
 /**
  * 識別子を、archive 名の中で曖昧さなく取り出せる形にする。
  *
- * archive 名は `<元の名前>_<kind>_<識別子><拡張子>` の形で組み立てる。元の名前は利用者が付けた
- * 任意の文字列なので `_file_` のような並びを含みうる。識別子側にも同じ並びが現れうると、
- * 別の (名前, 鍵) の組が同じ archive 名になり、**同じパスに 2 エントリ入って片方が失われる**
- * (共有層はアセット同士の名前衝突を検査しない)。
+ * 投稿ディレクトリは `<タイトル> [<postId>]` の形で組み立てる。タイトルは利用者が付けた任意の
+ * 文字列なので、区切りに使う角括弧と同じ並びを含みうる。postId 側を一意に符号化しておけば、
+ * 正規化によって別の postId が同じディレクトリ名へ潰れることを避けられる。
  *
- * そこで識別子からは `_` を含む「安全でない文字」を追い出す。`~` を escape 記号にし、`~` 自体も
- * 符号化するので、符号化後の文字列から元の識別子を一意に復元できる。`-` を残すのは、FANBOX の
- * assetId に現れる文字で、残しても曖昧さが生じないため (読みやすさのため)。
+ * `_` を含む安全でない文字は `~<code point>~` へ符号化する。`~` 自体も符号化するので、
+ * 符号化後の文字列から元の識別子を一意に復元できる。`-` を残すのは FANBOX の postId に
+ * 現れても曖昧さが生じないためである。
  *
  * `encodeFileName` が別の文字へ潰す文字 (`/` と `／` など) も符号化されるので、正規化で
  * 潰れて同じ名前になることも無い。
- * @param value 識別子 (assetId など)
+ * @param value 投稿の識別子
  */
 function toSafeIdentity(value: string): string {
   let encoded = '';
@@ -80,8 +76,8 @@ function toSafeIdentity(value: string): string {
 /**
  * 拡張子を archive 名に使える形にする。
  *
- * 拡張子は共有層の decoder が文字列としてしか検証していないので、`_file_` のような並びも入りうる。
- * 素のまま末尾に付けると識別子との切れ目が曖昧になるため、先頭のドットを除いた本体を符号化する。
+ * 拡張子は共有層の decoder が文字列としてしか検証していないので、パスに使えない文字も入りうる。
+ * 数字連番の末尾へ安全に付けられるよう、先頭のドットを除いた本体を符号化する。
  * 実際の拡張子 (`png` / `pdf` / `tar.gz` など) は符号化しても変わらない。
  * @param extension `FileObj.extension` (先頭ドット付き、または空文字列)
  */
@@ -101,7 +97,7 @@ function toSafeExtension(extension: string): string {
  * 凍結名は保存実績から来る任意の値で、生成時のような組み立てを経ない。
  * 「不正なら受け取った時点で拒否する」ためには、正規化済みであることだけでは足りない。
  *
- * 予約名 (`index.html` / `info.json` など) との衝突はここでは見ない。
+ * 予約名 (`index.html` / `post.json` など) との衝突はここでは見ない。
  * どのファイル名が予約されているかは共有層が決めることで、こちらに写すと定義が 2 箇所になる。
  * 共有層の `preflight` が保存先を確保する前に弾く。
  * @param name 検証する名前
@@ -123,10 +119,9 @@ function assertUsableSegment(name: string, context: string, utils: DownloadUtils
 /**
  * 割り当てた名前が互いに重なっていないことを確かめる。
  *
- * 名前は「利用者が付けた任意の文字列 (元の名前・拡張子)」と「識別子」を連ねて作る。
- * 識別子側は `toSafeIdentity` で曖昧さを消しているが、**組み立て全体が単射であることを文字列の形
- * だけで保証しきるのは難しい** (`encodeFileName` が別々の文字を同じ文字へ潰す、凍結名は任意の値を
- * 取れる、など)。
+ * 投稿ディレクトリはタイトルと postId を、アセット名は数字連番と拡張子を連ねて作る。
+ * 識別子と拡張子は符号化しているが、**組み立て全体が単射であることを文字列の形だけで保証しきる
+ * のは難しい** (`encodeFileName` が別々の文字を同じ文字へ潰す、凍結名は任意の値を取れる、など)。
  *
  * 共有層はアセット同士の名前衝突を検査しない (legacy allocator が作りうるものとして許容している)
  * ので、ここで検出しないと同じパスに 2 エントリ入って片方が黙って失われる。
@@ -167,13 +162,13 @@ function truncateToBytes(value: string, maxBytes: number): string {
 }
 
 /**
- * 元の名前を archive 名に使える形にする。
+ * 投稿タイトルを archive 名に使える形にする。
  *
  * 長さで切るのは、セグメント全体が ext4 のファイル名上限 (255 bytes) を超えると、ZIP は作れても
- * 展開できないため。識別子と拡張子を先に確保し、残りを元の名前に割り当てる。
- * @param name 元の名前 (投稿タイトルまたはアセット名)
+ * 展開できないため。postId を先に確保し、残りを投稿タイトルに割り当てる。
+ * @param name 投稿タイトル
  * @param utils 正規化に使うユーティリティ
- * @param budgetBytes 元の名前に割り当てられる UTF-8 バイト数
+ * @param budgetBytes 投稿タイトルに割り当てられる UTF-8 バイト数
  */
 function toNameSlug(name: string, utils: DownloadUtils, budgetBytes: number): string {
   const truncated = truncateToBytes(name, budgetBytes);
@@ -193,7 +188,7 @@ function toNameSlug(name: string, utils: DownloadUtils, budgetBytes: number): st
 }
 
 /**
- * postId 由来の archive path を割り当てる (Issue #56)。
+ * 投稿タイトルと数字連番による archive path を割り当てる。
  *
  * 従来の採番 (`createLegacyArchivePathAllocator`) は同名グループの件数に依存するため、同名の投稿や
  * アセットが増減すると**過去に割り当てた名前まで変わる**。複数の ZIP をまたいで同じ投稿を同定
@@ -201,14 +196,10 @@ function toNameSlug(name: string, utils: DownloadUtils, budgetBytes: number): st
  *
  * ここでは投稿を postId で、アセットを `AssetKey` で指す。どちらも収集結果の増減に影響されない。
  *
- * - 投稿ディレクトリ: `<postId>_<タイトル>`。タイトルが空になる場合は `<postId>` だけ
- * - 本文アセット: `<元の名前>_<kind>_<assetId><拡張子>`。**鍵は常に付ける。** 衝突したときだけ付ける
- *   形にすると、同名のアセットが増えた時点で既存の名前が変わる。`kind` も含めるのは、共有層の
- *   identity が `kind` と `assetId` の組だからである (image と file で同じ `assetId` が来ても別物)
- * - カバー: `cover<拡張子>`。投稿に高々 1 つなので、それだけで一意である
+ * - 投稿ディレクトリ: `<タイトル> [<postId>]`。タイトルが空になる場合は `[<postId>]` だけ
+ * - カバーと本文アセット: `001<拡張子>` から始まる数字連番。カバーがあれば先頭に置く
  *
- * アセット名には必ず `image_` / `file_` が入るので、投稿ディレクトリ直下の予約名
- * (`index.html` / `info.json` / `info.txt`) と一致しない。
+ * 数字だけの stem なので、投稿ディレクトリ直下の予約名 (`index.html` / `post.json`) と一致しない。
  * 投稿ディレクトリ名はルートの予約名 (`index.html` / `download-manifest.json`) と一致しうるが、
  * それには postId 自体がその文字列である必要があり、共有層の `preflight` が picker より前に弾く。
  *
@@ -258,10 +249,10 @@ export function createPostIdArchivePathAllocator(
     if (frozenName !== undefined) return frozenName;
     // postId も符号化する。素のまま使うと ("a", "b_c") と ("a_b", "c") が同じ名前になり、
     // 正規化で潰れる文字 (`/` と `／`) でも衝突する
-    const base = toSafeIdentity(post.postId);
-    // 識別子を先に確保し、残りをタイトルに割り当てる。区切りの 1 バイトも引く
-    const slug = toNameSlug(post.name, utils, SEGMENT_MAX_BYTES - byteLength(base) - 1);
-    return slug === '' ? base : `${base}_${slug}`;
+    const identity = `[${toSafeIdentity(post.postId)}]`;
+    // 識別子を先に確保し、残りをタイトルに割り当てる。間の空白 1 byte も引く。
+    const slug = toNameSlug(post.name, utils, SEGMENT_MAX_BYTES - byteLength(identity) - 1);
+    return slug === '' ? identity : `${slug} ${identity}`;
   };
 
   return {
@@ -283,32 +274,39 @@ export function createPostIdArchivePathAllocator(
     },
     allocateAssetPaths(post) {
       const frozenForPost = frozenAssetNames.get(post.postId);
+      // 現在の投稿から消えたアセットの凍結名も予約する。
+      // 再利用すると、別のアセットが過去の ZIP と同じ番号を指してしまう。
+      const usedIndexes = new Set<number>();
+      for (const name of frozenForPost?.values() ?? []) {
+        const matched = /^(\d+)(?:\..*)?$/u.exec(name);
+        const index = matched === null ? 0 : Number.parseInt(matched[1], 10);
+        if (!Number.isSafeInteger(index) || index <= 0 || usedIndexes.has(index)) {
+          throw new Error(`凍結済みの数字連番が不正です (${post.postId}: ${JSON.stringify(name)})`);
+        }
+        usedIndexes.add(index);
+      }
+      const itemCount = post.files.length + (post.cover ? 1 : 0);
+      const maxReserved = usedIndexes.size === 0 ? 0 : Math.max(...usedIndexes);
+      const width = Math.max(3, String(Math.max(itemCount, maxReserved)).length);
+      let nextIndex = 1;
+      const allocate = (
+        key: ReadonlyPostObj['files'][number]['key'] | { readonly kind: 'cover' },
+        extension: string,
+      ) => {
+        const frozenName = frozenForPost?.get(assetKeyToString(key));
+        if (frozenName !== undefined) return frozenName;
+        while (usedIndexes.has(nextIndex)) nextIndex++;
+        const index = nextIndex++;
+        usedIndexes.add(index);
+        return `${String(index).padStart(width, '0')}${toSafeExtension(extension)}`;
+      };
       const allocated: AllocatedAssetPaths = {
-        files: post.files.map((file) => {
-          const frozenName = frozenForPost?.get(assetKeyToString(file.key));
-          if (frozenName !== undefined) return { key: file.key, archiveName: frozenName };
-          // kind も含める。共有層の identity は kind と assetId の組であり、image と file で
-          // 同じ assetId が来ても別のアセットである。assetId だけだと同じ名前になり、
-          // 同じパスに 2 エントリ入って片方が失われる
-          const identity = `${file.key.kind}_${toSafeIdentity(file.key.assetId)}`;
-          const extension = toSafeExtension(file.extension);
-          // 識別子と拡張子を先に確保し、残りを元の名前に割り当てる。区切りの 1 バイトも引く
-          const slug = toNameSlug(
-            file.name,
-            utils,
-            SEGMENT_MAX_BYTES - byteLength(identity) - byteLength(extension) - 1,
-          );
-          const stem = slug === '' ? identity : `${slug}_${identity}`;
-          // 拡張子を後から繋ぐと、拡張子側に正規化対象の文字があったときに
-          // 「正規化済みの名前を返す」という allocator の契約を破る
-          return { key: file.key, archiveName: utils.encodeFileName(`${stem}${extension}`) };
-        }),
+        files: [],
       };
       if (post.cover) {
-        const frozenName = frozenForPost?.get(assetKeyToString(post.cover.key));
-        allocated.coverArchiveName =
-          frozenName ?? utils.encodeFileName(`cover${toSafeExtension(post.cover.extension)}`);
+        allocated.coverArchiveName = allocate(post.cover.key, post.cover.extension);
       }
+      allocated.files = post.files.map((file) => ({ key: file.key, archiveName: allocate(file.key, file.extension) }));
       // 凍結名と新しく割り当てた名前が重なることもあるので、解決し終えた全体を見る
       assertUniqueNames(
         [

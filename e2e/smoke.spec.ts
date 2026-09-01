@@ -112,10 +112,9 @@ test('FANBOX creator ページ: 収集から ZIP 生成まで完走する', asyn
       catalogCount: 2,
       savedCount: 2,
       // 取得系のエントリ (カバー + 本文アセット) の数。投稿ディレクトリ直下の生成物
-      // (index.html / info.json / info.txt) とルートの固定ファイルは含めない
+      // (index.html / post.json) とルートの固定ファイルは含めない
       writtenCount: EXPECTED_ZIP_ENTRIES.filter(
-        (name) =>
-          name.split('/').length === 3 && !name.endsWith('/') && !/\/(index\.html|info\.json|info\.txt)$/.test(name),
+        (name) => name.split('/').length === 3 && !name.endsWith('/') && !/\/(index\.html|post\.json)$/.test(name),
       ).length,
       completedFullScan: true,
     });
@@ -126,20 +125,18 @@ test('FANBOX creator ページ: 収集から ZIP 生成まで完走する', asyn
 });
 
 /**
- * Issue #56 の中心要件の回帰テスト: 2 回目の収集で、前回と変わらない投稿の `post.info` を
- * 発行しないこと。
+ * 保存済みの投稿も 2 回目の収集で `post.info` を再取得し、編集を検出できることを確認する。
  *
- * 単体テストは「省略できる条件」(`test/history-plan.test.ts`) と「履歴の組み立て」
- * (`test/history-update.test.ts`) を別々に固定しているが、次の配線はどれも押さえていない。
+ * 単体テストは履歴の組み立てと保存済み判定を別々に固定しているが、次の配線は押さえていない。
  *
  * - 収集の開始時に storage から履歴を読むこと
- * - 読んだ履歴を `collect()` へ渡すこと
- * - 全件が省かれたとき review へ進まず「更新はありませんでした」と表示すること
- * - 全件省略の回でも既存のカタログと保存実績が失われないこと
+ * - 保存履歴があっても全投稿の詳細を再取得すること
+ * - 同じ世代を保存済みと表示し、既定では投稿を選択しないこと
+ * - 再観測しても既存の保存実績が失われないこと
  *
- * 同じブラウザコンテキストで 2 回収集し、2 回目に `post.info` が要求されないことを見る。
+ * 同じブラウザコンテキストで 2 回収集し、2 回目の review と履歴を確認する。
  */
-test('2 回目の収集では前回保存済みの投稿の post.info を発行しない (Issue #56)', async () => {
+test('2 回目も投稿情報を取得し、前回保存済みの投稿を既定未選択で表示する', async () => {
   const session = await launchAndStartCollecting(JSON_RESPONSES, 'diff');
   const { context, page, overlay, userDataDir } = session;
 
@@ -170,15 +167,14 @@ test('2 回目の収集では前回保存済みの投稿の post.info を発行�
 
     await expect
       .poll(() => page.evaluate(readTestState), { timeout: 30_000 })
-      .toMatchObject({ overlayState: 'complete' });
+      .toMatchObject({ overlayState: 'review', addedPostCount: '2', selectedPostCount: '0' });
 
-    // 変わっていないので post.info は 1 回も出ず、ZIP も作らない
-    expect(requestedAfter).toEqual([]);
-    const state = await page.evaluate(readTestState);
-    expect(state.addedPostCount).toBe('0');
-    await expect(overlay.locator('p')).toContainText('前回保存済みから更新はありませんでした');
+    expect(requestedAfter.sort()).toEqual([POST_INFO_URL_A, POST_INFO_URL_B].sort());
+    await expect(overlay.locator('.review-post-list > li.is-saved')).toHaveCount(2);
+    await expect(overlay.locator('.review-post-list > li input[type="checkbox"]:checked')).toHaveCount(0);
+    await expect(overlay.locator('#review-confirm')).toBeDisabled();
 
-    // 全件省略の回でも既存の記録は失われない
+    // 再観測だけの回でも既存の保存実績は失われない
     const afterSecond = await session.serviceWorker.evaluate(async (creatorId: string) => {
       const key = `fbdlHistory:${creatorId}`;
       const stored = await chrome.storage.local.get(key);
@@ -305,10 +301,10 @@ test('review で外した投稿とカバーは ZIP にも取得要求にも現�
         'testcreator/',
         'testcreator/index.html',
         'testcreator/download-manifest.json',
-        'testcreator/1002_バナナ/',
-        'testcreator/1002_バナナ/info.json',
-        'testcreator/1002_バナナ/index.html',
-        'testcreator/1002_バナナ/資料_file_b-file-1.pdf',
+        'testcreator/バナナ [1002]/',
+        'testcreator/バナナ [1002]/post.json',
+        'testcreator/バナナ [1002]/index.html',
+        'testcreator/バナナ [1002]/002.pdf',
       ].sort(),
     );
 
@@ -358,7 +354,7 @@ test('review で外した拡張子の添付だけが ZIP から消える (Issue 
 
     const parsed = parseZip(decodeBase64ToBytes(state.zipB64 ?? ''));
     expect([...parsed.entries.map((e) => e.name)].sort()).toEqual(
-      EXPECTED_ZIP_ENTRIES.filter((name) => name !== 'testcreator/1002_バナナ/資料_file_b-file-1.pdf'),
+      EXPECTED_ZIP_ENTRIES.filter((name) => name !== 'testcreator/バナナ [1002]/002.pdf'),
     );
 
     expect(unexpectedRequests, `予期しないリクエストが発生した: ${unexpectedRequests.join(', ')}`).toEqual([]);
@@ -373,7 +369,7 @@ test('review で外した拡張子の添付だけが ZIP から消える (Issue 
  *
  * 従来の採番は同名グループの件数に依存しており、投稿タイトルが `a` / `a` / `a_1` のとき
  * `a_2` / `a_1` / `a_1` を割り当てて**同じディレクトリ名を 2 回作っていた**。
- * 同じパスに 2 投稿ぶんの中身が入るので、片方の `index.html` と `info.json` が失われる。
+ * 同じパスに 2 投稿ぶんの中身が入ると、片方の `index.html` とメタデータが失われる。
  * postId 由来の採番ではこの入力でも 3 投稿が別々のディレクトリに入る。
  */
 test('同名の投稿が並んでも archive path が衝突しない (Issue #56)', async () => {
@@ -409,12 +405,12 @@ test('同名の投稿が並んでも archive path が衝突しない (Issue #56)
 
     const parsed = parseZip(decodeBase64ToBytes(state.zipB64 ?? ''));
     const names = parsed.entries.map((e) => e.name);
-    // 3 投稿が別々のディレクトリに入り、どれも index.html と info.json を失っていない
+    // 3 投稿が別々のディレクトリに入り、どれも index.html と post.json を失っていない
     for (const [index, id] of collidingIds.entries()) {
-      const dir = `testcreator/${id}_${collidingTitles[index]}`;
+      const dir = `testcreator/${collidingTitles[index]} [${id}]`;
       expect(names, `${dir} が作られていない`).toContain(`${dir}/`);
       expect(names).toContain(`${dir}/index.html`);
-      expect(names).toContain(`${dir}/info.json`);
+      expect(names).toContain(`${dir}/post.json`);
     }
     expect(new Set(names).size, 'ZIP のエントリ名が重複している').toBe(names.length);
   } finally {

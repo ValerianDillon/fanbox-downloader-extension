@@ -8,10 +8,12 @@ paths:
 # API のレート制御 (ValerianDillon/fanbox-downloader#3)
 
 ゲート・再試行・適応スロットル・直列化・エラー型は共有層の `ApiSession` が持つ。拡張側 (`src/content/fanbox/api.ts`) は `Transport` の実装と、FANBOX 固有の URL 組み立て・レスポンス検証だけを持つ。ブックマークレット版と同じ契約・同じテストを通すため。
+設定画面の「投稿情報 API 間隔」はこのセッションが実際に発行した API 要求の開始時刻へ適用し、ZIP フェーズのメディア取得には適用しない。
 
 - transport は 3 系統を返す。`response` (status を観測できた) / `unobservable-failure` (応答を得られなかった) / `deferred` (I/O を発行しなかった)。**observable な 429 と「429 かもしれない失敗」を型で分け、後者から status を推測しない**
 - service worker が既知のバックオフ期限中で fetch を発行しなかった応答は `deferred` へ変換する。adapter の内側で待って再要求すると、セッションが実際の発行時刻を見失って基準間隔と適応間隔が抜けるため、**待機と再発行はセッションが行う**
 - 再試行ポリシーはセッション側にある。詳細は共有層の JSDoc が SoT
+- service worker の fetch は 30 秒、content script の message 待機は 35 秒で打ち切る。前者で通常の無応答を中断し、後者で service worker 自体が応答しない場合も待ち続けない。どちらも `unobservable-failure` として共有セッションの再試行ポリシーへ渡す
 
 ## 状態のスコープ
 

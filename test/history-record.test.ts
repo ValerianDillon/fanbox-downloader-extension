@@ -54,6 +54,7 @@ function makeSavedPost(
     revision: 'revision-1',
     archiveFormatVersion: 1,
     savedAt: 200,
+    bodyWritten: true,
     assets,
     ...overrides,
   };
@@ -151,6 +152,16 @@ describe('履歴のマージ', () => {
     const result = mergeCreatorHistory(current, makeUpdate({ saved: [retry] }));
 
     expect(result.saved[0].assets).toEqual([...existing.assets, ...retry.assets]);
+  });
+
+  test('同じ世代の本文保存実績は OR でマージする (添付だけの再試行で本文を未保存へ戻さないため)。', () => {
+    const withBody = makeSavedPost('post-1', [], { bodyWritten: true });
+    const withoutBody = makeSavedPost('post-1', [], { bodyWritten: false, savedAt: 300 });
+    const current = mergeCreatorHistory(null, makeUpdate({ saved: [withBody] }));
+
+    const result = mergeCreatorHistory(current, makeUpdate({ saved: [withoutBody] }));
+
+    expect(result.saved[0].bodyWritten).toBe(true);
   });
 
   test('revision が変わったら前の世代の書き込み結果は引き継がず、名前だけ name-only で残す (書けたかは世代ごとの状態だが archive 名は世代をまたいで保つため)。', () => {
@@ -587,6 +598,21 @@ describe('履歴のマージ', () => {
 });
 
 describe('履歴レコードの復号', () => {
+  test('bodyWritten の無い旧レコードは本文を保存済みとして移行する', () => {
+    const history = makeRichHistory();
+    const { bodyWritten: _bodyWritten, ...legacySaved } = history.saved[0];
+    const decoded = decodeCreatorHistory({ ...history, saved: [legacySaved] }, 'creator-1');
+
+    expect(decoded?.saved[0].bodyWritten).toBe(true);
+  });
+
+  test('bodyWritten が boolean でなければ履歴全体を拒否する', () => {
+    const history = makeRichHistory();
+    const value = { ...history, saved: [{ ...history.saved[0], bodyWritten: 'yes' }] };
+
+    expect(decodeCreatorHistory(value, 'creator-1')).toBeNull();
+  });
+
   test('schemaVersion が現在版と違えば null を返す (互換性のない履歴を保存済みと誤認しないため)。', () => {
     const history = makeRichHistory();
 

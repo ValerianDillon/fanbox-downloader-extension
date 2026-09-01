@@ -67,9 +67,9 @@ function sha256Hex(buf: Buffer): string {
 type ZipEntryDigest = { name: string; size: number; sha256: string };
 
 /**
- * ページ内で ZIP (Blob URL) を fetch し、Local File Header を先頭から走査してエントリごとの
- * サイズと SHA-256 を返す。ZipWriter は stored (無圧縮) かつ data descriptor なしで書くため、
- * LFH のサイズフィールドをそのまま信頼して次のエントリへ進める。
+ * ページ内で ZIP (Blob URL) を fetch し、central directory から各エントリの位置とサイズを読んで
+ * SHA-256 を返す。zip.js は ZIP64 と data descriptor を使いうるので、local header の 32-bit
+ * サイズを信用せず ZIP64 extra field も復号する。
  */
 async function digestZipEntriesInPage(
   page: { evaluate: <R, A>(fn: (arg: A) => Promise<R>, arg: A) => Promise<R> },
@@ -80,18 +80,88 @@ async function digestZipEntriesInPage(
     const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     const decoder = new TextDecoder();
     const entries: { name: string; size: number; sha256: string }[] = [];
-    let off = 0;
-    while (off + 30 <= buf.length && view.getUint32(off, true) === 0x04034b50) {
-      const compSize = view.getUint32(off + 18, true);
-      const nameLen = view.getUint16(off + 26, true);
-      const extraLen = view.getUint16(off + 28, true);
-      const name = decoder.decode(buf.subarray(off + 30, off + 30 + nameLen));
-      const dataStart = off + 30 + nameLen + extraLen;
+    const readSafeUint64 = (offset: number): number => {
+      const value = view.getBigUint64(offset, true);
+      if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(`ZIP64 の値が大きすぎます: ${value}`);
+      return Number(value);
+    };
+
+    let eocdOffset = -1;
+    const eocdSearchStart = Math.max(0, buf.length - 65_557);
+    for (let offset = buf.length - 22; offset >= eocdSearchStart; offset--) {
+      if (view.getUint32(offset, true) === 0x06054b50) {
+        eocdOffset = offset;
+        break;
+      }
+    }
+    if (eocdOffset < 0) throw new Error('End of central directory がありません');
+
+    let entryCount = view.getUint16(eocdOffset + 10, true);
+    let centralDirectoryOffset = view.getUint32(eocdOffset + 16, true);
+    if (entryCount === 0xffff || centralDirectoryOffset === 0xffffffff) {
+      const locatorOffset = eocdOffset - 20;
+      if (locatorOffset < 0 || view.getUint32(locatorOffset, true) !== 0x07064b50) {
+        throw new Error('ZIP64 locator がありません');
+      }
+      const zip64EocdOffset = readSafeUint64(locatorOffset + 8);
+      if (view.getUint32(zip64EocdOffset, true) !== 0x06064b50) throw new Error('ZIP64 EOCD がありません');
+      entryCount = readSafeUint64(zip64EocdOffset + 32);
+      centralDirectoryOffset = readSafeUint64(zip64EocdOffset + 48);
+    }
+
+    let centralOffset = centralDirectoryOffset;
+    for (let index = 0; index < entryCount; index++) {
+      if (view.getUint32(centralOffset, true) !== 0x02014b50) throw new Error('central directory entry が不正です');
+      const compressionMethod = view.getUint16(centralOffset + 10, true);
+      if (compressionMethod !== 0) throw new Error(`stored 以外のエントリです: ${compressionMethod}`);
+      let compSize = view.getUint32(centralOffset + 20, true);
+      const uncompressedSize32 = view.getUint32(centralOffset + 24, true);
+      const nameLen = view.getUint16(centralOffset + 28, true);
+      const extraLen = view.getUint16(centralOffset + 30, true);
+      const commentLen = view.getUint16(centralOffset + 32, true);
+      const diskStart32 = view.getUint16(centralOffset + 34, true);
+      let localOffset = view.getUint32(centralOffset + 42, true);
+      const nameStart = centralOffset + 46;
+      const name = decoder.decode(buf.subarray(nameStart, nameStart + nameLen));
+
+      if (
+        uncompressedSize32 === 0xffffffff ||
+        compSize === 0xffffffff ||
+        localOffset === 0xffffffff ||
+        diskStart32 === 0xffff
+      ) {
+        let extraOffset = nameStart + nameLen;
+        const extraEnd = extraOffset + extraLen;
+        let zip64Offset = -1;
+        while (extraOffset + 4 <= extraEnd) {
+          const type = view.getUint16(extraOffset, true);
+          const size = view.getUint16(extraOffset + 2, true);
+          if (type === 0x0001) {
+            zip64Offset = extraOffset + 4;
+            break;
+          }
+          extraOffset += 4 + size;
+        }
+        if (zip64Offset < 0) throw new Error(`ZIP64 extra field がありません: ${name}`);
+        if (uncompressedSize32 === 0xffffffff) zip64Offset += 8;
+        if (compSize === 0xffffffff) {
+          compSize = readSafeUint64(zip64Offset);
+          zip64Offset += 8;
+        }
+        if (localOffset === 0xffffffff) {
+          localOffset = readSafeUint64(zip64Offset);
+        }
+      }
+
+      if (view.getUint32(localOffset, true) !== 0x04034b50) throw new Error(`local header がありません: ${name}`);
+      const localNameLen = view.getUint16(localOffset + 26, true);
+      const localExtraLen = view.getUint16(localOffset + 28, true);
+      const dataStart = localOffset + 30 + localNameLen + localExtraLen;
       const data = buf.subarray(dataStart, dataStart + compSize);
       const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
       const sha256 = Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join('');
       entries.push({ name, size: compSize, sha256 });
-      off = dataStart + compSize;
+      centralOffset += 46 + nameLen + extraLen + commentLen;
     }
     return { totalSize: buf.length, entries };
   }, zipUrl);
@@ -240,13 +310,13 @@ test.describe('Issue #22: 大きいファイルの分割転送', () => {
       const { totalSize, entries } = await digestZipEntriesInPage(page, state.zipUrl ?? '');
       expect(totalSize).toBe(Number.parseInt(state.zipSize ?? '0', 10));
       const byName = Object.fromEntries(entries.map((e) => [e.name, e]));
-      expect(byName['testcreator/2001_大きいファイル/big48_file_2001-file-1.bin']).toEqual({
-        name: 'testcreator/2001_大きいファイル/big48_file_2001-file-1.bin',
+      expect(byName['testcreator/大きいファイル [2001]/001.bin']).toEqual({
+        name: 'testcreator/大きいファイル [2001]/001.bin',
         size: OLD_LIMIT_BYTES,
         sha256: sha256Hex(big48),
       });
-      expect(byName['testcreator/2001_大きいファイル/big65_file_2001-file-2.bin']).toEqual({
-        name: 'testcreator/2001_大きいファイル/big65_file_2001-file-2.bin',
+      expect(byName['testcreator/大きいファイル [2001]/002.bin']).toEqual({
+        name: 'testcreator/大きいファイル [2001]/002.bin',
         size: OVER_MESSAGE_LIMIT_BYTES,
         sha256: sha256Hex(big65),
       });
@@ -306,13 +376,13 @@ test.describe('Issue #22: 大きいファイルの分割転送', () => {
 
       const { entries } = await digestZipEntriesInPage(page, state.zipUrl ?? '');
       const byName = Object.fromEntries(entries.map((e) => [e.name, e]));
-      expect(byName['testcreator/2002_再開/resume-range_file_2002-file-1.bin']).toEqual({
-        name: 'testcreator/2002_再開/resume-range_file_2002-file-1.bin',
+      expect(byName['testcreator/再開 [2002]/001.bin']).toEqual({
+        name: 'testcreator/再開 [2002]/001.bin',
         size: withRange.length,
         sha256: sha256Hex(withRange),
       });
-      expect(byName['testcreator/2002_再開/resume-norange_file_2002-file-2.bin']).toEqual({
-        name: 'testcreator/2002_再開/resume-norange_file_2002-file-2.bin',
+      expect(byName['testcreator/再開 [2002]/002.bin']).toEqual({
+        name: 'testcreator/再開 [2002]/002.bin',
         size: noRange.length,
         sha256: sha256Hex(noRange),
       });

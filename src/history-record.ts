@@ -159,6 +159,8 @@ export type SavedPost = {
    * 作るときは同じ ZIP の全アセットと同じ値を入れるので、アセット側と食い違わない。
    */
   readonly savedAt: number;
+  /** この世代の投稿本文 (`index.html`) を書き終えたか。 */
+  readonly bodyWritten: boolean;
   readonly assets: readonly SavedAsset[];
 };
 
@@ -491,7 +493,12 @@ function mergeSavedPost(existing: SavedPost, next: SavedPost): SavedPost {
   }
   // 同じ世代をマージしたら、新しい方の時刻を採る。古い差分の再送で時刻が巻き戻ると、
   // その後に届いた別世代の実績との比較が狂う
-  return { ...next, savedAt: Math.max(existing.savedAt, next.savedAt), assets };
+  return {
+    ...next,
+    savedAt: Math.max(existing.savedAt, next.savedAt),
+    bodyWritten: existing.bodyWritten || next.bodyWritten,
+    assets,
+  };
 }
 
 /**
@@ -622,6 +629,9 @@ function decodeSavedPost(value: unknown): SavedPost | null {
   const revision = decodeRevision(value.revision);
   if (revision === undefined) return null;
   if (!isCount(value.archiveFormatVersion) || !isCount(value.savedAt)) return null;
+  // schemaVersion 1 の旧レコードは常に本文を保存していたため、欠落時は true として移行する。
+  const bodyWritten = value.bodyWritten === undefined ? true : value.bodyWritten;
+  if (typeof bodyWritten !== 'boolean') return null;
   const assets = decodeArray(value.assets, decodeSavedAsset);
   if (assets === null || hasDuplicate(assets, assetIdentity)) return null;
   return {
@@ -630,6 +640,7 @@ function decodeSavedPost(value: unknown): SavedPost | null {
     revision,
     archiveFormatVersion: value.archiveFormatVersion,
     savedAt: value.savedAt,
+    bodyWritten,
     assets,
   };
 }

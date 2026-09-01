@@ -1,88 +1,73 @@
 import type { PostSummary, Selection } from 'download-helper/download-helper';
 
-/**
- * review 画面 (収集後の選択) の状態と集計。DOM を触らない純粋な部分だけをここに置く。
- *
- * 選択の意味論そのもの (投稿 × 拡張子 × カバーの積) は共有層の `Selection` が持ち、
- * 導出は `DownloadObject.project()` が行う。このモジュールが担うのは、UI が保持する
- * 可変の選択状態と、確定前に表示する件数・サイズの集計である。
- */
-
-/**
- * 投稿リストを一度に描画する上限。
- *
- * 選択は postId の集合に対して適用するので、描画されていない投稿も選択・解除の対象になる。
- * したがってこの上限は描画コストだけを抑えるものであって、操作の対象範囲を狭めない。
- */
-export const POST_LIST_RENDER_LIMIT = 200;
-
-/**
- * review 画面が保持する選択状態。これが選択の SoT であり、DOM のチェック状態ではない。
- *
- * 検索や再描画でチェックボックスの要素は入れ替わるため、DOM を SoT にすると
- * 絞り込みの操作だけで選択が変わってしまう。
- */
+/** review 画面の選択状態。DOM ではなくこの値を SoT にする。 */
 export type ReviewSelection = {
-  /** 選択された投稿の postId */
+  /** 利用者が選択した投稿。コンテンツ条件で一時的に無効になっても保持する。 */
   readonly postIds: Set<string>;
-  /** 選択された拡張子。`PostSummary.files[].extension` と同じ正規化済みの形 */
+  /** 利用者が選択した拡張子。対象が 0 件になっても保持し、再び現れたら復元する。 */
   readonly extensions: Set<string>;
-  /** カバー画像を含めるか */
+  /** カバー画像を含めたいか。対象が 0 件の間も保持する。 */
   includeCover: boolean;
+  /** 投稿本文を含めたいか。 */
+  includeBody: boolean;
 };
 
-/** 拡張子の選択肢 1 件 */
 export type ExtensionOption = {
-  /** 正規化済みの拡張子。拡張子が無いアセットは空文字列になる */
   readonly extension: string;
-  /** この拡張子を持つ添付の総数。選択の有無に関わらない、収集できた全投稿での件数 */
+  /** 現在選ばれている投稿に属する添付件数。 */
   readonly fileCount: number;
 };
 
-/**
- * 現在の選択で ZIP に入る対象の集計。
- *
- * サイズは合計を断定しない。`size` は file 系のアセットにしか無く (実測 2026-08-22)、
- * image 系とカバーには無いため、既知分の合計と不明な件数を分けて持つ。
- */
+export type ContentAvailability = {
+  readonly bodyCount: number;
+  readonly coverCount: number;
+  readonly extensions: ExtensionOption[];
+};
+
 export type SelectionCounts = {
-  /** 選択された投稿数 */
   postCount: number;
-  /** 選択された投稿に属し、拡張子の選択にも一致した添付の数 */
+  bodyCount: number;
   fileCount: number;
-  /** 選択された投稿のうち、カバーを持ち `includeCover` で含まれるものの数 */
   coverCount: number;
-  /** 上の添付・カバーのうち、サイズが分かっているものの合計バイト数 */
   knownSizeBytes: number;
-  /** 上の添付・カバーのうち、サイズが分からないものの件数 */
   unknownSizeCount: number;
 };
 
-/** 収集できた全投稿・全拡張子・カバーありを選んだ初期状態を作る */
-export function createInitialSelection(posts: readonly PostSummary[]): ReviewSelection {
+export type PostDateField = 'published' | 'updated';
+
+export type PostFilter = {
+  readonly query: string;
+  readonly dateField?: PostDateField;
+  /** YYYY-MM-DD。指定日の 00:00 以降を含める。 */
+  readonly from?: string;
+  /** YYYY-MM-DD。指定日の終わりまでを含める。 */
+  readonly to?: string;
+};
+
+/** 全コンテンツを選ぶ初期状態を作る。指定した投稿だけは既定で外す。 */
+export function createInitialSelection(
+  posts: readonly PostSummary[],
+  initiallyExcludedPostIds: ReadonlySet<string> = new Set(),
+): ReviewSelection {
   const postIds = new Set<string>();
   const extensions = new Set<string>();
   for (const post of posts) {
-    postIds.add(post.postId);
-    for (const file of post.files) {
-      extensions.add(file.extension);
-    }
+    if (!initiallyExcludedPostIds.has(post.postId)) postIds.add(post.postId);
+    for (const file of post.files) extensions.add(file.extension);
   }
-  return { postIds, extensions, includeCover: true };
+  return { postIds, extensions, includeCover: true, includeBody: true };
 }
 
-/**
- * 拡張子の選択肢を、拡張子ごとの添付件数付きで返す。
- *
- * 拡張子が無いアセット (空文字列) は末尾に置く。他の拡張子と同じ辞書順に混ぜると
- * 先頭に来て、選択肢の並びの起点が「拡張子なし」になる。
- * @param posts 収集できた投稿
- */
-export function listExtensionOptions(posts: readonly PostSummary[]): ExtensionOption[] {
+/** 全投稿に存在する拡張子を残し、件数だけを現在選ばれている投稿から集計する。 */
+export function listExtensionOptions(
+  posts: readonly PostSummary[],
+  selectedPostIds: ReadonlySet<string> = new Set(posts.map((post) => post.postId)),
+): ExtensionOption[] {
   const counts = new Map<string, number>();
   for (const post of posts) {
     for (const file of post.files) {
-      counts.set(file.extension, (counts.get(file.extension) ?? 0) + 1);
+      if (!counts.has(file.extension)) counts.set(file.extension, 0);
+      if (selectedPostIds.has(post.postId)) counts.set(file.extension, (counts.get(file.extension) ?? 0) + 1);
     }
   }
   return [...counts.entries()]
@@ -94,32 +79,55 @@ export function listExtensionOptions(posts: readonly PostSummary[]): ExtensionOp
     });
 }
 
-/**
- * 現在の選択で ZIP に入る対象を数える。
- *
- * 拡張子の選択はカバーには適用しない (カバーは投稿の付随物であって添付の一種ではない)。
- * 共有層の projection と同じ意味論にしておかないと、確定前の表示と ZIP の中身がずれる。
- * @param posts 収集できた投稿
- * @param selection 現在の選択状態
- */
+/** 現在選ばれている投稿に、各コンテンツが何件あるかを返す。 */
+export function countContentAvailability(
+  posts: readonly PostSummary[],
+  selectedPostIds: ReadonlySet<string>,
+): ContentAvailability {
+  let bodyCount = 0;
+  let coverCount = 0;
+  for (const post of posts) {
+    if (!selectedPostIds.has(post.postId)) continue;
+    bodyCount++;
+    if (post.cover) coverCount++;
+  }
+  return { bodyCount, coverCount, extensions: listExtensionOptions(posts, selectedPostIds) };
+}
+
+/** 投稿に、現在のコンテンツ条件で 1 件以上の保存対象があるかを返す。 */
+export function hasSelectedContent(post: PostSummary, selection: ReviewSelection): boolean {
+  if (selection.includeBody) return true;
+  if (selection.includeCover && post.cover) return true;
+  return post.files.some((file) => selection.extensions.has(file.extension));
+}
+
+/** 投稿選択とコンテンツ選択を掛け合わせた実効 postId を返す。 */
+export function effectivePostIds(posts: readonly PostSummary[], selection: ReviewSelection): Set<string> {
+  const ids = new Set<string>();
+  for (const post of posts) {
+    if (selection.postIds.has(post.postId) && hasSelectedContent(post, selection)) ids.add(post.postId);
+  }
+  return ids;
+}
+
+/** 現在の実効選択で ZIP に入る対象を数える。 */
 export function countSelection(posts: readonly PostSummary[], selection: ReviewSelection): SelectionCounts {
   const counts: SelectionCounts = {
     postCount: 0,
+    bodyCount: 0,
     fileCount: 0,
     coverCount: 0,
     knownSizeBytes: 0,
     unknownSizeCount: 0,
   };
   const addSize = (size: number | undefined) => {
-    if (size === undefined) {
-      counts.unknownSizeCount++;
-      return;
-    }
-    counts.knownSizeBytes += size;
+    if (size === undefined) counts.unknownSizeCount++;
+    else counts.knownSizeBytes += size;
   };
   for (const post of posts) {
-    if (!selection.postIds.has(post.postId)) continue;
+    if (!selection.postIds.has(post.postId) || !hasSelectedContent(post, selection)) continue;
     counts.postCount++;
+    if (selection.includeBody) counts.bodyCount++;
     for (const file of post.files) {
       if (!selection.extensions.has(file.extension)) continue;
       counts.fileCount++;
@@ -133,44 +141,53 @@ export function countSelection(posts: readonly PostSummary[], selection: ReviewS
   return counts;
 }
 
-/**
- * 検索語で投稿を絞り込む。空の検索語は全件に一致する。
- *
- * 投稿タイトルと postId のどちらかに含まれていれば一致とする。同名の投稿が並ぶクリエイターでは
- * タイトルだけでは目的の投稿を指せないため、URL から分かる postId でも引けるようにする。
- * @param posts 収集できた投稿
- * @param query 検索語
- */
-export function filterPosts(posts: readonly PostSummary[], query: string): PostSummary[] {
-  const normalized = query.trim().toLowerCase();
-  if (normalized === '') return [...posts];
-  return posts.filter(
-    (post) => post.name.toLowerCase().includes(normalized) || post.postId.toLowerCase().includes(normalized),
-  );
+function localDateKey(value: string | undefined): string | null {
+  if (value === undefined) return null;
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  const year = String(date.getFullYear()).padStart(4, '0');
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
-/**
- * UI の選択状態を共有層の `Selection` に写す。
- *
- * 集合を複製する。`project()` に渡した後も UI 側の集合は操作され続けるので、同じ参照を渡すと
- * 確定後の操作が既に導出済みの対象を書き換えうる。
- * @param selection 現在の選択状態
- */
-export function toSelection(selection: ReviewSelection): Selection {
+/** 検索語と公開日・更新日の包含範囲で投稿を絞り込む。 */
+export function filterPosts(posts: readonly PostSummary[], filter: string | PostFilter): PostSummary[] {
+  const options: PostFilter = typeof filter === 'string' ? { query: filter } : filter;
+  const normalized = options.query.trim().toLowerCase();
+  const from = options.from?.trim() ?? '';
+  const to = options.to?.trim() ?? '';
+  const dateField = options.dateField ?? 'updated';
+  return posts.filter((post) => {
+    const matchesQuery =
+      normalized === '' ||
+      post.name.toLowerCase().includes(normalized) ||
+      post.postId.toLowerCase().includes(normalized);
+    if (!matchesQuery) return false;
+    if (from === '' && to === '') return true;
+    const key = localDateKey(dateField === 'updated' ? post.updatedDatetime : post.publishedDatetime);
+    if (key === null) return false;
+    return (from === '' || key >= from) && (to === '' || key <= to);
+  });
+}
+
+/** UI の希望状態を共有層が受け取る実効 Selection に写す。 */
+export function toSelection(posts: readonly PostSummary[], selection: ReviewSelection): Selection {
+  const availability = countContentAvailability(posts, selection.postIds);
   return {
-    postIds: new Set(selection.postIds),
-    extensions: new Set(selection.extensions),
-    includeCover: selection.includeCover,
+    postIds: effectivePostIds(posts, selection),
+    extensions: new Set(
+      availability.extensions
+        .filter((option) => option.fileCount > 0 && selection.extensions.has(option.extension))
+        .map((option) => option.extension),
+    ),
+    includeCover: selection.includeCover && availability.coverCount > 0,
+    includeBody: selection.includeBody && availability.bodyCount > 0,
   };
 }
 
 const SIZE_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB'] as const;
 
-/**
- * バイト数を人間が読める単位にする。2 進接頭辞を使うのは、この拡張の他の箇所
- * (分割転送の chunk サイズなど) と単位の意味を揃えるため。
- * @param bytes バイト数
- */
 export function formatByteSize(bytes: number): string {
   let value = bytes;
   let unit = 0;
@@ -178,35 +195,23 @@ export function formatByteSize(bytes: number): string {
     value /= 1024;
     unit++;
   }
-  // B は小数を出しても意味が無い。それ以外は 1 桁だけ出して桁を追えるようにする
   return unit === 0 ? `${value} B` : `${value.toFixed(1)} ${SIZE_UNITS[unit]}`;
 }
 
-/** 選択された対象の件数を 1 行で表す */
 export function describeSelectionCounts(counts: SelectionCounts): string {
-  return `投稿 ${counts.postCount} 件、添付 ${counts.fileCount} 件、カバー ${counts.coverCount} 件`;
+  return `投稿 ${counts.postCount} 件、本文 ${counts.bodyCount} 件、添付 ${counts.fileCount} 件、カバー ${counts.coverCount} 件`;
 }
 
-/**
- * 選択された対象のサイズを 1 行で表す。
- *
- * **合計を断定しない。** `size` を持たないアセットがある限り、既知分の合計は下限でしかない。
- * @param counts 集計結果
- */
 export function describeSizeEstimate(counts: SelectionCounts): string {
   if (counts.fileCount === 0 && counts.coverCount === 0) {
-    return '取得するファイルはありません (HTML と投稿情報のみ)';
+    return counts.bodyCount > 0 ? 'メディアファイルなし (投稿本文と post.json を保存)' : '保存対象がありません';
   }
-  if (counts.unknownSizeCount === 0) {
-    return `合計 ${formatByteSize(counts.knownSizeBytes)}`;
-  }
-  if (counts.knownSizeBytes === 0) {
-    return `サイズ不明 ${counts.unknownSizeCount} 件 (合計は不明)`;
-  }
+  if (counts.unknownSizeCount === 0) return `合計 ${formatByteSize(counts.knownSizeBytes)}`;
+  if (counts.knownSizeBytes === 0)
+    return `サイズ不明 ${counts.unknownSizeCount} 件 (画像とカバーは API にサイズ情報なし)`;
   return `既知分 ${formatByteSize(counts.knownSizeBytes)}、サイズ不明 ${counts.unknownSizeCount} 件 (合計は不明)`;
 }
 
-/** 投稿リストの描画件数と一致件数を 1 行で表す */
 export function describeRenderedRange(matchedCount: number, renderedCount: number): string {
   return `${renderedCount} / ${matchedCount} 件を表示`;
 }

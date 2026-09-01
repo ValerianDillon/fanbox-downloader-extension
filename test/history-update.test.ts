@@ -42,6 +42,7 @@ function makeResult(overrides: Partial<CollectResult> & { posts?: PostSummaryStu
     scannedCreator: true,
     completedFullScan: true,
     limited: false,
+    historyUsed: null,
     ...rest,
   };
 }
@@ -52,8 +53,18 @@ function makeManifest(
     archiveDirectory: string;
     included: Array<{ kind: 'cover' | 'image' | 'file'; assetId?: string; archiveName: string }>;
   }>,
+  includeBody = true,
 ): DownloadManifest {
   return {
+    schemaVersion: 1,
+    creatorId: 'creator-1',
+    generatedAt: '2026-01-02T03:04:05.000Z',
+    selection: {
+      postIds: posts.map((post) => post.postId),
+      extensions: ['png'],
+      includeCover: true,
+      includeBody,
+    },
     posts: posts.map((post) => ({
       postId: post.postId,
       archiveDirectory: post.archiveDirectory,
@@ -65,7 +76,8 @@ function makeManifest(
       })),
       excluded: [],
     })),
-  } as unknown as DownloadManifest;
+    excludedPosts: [],
+  };
 }
 
 const writeResult = (postIndex: number, archiveName: string, outcome: AssetWriteResult['outcome']): AssetWriteResult =>
@@ -167,35 +179,35 @@ describe('保存実績の組み立て', () => {
       postId: 'p1',
       archiveDirectory: 'p1_dir',
       included: [
-        { kind: 'image', assetId: 'a1', archiveName: 'a_image_a1.png' },
-        { kind: 'file', assetId: 'a1', archiveName: 'a_file_a1.zip' },
-        { kind: 'cover', archiveName: 'cover.jpg' },
+        { kind: 'cover', archiveName: '001.jpg' },
+        { kind: 'image', assetId: 'a1', archiveName: '002.png' },
+        { kind: 'file', assetId: 'a1', archiveName: '003.zip' },
       ],
     },
   ]);
 
   test('archive 名から AssetKey を引き当てる (共有層は archive 名でしか結果を指さないため)。', () => {
     const assets = [
-      writeResult(0, 'a_image_a1.png', 'written'),
-      writeResult(0, 'a_file_a1.zip', 'failed'),
-      writeResult(0, 'cover.jpg', 'written'),
+      writeResult(0, '001.jpg', 'written'),
+      writeResult(0, '002.png', 'written'),
+      writeResult(0, '003.zip', 'failed'),
     ];
 
     const saved = buildSavedPosts(manifest, assets, new Map(), 'out.zip', SAVED_AT);
 
     expect(saved[0].assets.map((asset) => [asset.kind, asset.assetId, asset.outcome])).toEqual([
+      ['cover', undefined, 'written'],
       ['image', 'a1', 'written'],
       ['file', 'a1', 'failed'],
-      ['cover', undefined, 'written'],
     ]);
   });
 
   test('中断で書けなかったアセットは記録しない (書けたと確認できていないものを保存済みにしないため)。', () => {
-    const assets = [writeResult(0, 'a_image_a1.png', 'skipped'), writeResult(0, 'cover.jpg', 'written')];
+    const assets = [writeResult(0, '002.png', 'skipped'), writeResult(0, '001.jpg', 'written')];
 
     const saved = buildSavedPosts(manifest, assets, new Map(), 'out.zip', SAVED_AT);
 
-    expect(saved[0].assets.map((asset) => asset.archiveName)).toEqual(['cover.jpg']);
+    expect(saved[0].assets.map((asset) => asset.archiveName)).toEqual(['001.jpg']);
   });
 
   test('archive 名が manifest に無ければ例外にする (allocator の不変条件が破れたのを黙って通さないため)。', () => {
@@ -222,13 +234,11 @@ describe('保存実績の組み立て', () => {
   });
 
   test('postIndex が manifest の範囲外なら例外にする (別の投稿の実績として記録しないため)。', () => {
-    expect(() =>
-      buildSavedPosts(manifest, [writeResult(5, 'cover.jpg', 'written')], new Map(), 'z', SAVED_AT),
-    ).toThrow();
+    expect(() => buildSavedPosts(manifest, [writeResult(5, '001.jpg', 'written')], new Map(), 'z', SAVED_AT)).toThrow();
   });
 
   test('revision には一覧が返した値を、無ければ null を入れる (世代の判定を一覧の値で行うため)。', () => {
-    const assets = [writeResult(0, 'cover.jpg', 'written')];
+    const assets = [writeResult(0, '001.jpg', 'written')];
 
     const withRevision = buildSavedPosts(manifest, assets, new Map([['p1', 'rev-1']]), 'z', SAVED_AT);
     const withoutRevision = buildSavedPosts(manifest, assets, new Map(), 'z', SAVED_AT);
@@ -237,7 +247,7 @@ describe('保存実績の組み立て', () => {
   });
 
   test('現在の ARCHIVE_FORMAT_VERSION と保存元と保存時刻を記録する (採番規則が変われば過去の ZIP は別の場所に入るため)。', () => {
-    const saved = buildSavedPosts(manifest, [writeResult(0, 'cover.jpg', 'written')], new Map(), 'out.zip', SAVED_AT);
+    const saved = buildSavedPosts(manifest, [writeResult(0, '001.jpg', 'written')], new Map(), 'out.zip', SAVED_AT);
 
     expect([saved[0].archiveFormatVersion, saved[0].assets[0].zipName, saved[0].assets[0].savedAt]).toEqual([
       ARCHIVE_FORMAT_VERSION,
@@ -267,7 +277,7 @@ describe('保存実績の組み立て', () => {
   });
 
   test('投稿ディレクトリ名を manifest から写す (次回の凍結名として渡すため)。', () => {
-    const saved = buildSavedPosts(manifest, [writeResult(0, 'cover.jpg', 'written')], new Map(), 'z', SAVED_AT);
+    const saved = buildSavedPosts(manifest, [writeResult(0, '001.jpg', 'written')], new Map(), 'z', SAVED_AT);
 
     expect(saved[0].archiveDirectory).toBe('p1_dir');
   });

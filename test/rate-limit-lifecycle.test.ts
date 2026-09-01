@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { ApiSession, resetSharedBackoff } from '../src/content/fanbox/api';
+import { API_MESSAGE_TIMEOUT_MS, ApiSession, resetSharedBackoff } from '../src/content/fanbox/api';
 import { sendMessageAbortable } from '../src/content/messaging';
 import { BackoffStore } from '../src/service-worker/backoff-store';
 import { handleFetchApi } from '../src/service-worker/handlers';
 import { createFakeSessionStorage } from './service-worker/fake-storage';
+
+/** レート制御の実待機と区別できる、テスト内だけの fetch watchdog 値。 */
+const TEST_FETCH_TIMEOUT_MS = 31_337;
 
 /**
  * 本番のライフサイクル境界 (別タブ、リロード、service worker の停止) を再現するテスト。
@@ -48,7 +51,9 @@ function okPostBody(): string {
 /** content script (chrome.runtime.sendMessage) から service worker (BackoffStore) への橋渡し */
 function bridgeTo(store: BackoffStore) {
   return (message: { type: string; url?: string }) => {
-    if (message.type === 'fetchApi') return handleFetchApi(message.url as string, store);
+    if (message.type === 'fetchApi') {
+      return handleFetchApi(message.url as string, store, { timeoutMs: TEST_FETCH_TIMEOUT_MS });
+    }
     return Promise.reject(new Error(`unexpected message type: ${message.type}`));
   };
 }
@@ -72,9 +77,13 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
   function installFakeTimers() {
     virtualWaitMs = 0;
     let offsetMs = 0;
+    let ignoredDeadlineId = 1_000_000_000;
     Date.now = () => origDateNow() + offsetMs;
     globalThis.setTimeout = ((handler: TimerHandler, timeout?: number) => {
       const ms = timeout ?? 0;
+      if (ms === API_MESSAGE_TIMEOUT_MS || ms === TEST_FETCH_TIMEOUT_MS) {
+        return ignoredDeadlineId++ as unknown as ReturnType<typeof setTimeout>;
+      }
       virtualWaitMs += ms;
       offsetMs += ms;
       return origSetTimeout(handler as () => void, 0);
@@ -151,7 +160,7 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
       runtime: {
         sendMessage: (message: { type: string; url?: string }) => {
           if (message.type !== 'fetchApi') return Promise.reject(new Error(`unexpected message type: ${message.type}`));
-          swProcessing = handleFetchApi(message.url as string, store);
+          swProcessing = handleFetchApi(message.url as string, store, { timeoutMs: TEST_FETCH_TIMEOUT_MS });
           return swProcessing;
         },
       },
@@ -293,7 +302,7 @@ describe('レート制限バックオフのライフサイクル境界 (Issue #1
             markReached?.();
             return (async () => {
               await releaseGate;
-              return handleFetchApi(message.url as string, store);
+              return handleFetchApi(message.url as string, store, { timeoutMs: TEST_FETCH_TIMEOUT_MS });
             })();
           }
           return Promise.reject(new Error(`unexpected message type: ${message.type}`));

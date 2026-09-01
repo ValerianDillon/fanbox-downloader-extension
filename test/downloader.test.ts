@@ -2,7 +2,13 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import type { DownloadJsonObj } from 'download-helper/download-helper';
 import { DownloadHelper, DownloadUtils } from 'download-helper/download-helper';
 import type { DownloadProgress, FileSystemFileHandle, MediaFetchAttempt } from '../src/content/downloader';
-import { downloadAsZip, fetchWithRetry, preflightDownload } from '../src/content/downloader';
+import {
+  createConcurrentFetchFile,
+  downloadAsZip,
+  fetchWithRetry,
+  formatDownloadLog,
+  preflightDownload,
+} from '../src/content/downloader';
 import { MEDIA_ATTEMPT_STORAGE_KEY } from '../src/content/media-attempt-log';
 import { installFakeMediaRuntime, simpleResponder } from './fake-media-port';
 // chrome.storage.local も get(key) / set(items) の契約は storage.session と同じなのでフェイクを流用する
@@ -27,8 +33,13 @@ type TestPost = {
 };
 
 function withManifest(obj: { id: string; posts: TestPost[]; [key: string]: unknown }): DownloadJsonObj {
-  const posts = obj.posts.map((post, i) => ({
-    postId: `p${i + 1}`,
+  const normalizedPosts = obj.posts.map((post, index) => ({
+    ...post,
+    postId: `p${index + 1}`,
+    bodyIncluded: true,
+  }));
+  const posts = normalizedPosts.map((post, i) => ({
+    postId: post.postId,
     archiveDirectory: post.encodedName,
     included: [
       ...post.files.map((file, j) => ({
@@ -52,10 +63,11 @@ function withManifest(obj: { id: string; posts: TestPost[]; [key: string]: unkno
       schemaVersion: 1,
       creatorId: obj.id,
       generatedAt: '2026-08-23T00:00:00.000Z',
-      selection: { postIds: posts.map((it) => it.postId), extensions: [''], includeCover: true },
+      selection: { postIds: posts.map((it) => it.postId), extensions: [''], includeCover: true, includeBody: true },
       posts,
       excludedPosts: [],
     },
+    posts: normalizedPosts,
   } as unknown as DownloadJsonObj;
 }
 
@@ -100,17 +112,19 @@ function findExtra(extra: Uint8Array, id: number): { offset: number; size: numbe
 
 type Entry = { name: string; dosTime: number; dosDate: number; extraLen: number; utMtime: number | null };
 
-// Local File Header を signature 0x04034b50 から走査する (stored 無圧縮、data descriptor なし)
+// Central Directory File Header を走査する。zip.js は data descriptor を使うため、
+// compressed size が未確定な Local File Header だけでは次の entry へ進めない。
 function parseLocalEntries(buf: Uint8Array): Entry[] {
   const dec = new TextDecoder();
   const entries: Entry[] = [];
   let off = 0;
-  while (off + 4 <= buf.length && u32(buf, off) === 0x04034b50) {
-    const compSize = u32(buf, off + 18);
-    const nameLen = u16(buf, off + 26);
-    const extraLen = u16(buf, off + 28);
-    const name = dec.decode(buf.slice(off + 30, off + 30 + nameLen));
-    const extra = buf.slice(off + 30 + nameLen, off + 30 + nameLen + extraLen);
+  while (off + 4 <= buf.length && u32(buf, off) !== 0x02014b50) off++;
+  while (off + 46 <= buf.length && u32(buf, off) === 0x02014b50) {
+    const nameLen = u16(buf, off + 28);
+    const extraLen = u16(buf, off + 30);
+    const commentLen = u16(buf, off + 32);
+    const name = dec.decode(buf.slice(off + 46, off + 46 + nameLen));
+    const extra = buf.slice(off + 46 + nameLen, off + 46 + nameLen + extraLen);
     const ut = findExtra(extra, 0x5455);
     let utMtime: number | null = null;
     if (ut) {
@@ -118,8 +132,8 @@ function parseLocalEntries(buf: Uint8Array): Entry[] {
       // blk[4] = flags(0x07), blk[5..] = mtime (Int32LE)
       utMtime = i32(blk, 5);
     }
-    entries.push({ name, dosTime: u16(buf, off + 10), dosDate: u16(buf, off + 12), extraLen, utMtime });
-    off += 30 + nameLen + extraLen + compSize;
+    entries.push({ name, dosTime: u16(buf, off + 12), dosDate: u16(buf, off + 14), extraLen, utMtime });
+    off += 46 + nameLen + extraLen + commentLen;
   }
   return entries;
 }
@@ -192,7 +206,7 @@ describe('downloadAsZip - publishedDatetime (info/html, chrome 不要)', () => {
     expect(root.extraLen).toBeGreaterThan(0);
 
     // publishedDatetime ありの post 配下は DOS time/date + UT extra
-    for (const path of ['u/withDate/info.json', 'u/withDate/index.html']) {
+    for (const path of ['u/withDate/post.json', 'u/withDate/index.html']) {
       const e = entryByName(entries, path);
       expect(e.dosDate).not.toBe(0);
       expect(e.extraLen).toBeGreaterThan(0);
@@ -204,7 +218,7 @@ describe('downloadAsZip - publishedDatetime (info/html, chrome 不要)', () => {
     expect(withDateDir.utMtime).toBe(expectedUnix);
 
     // publishedDatetime なしの post 配下は fallback (date なし)
-    for (const path of ['u/noDate/info.json', 'u/noDate/index.html']) {
+    for (const path of ['u/noDate/post.json', 'u/noDate/index.html']) {
       const e = entryByName(entries, path);
       expect(e.dosTime).toBe(0);
       expect(e.dosDate).toBe(0);
@@ -243,7 +257,7 @@ describe('downloadAsZip - publishedDatetime (info/html, chrome 不要)', () => {
     await downloadAsZip(handle, json, noopProgress, new AbortController().signal);
 
     const entries = parseLocalEntries(mock.toBuffer());
-    const e = entryByName(entries, 'u/bad/info.json');
+    const e = entryByName(entries, 'u/bad/post.json');
     expect(e.dosTime).toBe(0);
     expect(e.dosDate).toBe(0);
     expect(e.extraLen).toBe(0);
@@ -489,7 +503,7 @@ describe('fetchWithRetry の試行記録 (Issue #18)', () => {
     );
     restoreRuntime = runtime.restore;
     const loggedAttempts: unknown[] = [];
-    console.info = ((...args: unknown[]) => loggedAttempts.push(args[0])) as typeof console.info;
+    console.info = ((...args: unknown[]) => loggedAttempts.push(args[1])) as typeof console.info;
 
     const attempts: MediaFetchAttempt[] = [];
     const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, undefined, 'file', attempts);
@@ -580,6 +594,132 @@ describe('fetchWithRetry の試行記録 (Issue #18)', () => {
     expect(blob).not.toBeNull();
     expect(blob?.size).toBe(0);
     expect(attempts.map((a) => a.status)).toEqual([200]);
+  });
+});
+
+describe('メディアの並列取得', () => {
+  const downloadObject = {
+    posts: [
+      {
+        cover: { url: 'https://example.test/cover', name: '001.jpg' },
+        files: [
+          { url: 'https://example.test/a', encodedName: '002.png' },
+          { url: 'https://example.test/b', encodedName: '003.png' },
+        ],
+      },
+      { files: [{ url: 'https://example.test/c', encodedName: '001.zip' }] },
+    ],
+  } as unknown as DownloadJsonObj;
+
+  test('指定数だけ先行取得し、完了順が前後しても呼び出し順に結果を返す', async () => {
+    const resolvers = new Map<string, (blob: Blob | null) => void>();
+    const started: string[] = [];
+    let resolveThirdStarted = () => {};
+    let resolveFourthStarted = () => {};
+    const thirdStarted = new Promise<void>((resolve) => {
+      resolveThirdStarted = resolve;
+    });
+    const fourthStarted = new Promise<void>((resolve) => {
+      resolveFourthStarted = resolve;
+    });
+    let active = 0;
+    let maxActive = 0;
+    const directFetch = (url: string) => {
+      started.push(url);
+      if (started.length === 3) resolveThirdStarted();
+      if (started.length === 4) resolveFourthStarted();
+      active++;
+      maxActive = Math.max(maxActive, active);
+      return new Promise<Blob | null>((resolve) => {
+        resolvers.set(url, (blob) => {
+          active--;
+          resolve(blob);
+        });
+      });
+    };
+    const controller = new AbortController();
+    const fetch = createConcurrentFetchFile(downloadObject, directFetch, 2, controller.signal);
+
+    const coverResult = fetch('https://example.test/cover', '001.jpg', { kind: 'cover' });
+    expect(started).toEqual(['https://example.test/cover', 'https://example.test/a']);
+
+    // 2 件目を先に終えると 3 件目が始まるが、1 件目の呼び出しは 1 件目の結果を待ち続ける。
+    resolvers.get('https://example.test/a')?.(new Blob(['a']));
+    await thirdStarted;
+    expect(started).toEqual(['https://example.test/cover', 'https://example.test/a', 'https://example.test/b']);
+
+    const coverBlob = new Blob(['cover']);
+    resolvers.get('https://example.test/cover')?.(coverBlob);
+    expect(await coverResult).toBe(coverBlob);
+
+    const aResult = await fetch('https://example.test/a', '002.png', { kind: 'file' });
+    if (aResult === null) throw new Error('a の取得結果が null');
+    expect(await aResult.text()).toBe('a');
+    expect(maxActive).toBe(2);
+
+    resolvers.get('https://example.test/b')?.(new Blob(['b']));
+    await fourthStarted;
+    expect(started).toEqual([
+      'https://example.test/cover',
+      'https://example.test/a',
+      'https://example.test/b',
+      'https://example.test/c',
+    ]);
+    resolvers.get('https://example.test/c')?.(new Blob(['c']));
+    const bResult = await fetch('https://example.test/b', '003.png', { kind: 'file' });
+    const cResult = await fetch('https://example.test/c', '001.zip', { kind: 'file' });
+    if (bResult === null || cResult === null) throw new Error('先行取得したファイルの結果が null');
+    expect(await bResult.text()).toBe('b');
+    expect(await cResult.text()).toBe('c');
+  });
+
+  test('共有層から来た取得順が計画と違えば ZIP を作らず例外にする', async () => {
+    const fetch = createConcurrentFetchFile(downloadObject, async () => new Blob(), 2, new AbortController().signal);
+
+    await expect(fetch('https://example.test/a', '002.png', { kind: 'file' })).rejects.toThrow(
+      'メディア取得順が ZIP の書き込み計画と一致しません',
+    );
+  });
+
+  test('同時数は上限の 4 に丸める', async () => {
+    const pending: Array<() => void> = [];
+    let active = 0;
+    let maxActive = 0;
+    const fetch = createConcurrentFetchFile(
+      downloadObject,
+      async () => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        await new Promise<void>((resolve) => pending.push(resolve));
+        active--;
+        return new Blob();
+      },
+      99,
+      new AbortController().signal,
+    );
+
+    const first = fetch('https://example.test/cover', '001.jpg', { kind: 'cover' });
+    expect(maxActive).toBe(4);
+    for (const resolve of pending) resolve();
+    await first;
+  });
+});
+
+describe('ダウンロード進捗ログの表示', () => {
+  test.each([
+    ['@creator 投稿:12 ファイル:34', 'ZIP 作成開始: @creator / 投稿 12 件 / 添付 34 件'],
+    ['タイトル (2/12)', '投稿 2/12: タイトル'],
+    ['download 003.jpg (3/10)', '取得 3/10: 003.jpg'],
+    ['download 001.jpg', '取得: 001.jpg'],
+    ['003.jpgのダウンロードに失敗', '取得失敗: 003.jpg'],
+    ['完了', 'ZIP 作成完了'],
+    ['完了 (2件のダウンロードに失敗)', 'ZIP 作成完了: 2 件取得失敗'],
+  ] as const)('%s を %s に整形する', (source, expected) => {
+    expect(formatDownloadLog(source)).toBe(expected);
+  });
+
+  test('未知のログは情報を捨てずそのまま表示する', () => {
+    expect(formatDownloadLog('unknown event')).toBe('unknown event');
   });
 });
 
