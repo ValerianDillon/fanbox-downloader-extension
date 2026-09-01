@@ -51,6 +51,15 @@ Claude Code は `.claude/skills/extension-live-test/SKILL.md` の wrapper から
 
 Biome (recommended ルールセット) で強制。設定は `biome.json` が SoT。
 
+## バージョンとリリース
+
+拡張の版番号は `package.json` の `version` を SoT とする。
+`static/manifest.template.json` は版番号の placeholder を持ち、`scripts/build.ts` が通常ビルドとテストビルドの `manifest.json` へ現在の版番号を反映する。
+[Chrome manifest の version](https://developer.chrome.com/docs/extensions/reference/manifest/version) の更新比較に使えるよう、版番号は 1〜4 個の整数とし、プレリリース接尾辞は使わない。
+利用者向け機能には SemVer を適用し、保存形式の互換性を壊す変更ではメジャーバージョンを上げる。
+
+リリースは版番号を更新する PR の CI 成功と squash merge の後、マージコミットへ同じ `vX.Y.Z` タグを付けて公開する。
+
 ## Git 運用
 
 マージは squash。`main` の履歴は `<タイトル> (#42)` の形の単一コミットで揃える。
