@@ -10,8 +10,9 @@
  * bun build の define は識別子置換 + dead code elimination を行うため、
  * `__FBDL_TEST__` で分岐したテスト専用コードは本番ビルドの成果物に残らない。
  */
-import { cpSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { applyExtensionVersion } from './lib/extension-version';
 
 const isTest = process.argv.includes('--test');
 const outdir = isTest ? 'dist-test' : 'dist';
@@ -20,7 +21,19 @@ const outdir = isTest ? 'dist-test' : 'dist';
 const ENTRY_FILE_NAMES = ['content.js', 'service-worker.js'];
 const TEST_LEAK_PATTERN = /__FBDL_TEST__|data-fbdl|__fbdlTest/;
 
+function readJson(path: string): unknown {
+  try {
+    return JSON.parse(readFileSync(path, 'utf-8'));
+  } catch (error) {
+    throw new Error(`${path} を JSON として読み込めません: ${String(error)}`);
+  }
+}
+
 async function main() {
+  // 出力先を消す前に版番号と template を検証し、設定不備で既存ビルドだけを失わないようにする。
+  const manifest = applyExtensionVersion(readJson('package.json'), readJson('static/manifest.template.json'));
+  const version = manifest.version;
+
   rmSync(outdir, { recursive: true, force: true });
   mkdirSync(outdir, { recursive: true });
 
@@ -51,7 +64,7 @@ async function main() {
     process.exit(1);
   }
 
-  cpSync('static/manifest.json', join(outdir, 'manifest.json'));
+  writeFileSync(join(outdir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   cpSync('static/rules.json', join(outdir, 'rules.json'));
   cpSync('static/icons', join(outdir, 'icons'), { recursive: true });
 
@@ -69,7 +82,7 @@ async function main() {
     }
   }
 
-  console.log(`build complete: ${outdir}/ (__FBDL_TEST__=${isTest})`);
+  console.log(`build complete: ${outdir}/ (version=${version}, __FBDL_TEST__=${isTest})`);
 }
 
 await main();

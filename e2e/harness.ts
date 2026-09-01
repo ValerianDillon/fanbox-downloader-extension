@@ -17,11 +17,11 @@ type Manifest = {
 };
 
 /**
- * static/manifest.json を読み込む。ハードコードによる手打ち複製 (実体との乖離リスク) を避け、
+ * static/manifest.template.json を読み込む。ハードコードによる手打ち複製 (実体との乖離リスク) を避け、
  * host_permissions / background.service_worker を実ファイルから導出するために使う。
  */
 function readManifest(): Manifest {
-  const manifestPath = path.resolve(process.cwd(), 'static/manifest.json');
+  const manifestPath = path.resolve(process.cwd(), 'static/manifest.template.json');
   return JSON.parse(readFileSync(manifestPath, 'utf-8')) as Manifest;
 }
 
@@ -32,7 +32,9 @@ function readManifest(): Manifest {
 function deriveAllowedHostSuffixes(manifest: Manifest): string[] {
   const hostPermissions = manifest.host_permissions;
   if (!Array.isArray(hostPermissions) || hostPermissions.length === 0) {
-    throw new Error(`static/manifest.json の host_permissions が空/不正です: ${JSON.stringify(hostPermissions)}`);
+    throw new Error(
+      `static/manifest.template.json の host_permissions が空/不正です: ${JSON.stringify(hostPermissions)}`,
+    );
   }
   const pattern = /^\*:\/\/\*\.(.+)\/\*$/;
   return hostPermissions.map((entry) => {
@@ -68,7 +70,7 @@ function browserEnv(): Record<string, string> {
 function deriveServiceWorkerFileName(manifest: Manifest): string {
   const swPath = manifest.background?.service_worker;
   if (typeof swPath !== 'string' || swPath.length === 0) {
-    throw new Error(`static/manifest.json の background.service_worker が不正です: ${JSON.stringify(swPath)}`);
+    throw new Error(`static/manifest.template.json の background.service_worker が不正です: ${JSON.stringify(swPath)}`);
   }
   return swPath;
 }
