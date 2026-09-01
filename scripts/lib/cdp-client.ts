@@ -1,9 +1,8 @@
 /**
  * scripts/live-cdp-eval.ts と scripts/live-pull-zip.ts が共有する、最小限の CDP クライアント。
  *
- * chrome-devtools MCP が同じ CDP endpoint を掴んでいると playwright.connectOverCDP は
- * タイムアウトすることがあるため (SKILL.md 参照)、両スクリプトとも webSocketDebuggerUrl に
- * 生の WebSocket で直接つなぎ Runtime.evaluate を送る方式を採る。
+ * agent-browser が page target を操作している間も service worker target を直接調べられるよう、
+ * 両スクリプトとも webSocketDebuggerUrl に生の WebSocket で直接つなぎ Runtime.evaluate を送る。
  */
 
 export type CdpTarget = {

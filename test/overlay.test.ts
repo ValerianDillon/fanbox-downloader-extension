@@ -47,7 +47,7 @@ describe('Overlay 状態遷移', () => {
   // 下の個別テストが「有効」と言い続けてしまう
   test('遷移表の内容が仕様どおりである', () => {
     expect(OVERLAY_TRANSITIONS).toEqual({
-      settings: ['collecting'],
+      settings: ['collecting', 'review'],
       collecting: ['review', 'settings', 'complete'],
       review: ['downloading', 'settings'],
       downloading: ['complete', 'settings'],
@@ -57,6 +57,10 @@ describe('Overlay 状態遷移', () => {
 
   test('settings → collecting は有効', () => {
     expect(isValidTransition('settings', 'collecting')).toBe(true);
+  });
+
+  test('settings → review は投稿情報ファイルの import で有効', () => {
+    expect(isValidTransition('settings', 'review')).toBe(true);
   });
 
   // Issue #55: 収集が終わっても直接 ZIP 生成へは行かず、必ず選択画面 (review) を挟む
@@ -123,10 +127,6 @@ describe('Overlay 状態遷移', () => {
 
   test('settings → downloading は無効', () => {
     expect(isValidTransition('settings', 'downloading')).toBe(false);
-  });
-
-  test('settings → review は無効', () => {
-    expect(isValidTransition('settings', 'review')).toBe(false);
   });
 
   test('complete → review は無効', () => {

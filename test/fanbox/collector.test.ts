@@ -90,20 +90,21 @@ const HISTORY: CreatorHistory = {
   saved: [
     {
       postId: POST_STUB.id,
-      archiveDirectory: `${POST_STUB.id}_${POST_STUB.title}`,
+      archiveDirectory: `${POST_STUB.title} [${POST_STUB.id}]`,
       revision: POST_STUB.updatedDatetime,
       archiveFormatVersion: ARCHIVE_FORMAT_VERSION,
       savedAt: 2,
+      bodyWritten: true,
       assets: [
         {
           kind: 'image',
           assetId: 'img-1',
-          archiveName: 'img_image_img-1.png',
+          archiveName: '002.png',
           outcome: 'written',
           zipName: 'out.zip',
           savedAt: 2,
         },
-        { kind: 'cover', archiveName: 'cover.jpg', outcome: 'written', zipName: 'out.zip', savedAt: 2 },
+        { kind: 'cover', archiveName: '001.jpg', outcome: 'written', zipName: 'out.zip', savedAt: 2 },
       ],
     },
   ],

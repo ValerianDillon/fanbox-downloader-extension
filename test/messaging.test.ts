@@ -53,4 +53,18 @@ describe('sendMessageAbortable', () => {
     await expect(sendMessageAbortable({ type: 'fetchApi' }, controller.signal)).rejects.toThrow(/Aborted/);
     expect(called).toBe(false);
   });
+
+  test('service worker が応答しなければタイムアウトする', async () => {
+    mockPending();
+    const promise = sendMessageAbortable({ type: 'fetchApi' }, undefined, 1);
+    await expect(promise).rejects.toThrow(/service worker/);
+  });
+
+  test('タイムアウト後に遅れて応答しても結果は変わらない', async () => {
+    const resolve = mockPending();
+    const promise = sendMessageAbortable({ type: 'fetchApi' }, undefined, 1);
+    await expect(promise).rejects.toThrow(/service worker/);
+    resolve({ ok: true });
+    await Bun.sleep(0);
+  });
 });

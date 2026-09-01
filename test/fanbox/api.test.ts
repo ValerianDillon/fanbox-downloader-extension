@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
+  API_MESSAGE_TIMEOUT_MS,
   ApiSession,
   ApiShapeError,
   DEFAULT_API_RATE_LIMIT_MS,
@@ -141,7 +142,13 @@ describe('fetchJson レートリミッタ / 429 リトライ', () => {
   function installFakeTimers() {
     virtualWaitMs = 0;
     virtualClockMs = 0;
+    let ignoredDeadlineId = 1_000_000_000;
     globalThis.setTimeout = ((handler: TimerHandler, timeout?: number) => {
+      // sendMessage の応答期限は待機ではなく、通常は応答時に clear される監視タイマーである。
+      // 即時実行すると正常な応答との競争を作り、累積待機にも存在しない 35 秒を加えてしまう。
+      if (timeout === API_MESSAGE_TIMEOUT_MS) {
+        return ignoredDeadlineId++ as unknown as ReturnType<typeof setTimeout>;
+      }
       virtualWaitMs += timeout ?? 0;
       virtualClockMs += timeout ?? 0;
       const id = origSetTimeout(handler as () => void, 0);

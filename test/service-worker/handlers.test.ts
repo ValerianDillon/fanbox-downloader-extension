@@ -79,6 +79,24 @@ describe('handleFetchApi', () => {
     expect(res.backoffUntil).toBe(await store.get());
   });
 
+  test('fetch が応答しなければタイムアウトで中断し、status 0 の応答を返す', async () => {
+    let aborted = false;
+    globalThis.fetch = ((_url: string | URL | Request, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          aborted = true;
+          reject(init.signal?.reason);
+        });
+      })) as unknown as typeof fetch;
+
+    const res = await handleFetchApi('https://api.fanbox.cc/x', store, { timeoutMs: 1 });
+
+    expect(aborted).toBe(true);
+    expect(res.status).toBe(0);
+    expect(res.error).toContain('TimeoutError');
+    expect(typeof res.issuedAt).toBe('number');
+  });
+
   test('既知の未経過期限があるときは fetch せずにゲート拒否を返す', async () => {
     const backoffUntil = await store.record(Date.now() + 60_000);
     let fetchCalled = false;

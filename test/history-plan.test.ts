@@ -1,11 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { DownloadUtils } from 'download-helper/download-helper';
+import { DownloadUtils, type PostSummary } from 'download-helper/download-helper';
 import { ARCHIVE_FORMAT_VERSION } from '../src/content/archive-path';
 import {
   acquireHistoryForCollect,
   buildFrozenArchiveNames,
   canSkipPostInfo,
   historyForCollect,
+  isPostSavedForSelection,
   prepareHistoryPlan,
 } from '../src/content/history-plan';
 import type { CatalogPost, CreatorHistory, SavedAsset, SavedPost } from '../src/history-record';
@@ -22,7 +23,7 @@ function makeCatalog(overrides: Partial<CatalogPost> = {}): CatalogPost {
     title: 'タイトル',
     publishedDatetime: null,
     complete: true,
-    assets: [{ kind: 'image', assetId: 'a1', originalName: 'a', extension: 'png' }],
+    assets: [{ kind: 'image', assetId: 'a1', originalName: 'a', extension: '.png' }],
     ...overrides,
   };
 }
@@ -31,7 +32,7 @@ function makeSavedAsset(overrides: Partial<SavedAsset> = {}): SavedAsset {
   return {
     kind: 'image',
     assetId: 'a1',
-    archiveName: 'a_image_a1.png',
+    archiveName: '001.png',
     outcome: 'written',
     zipName: 'out.zip',
     savedAt: 200,
@@ -42,10 +43,11 @@ function makeSavedAsset(overrides: Partial<SavedAsset> = {}): SavedAsset {
 function makeSaved(overrides: Partial<SavedPost> = {}): SavedPost {
   return {
     postId: 'p1',
-    archiveDirectory: 'p1_タイトル',
+    archiveDirectory: 'タイトル [p1]',
     revision: REVISION,
     archiveFormatVersion: ARCHIVE_FORMAT_VERSION,
     savedAt: 200,
+    bodyWritten: true,
     assets: [makeSavedAsset()],
     ...overrides,
   };
@@ -67,8 +69,8 @@ describe('凍結名の組み立て', () => {
   test('投稿ディレクトリとアセット名を postId で入れ子にして渡す (一度出した名前を編集で変えないため)。', () => {
     const frozen = buildFrozenArchiveNames(makeHistory());
 
-    expect(frozen.postDirectories.get('p1')).toBe('p1_タイトル');
-    expect(frozen.assetNames.get('p1')?.get('image:a1')).toBe('a_image_a1.png');
+    expect(frozen.postDirectories.get('p1')).toBe('タイトル [p1]');
+    expect(frozen.assetNames.get('p1')?.get('image:a1')).toBe('001.png');
   });
 
   test('カバーは sentinel の鍵で渡す (投稿に高々一つなので assetId を持たないため)。', () => {
@@ -182,6 +184,107 @@ describe('post.info を省略できる条件', () => {
     });
 
     expect(canSkipPostInfo(history, 'p1', REVISION)).toBe(false);
+  });
+});
+
+describe('現在のコンテンツ条件に対する保存済み判定', () => {
+  const post: PostSummary = {
+    postId: 'p1',
+    name: 'タイトル',
+    tags: [],
+    files: [
+      { key: { kind: 'image', assetId: 'a1' }, name: 'a', extension: '.png', metadata: {} },
+      { key: { kind: 'file', assetId: 'a2' }, name: 'b', extension: '.zip', metadata: {} },
+    ],
+    cover: { key: { kind: 'cover' }, name: 'cover', extension: '.jpg', metadata: {} },
+  };
+
+  test('現在選ばれた拡張子の全アセットだけが保存済みなら true にする', () => {
+    expect(
+      isPostSavedForSelection(makeHistory(), post, REVISION, {
+        extensions: new Set(['.png']),
+        includeCover: false,
+        includeBody: false,
+      }),
+    ).toBe(true);
+  });
+
+  test('選ばれていない拡張子の未保存アセットは判定に含めず、選び直した時点で未保存に戻す', () => {
+    const history = makeHistory({
+      catalog: [
+        makeCatalog({
+          assets: [
+            { kind: 'image', assetId: 'a1', originalName: 'a', extension: '.png' },
+            { kind: 'file', assetId: 'a2', originalName: 'b', extension: '.zip' },
+          ],
+        }),
+      ],
+    });
+
+    expect(
+      isPostSavedForSelection(history, post, REVISION, {
+        extensions: new Set(['.png']),
+        includeCover: false,
+        includeBody: false,
+      }),
+    ).toBe(true);
+    expect(
+      isPostSavedForSelection(history, post, REVISION, {
+        extensions: new Set(['.png', '.zip']),
+        includeCover: false,
+        includeBody: false,
+      }),
+    ).toBe(false);
+  });
+
+  test('本文を選んだ場合は bodyWritten、カバーを選んだ場合は cover の written を要求する', () => {
+    const withoutBody = makeHistory({ saved: [makeSaved({ bodyWritten: false })] });
+    expect(
+      isPostSavedForSelection(withoutBody, post, REVISION, {
+        extensions: new Set(['.png']),
+        includeCover: false,
+        includeBody: true,
+      }),
+    ).toBe(false);
+    expect(
+      isPostSavedForSelection(makeHistory(), post, REVISION, {
+        extensions: new Set(['.png']),
+        includeCover: true,
+        includeBody: false,
+      }),
+    ).toBe(false);
+
+    const withCover = makeHistory({
+      saved: [
+        makeSaved({
+          assets: [makeSavedAsset(), makeSavedAsset({ kind: 'cover', assetId: undefined, archiveName: '002.jpg' })],
+        }),
+      ],
+    });
+    expect(
+      isPostSavedForSelection(withCover, post, REVISION, {
+        extensions: new Set(['.png']),
+        includeCover: true,
+        includeBody: true,
+      }),
+    ).toBe(true);
+  });
+
+  test('保存対象が一つも無い条件や世代が違う実績は保存済みにしない', () => {
+    expect(
+      isPostSavedForSelection(makeHistory(), post, REVISION, {
+        extensions: new Set(),
+        includeCover: false,
+        includeBody: false,
+      }),
+    ).toBe(false);
+    expect(
+      isPostSavedForSelection(makeHistory(), post, '2025-01-01T00:00:00+09:00', {
+        extensions: new Set(['.png']),
+        includeCover: false,
+        includeBody: false,
+      }),
+    ).toBe(false);
   });
 });
 

@@ -7,12 +7,14 @@ import {
   historyKeyFor,
 } from '../history-record';
 
+/** MV3 service worker が応答しなくても content script の状態遷移を止め続けない上限。 */
+export const HISTORY_MESSAGE_TIMEOUT_MS = 35_000;
+
 /**
  * content script から差分ダウンロードの履歴を読み書きする (Issue #56)。
  *
- * **読みは `chrome.storage.local` を直接引き、書きは service worker へ送る。**
- * 読みまで往復にすると収集の入口で service worker の起動待ちが入る一方、書きは
- * タブをまたぐ read-modify-write なので単一スレッドの直列キューで守る必要がある
+ * 設定表示の読みは `chrome.storage.local` を直接引き、収集に使う読みと全書き込みは service worker へ送る。
+ * 収集用の読みは削除と、書き込みはタブをまたぐ read-modify-write と順序を揃える必要がある
  * (理由は `service-worker/history-store.ts` のコメント)。
  *
  * content script から Web Storage / IndexedDB を使うと FANBOX ページ側の origin になるため
@@ -55,8 +57,11 @@ export async function readCreatorHistory(creatorId: string): Promise<CreatorHist
  * 読めなければ null に倒す。応答が想定外・service worker が失敗を返した・例外、のいずれでも
  * 「履歴が無い」と同じ扱いにする (再ダウンロードになるだけである)。
  */
-export async function readCreatorHistoryForCollect(creatorId: string): Promise<CreatorHistory | null> {
-  const response = await sendHistoryMessage({ type: 'historyRead', creatorId });
+export async function readCreatorHistoryForCollect(
+  creatorId: string,
+  signal?: AbortSignal,
+): Promise<CreatorHistory | null> {
+  const response = await sendHistoryMessage({ type: 'historyRead', creatorId }, signal);
   if (!response.ok) {
     console.warn('履歴の読み出しに失敗しました。履歴なしとして扱います:', response.error);
     return null;
@@ -73,8 +78,11 @@ export async function readCreatorHistoryForCollect(creatorId: string): Promise<C
  * ただしここでは自動で送り直さない — 失敗を利用者に見せる方が、黙って再送して結果を
  * 曖昧にするより実態に合う。
  */
-export async function applyCreatorHistory(update: CreatorHistoryUpdate): Promise<HistoryResponse> {
-  return sendHistoryMessage({ type: 'historyApply', update });
+export async function applyCreatorHistory(
+  update: CreatorHistoryUpdate,
+  signal?: AbortSignal,
+): Promise<HistoryResponse> {
+  return sendHistoryMessage({ type: 'historyApply', update }, signal);
 }
 
 /** creator の履歴を消す (利用者の操作) */
@@ -82,11 +90,42 @@ export async function removeCreatorHistory(creatorId: string): Promise<HistoryRe
   return sendHistoryMessage({ type: 'historyRemove', creatorId });
 }
 
-async function sendHistoryMessage(message: HistoryMessage): Promise<HistoryResponse> {
+async function sendHistoryMessage(message: HistoryMessage, signal?: AbortSignal): Promise<HistoryResponse> {
   const runtime = typeof chrome !== 'undefined' ? chrome.runtime : undefined;
   if (!runtime?.sendMessage) return { ok: false, error: 'chrome.runtime が利用できません' };
   try {
-    const response: unknown = await runtime.sendMessage(message);
+    const response: unknown = await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        signal?.removeEventListener('abort', onAbort);
+        callback();
+      };
+      const onAbort = () => finish(() => reject(signal?.reason ?? new DOMException('Aborted', 'AbortError')));
+      const timeoutId = setTimeout(
+        () => finish(() => reject(new Error(`履歴の応答が ${HISTORY_MESSAGE_TIMEOUT_MS / 1000} 秒以内にありません`))),
+        HISTORY_MESSAGE_TIMEOUT_MS,
+      );
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      // race で待機を打ち切った後の reject も、この then の reject handler が受けて未処理にしない。
+      let request: Promise<unknown>;
+      try {
+        request = runtime.sendMessage(message);
+      } catch (error) {
+        finish(() => reject(error));
+        return;
+      }
+      void request.then(
+        (value) => finish(() => resolve(value)),
+        (error) => finish(() => reject(error)),
+      );
+    });
     // 応答の形が想定と違えば成功とは言えない。service worker が listener を持たない版に
     // 差し替わっている場合 (undefined が返る) をここで成功に丸めない
     if (typeof response !== 'object' || response === null) {

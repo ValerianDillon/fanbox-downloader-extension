@@ -110,29 +110,26 @@ export const EXPECTED_FETCHED_URLS = [POST_A_COVER_URL, POST_A_IMAGE_URL, POST_B
 /**
  * 期待される ZIP エントリ名一覧。
  *
- * archive path は postId 由来の allocator (`src/content/archive-path.ts`、Issue #56) が決める。
+ * archive path は postId を末尾へ付ける allocator (`src/content/archive-path.ts`、Issue #56) が決める。
  * - encodedId = utils.encodeFileName('testcreator') = 'testcreator' (エスケープ対象文字なし)
- * - 投稿ディレクトリは `<postId>_<タイトル>`
- * - 本文アセットは `<元の名前>_<kind>_<assetId><拡張子>`。assetId を常に付けるので、同名のアセットが
- *   増えても既存の名前が変わらない。kind も含めるのは image と file で同じ assetId が来ても別物だから
- * - image type の投稿は addFile(postName, ext, url) で呼ばれるため、元の名前は投稿タイトルになる
- * - file type の投稿は addFile(file.name, file.extension, file.url) で呼ばれるため、元の名前は
- *   FileInfo.name になる
- * - cover のエントリ名は 'cover' + (coverImageUrl の拡張子)。投稿に高々 1 つなので一意である
+ * - 投稿ディレクトリは `<タイトル> [<postId>]`
+ * - 本文アセットは投稿内で `001` から始まる数字連番にする
+ * - カバーがあれば `001` に置き、本文アセットは `002` から始める
+ * - 投稿メタデータは各投稿ディレクトリの post.json に保存する
  * - download-manifest.json は projection の記録として ZIP ルートに必ず書かれる
  */
 export const EXPECTED_ZIP_ENTRIES = [
   'testcreator/',
   'testcreator/index.html',
   'testcreator/download-manifest.json',
-  'testcreator/1001_リンゴ/',
-  'testcreator/1001_リンゴ/info.json',
-  'testcreator/1001_リンゴ/index.html',
-  'testcreator/1001_リンゴ/cover.jpg',
-  'testcreator/1001_リンゴ/リンゴ_image_a-img-1.png',
-  'testcreator/1002_バナナ/',
-  'testcreator/1002_バナナ/info.json',
-  'testcreator/1002_バナナ/index.html',
-  'testcreator/1002_バナナ/cover.png',
-  'testcreator/1002_バナナ/資料_file_b-file-1.pdf',
+  'testcreator/リンゴ [1001]/',
+  'testcreator/リンゴ [1001]/post.json',
+  'testcreator/リンゴ [1001]/index.html',
+  'testcreator/リンゴ [1001]/001.jpg',
+  'testcreator/リンゴ [1001]/002.png',
+  'testcreator/バナナ [1002]/',
+  'testcreator/バナナ [1002]/post.json',
+  'testcreator/バナナ [1002]/index.html',
+  'testcreator/バナナ [1002]/001.png',
+  'testcreator/バナナ [1002]/002.pdf',
 ].sort();

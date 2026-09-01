@@ -4,26 +4,42 @@ import type {
   DownloadZipResult,
   PostSummary,
 } from 'download-helper/download-helper';
+import { DownloadUtils } from 'download-helper/download-helper';
 import type { CreatorHistory, HistoryResponse } from '../history-record';
+import { createCollectionFile, restoreCollectionFile } from './collection-file';
 import type { DownloadProgress, FileSystemFileHandle } from './downloader';
-import { downloadAsZip, pickSaveHandle, preflightDownload } from './downloader';
+import {
+  DEFAULT_MEDIA_CONCURRENCY,
+  downloadAsZip,
+  formatDownloadLog,
+  MAX_MEDIA_CONCURRENCY,
+  pickSaveHandle,
+  preflightDownload,
+} from './downloader';
 import { ApiShapeError, type PageType, ResponseParseError } from './fanbox/api';
 import type { CollectorSettings, CollectResult, PostFailureCounts } from './fanbox/collector';
 import { collect, PostBodyInvalidError } from './fanbox/collector';
 import { applyCreatorHistory, readCreatorHistory, readCreatorHistoryForCollect, removeCreatorHistory } from './history';
-import { acquireHistoryForCollect, historyForCollect } from './history-plan';
+import {
+  acquireHistoryForCollect,
+  historyForCollect,
+  isPostSavedForSelection,
+  prepareHistoryPlan,
+} from './history-plan';
 import { buildObservationUpdate, buildSaveUpdate } from './history-update';
 import css from './overlay.css' with { type: 'text' };
 import {
+  countContentAvailability,
   countSelection,
   createInitialSelection,
   describeRenderedRange,
   describeSelectionCounts,
   describeSizeEstimate,
-  type ExtensionOption,
+  effectivePostIds,
   filterPosts,
-  listExtensionOptions,
-  POST_LIST_RENDER_LIMIT,
+  formatByteSize,
+  hasSelectedContent,
+  type PostDateField,
   type ReviewSelection,
   toSelection,
 } from './review-model';
@@ -48,11 +64,13 @@ export type OverlayState = 'settings' | 'collecting' | 'review' | 'downloading' 
  *   それ以外の例外 (枯渇や想定外のバグ) の catch。いずれも保存すべき ZIP が無いと分かった時点で着地する
  * - `review → complete` は無い。確定は必ず `downloading` を経由する。保存先の取得に失敗しても
  *   review に留まる (Issue #55)
+ * - `settings → review` は投稿情報ファイルの import が使う。API 収集を再実行せず、検証済みの
+ *   snapshot と現在の保存履歴から通常の review 状態を組み立てる
  * - `downloading → settings` はパネルの再オープン等による全破棄で、部分保存を活かす
  *   「ここまでで終了」(→ complete) とは別物である
  */
 export const OVERLAY_TRANSITIONS: Readonly<Record<OverlayState, readonly OverlayState[]>> = {
-  settings: ['collecting'],
+  settings: ['collecting', 'review'],
   collecting: ['review', 'settings', 'complete'],
   review: ['downloading', 'settings'],
   downloading: ['complete', 'settings'],
@@ -348,9 +366,13 @@ export function joinHistoryErrors(observationError: string | null, saveError: st
  *
  * ZIP を作るかに関わらず送る。理由は `buildObservationUpdate` の JSDoc を参照。
  */
-export async function recordObservation(creatorId: string, result: CollectResult): Promise<string | null> {
+export async function recordObservation(
+  creatorId: string,
+  result: CollectResult,
+  signal?: AbortSignal,
+): Promise<string | null> {
   try {
-    const response = await applyCreatorHistory(buildObservationUpdate(creatorId, result));
+    const response = await applyCreatorHistory(buildObservationUpdate(creatorId, result), signal);
     return response.ok ? null : (response.error ?? '不明な理由');
   } catch (e) {
     console.error('収集結果の記録に失敗:', e);
@@ -398,10 +420,14 @@ type ReviewContext = {
   readonly creatorId: string;
   readonly result: CollectResult;
   readonly posts: PostSummary[];
-  readonly extensionOptions: ExtensionOption[];
   readonly selection: ReviewSelection;
+  readonly history: CreatorHistory | null;
+  readonly mediaConcurrency: number;
   /** 投稿リストの検索語 */
   query: string;
+  dateField: PostDateField;
+  dateFrom: string;
+  dateTo: string;
   /**
    * 選択から導出済みかつ検証済みのダウンロード対象。導出が終わっていなければ null。
    *
@@ -644,6 +670,7 @@ export class OverlayController {
     let ignoreFreeCheckbox: HTMLInputElement | undefined;
     let limitInput: HTMLInputElement | undefined;
     let intervalInput: HTMLInputElement | undefined;
+    let mediaConcurrencyInput: HTMLInputElement | undefined;
 
     if (isCreator) {
       const freeLabel = document.createElement('label');
@@ -668,7 +695,7 @@ export class OverlayController {
       const intervalRow = document.createElement('div');
       intervalRow.className = 'setting-row';
       const intervalLabel = document.createElement('span');
-      intervalLabel.textContent = 'API 間隔(ms):';
+      intervalLabel.textContent = '投稿情報 API 間隔(ms):';
       intervalInput = document.createElement('input');
       intervalInput.type = 'number';
       intervalInput.min = '100';
@@ -680,12 +707,52 @@ export class OverlayController {
       this.panelEl.appendChild(intervalRow);
     }
 
+    const concurrencyRow = document.createElement('div');
+    concurrencyRow.className = 'setting-row';
+    const concurrencyLabel = document.createElement('span');
+    concurrencyLabel.textContent = 'メディア並列数:';
+    mediaConcurrencyInput = document.createElement('input');
+    mediaConcurrencyInput.type = 'number';
+    mediaConcurrencyInput.min = '1';
+    mediaConcurrencyInput.max = String(MAX_MEDIA_CONCURRENCY);
+    mediaConcurrencyInput.step = '1';
+    mediaConcurrencyInput.value = String(DEFAULT_MEDIA_CONCURRENCY);
+    concurrencyRow.appendChild(concurrencyLabel);
+    concurrencyRow.appendChild(mediaConcurrencyInput);
+    this.panelEl.appendChild(concurrencyRow);
+
     // 履歴の行は読み込みが済んでから埋める。ここでは器だけ置く
     const historyRow = document.createElement('div');
     historyRow.className = 'setting-row';
     historyRow.id = 'history-row';
     this.panelEl.appendChild(historyRow);
     this.renderHistoryRow();
+
+    const importRow = document.createElement('div');
+    importRow.className = 'setting-row';
+    const importInput = document.createElement('input');
+    importInput.type = 'file';
+    importInput.accept = '.json,application/json';
+    importInput.hidden = true;
+    const importBtn = document.createElement('button');
+    importBtn.type = 'button';
+    importBtn.className = 'btn-secondary';
+    importBtn.textContent = '投稿情報ファイルを読み込む';
+    importBtn.addEventListener('click', () => importInput.click());
+    importInput.addEventListener('change', () => {
+      const file = importInput.files?.[0];
+      importInput.value = '';
+      if (file) void this.importCollectionFile(file, importBtn);
+    });
+    importRow.appendChild(importBtn);
+    importRow.appendChild(importInput);
+    this.panelEl.appendChild(importRow);
+
+    const importError = document.createElement('p');
+    importError.className = 'review-error';
+    importError.id = 'import-error';
+    importError.hidden = true;
+    this.panelEl.appendChild(importError);
 
     const btnRow = document.createElement('div');
     btnRow.className = 'btn-row';
@@ -699,6 +766,9 @@ export class OverlayController {
         isIgnoreFree: ignoreFreeCheckbox?.checked ?? false,
         limit: limitInput?.value ? Number.parseInt(limitInput.value, 10) : null,
         apiIntervalMs: intervalInput?.value ? Number.parseInt(intervalInput.value, 10) : null,
+        mediaConcurrency: mediaConcurrencyInput?.value
+          ? Number.parseInt(mediaConcurrencyInput.value, 10)
+          : DEFAULT_MEDIA_CONCURRENCY,
       };
       const ignoreHistory =
         (this.shadowRoot.getElementById('history-ignore') as HTMLInputElement | null)?.checked ?? false;
@@ -745,9 +815,7 @@ export class OverlayController {
     ignoreBox.type = 'checkbox';
     ignoreBox.id = 'history-ignore';
     ignoreLabel.appendChild(ignoreBox);
-    // 「履歴を無視して全件を取得する」と「既存の履歴を含めて再保存する」は、収集から見れば
-    // 同じ操作である (どちらも全件を取得し、その結果で記録を更新する)
-    ignoreLabel.appendChild(document.createTextNode('前回保存分も取得する'));
+    ignoreLabel.appendChild(document.createTextNode('前回保存分も選択した状態で表示'));
     row.appendChild(ignoreLabel);
 
     const forgetBtn = document.createElement('button');
@@ -813,6 +881,37 @@ export class OverlayController {
     if (this.state === 'settings') this.renderHistoryRow();
   }
 
+  /** 投稿情報ファイルを検証して、通信せず通常の review へ復元する。 */
+  private async importCollectionFile(file: File, button: HTMLButtonElement) {
+    const pageCreatorId = this.pageType?.creatorId;
+    if (pageCreatorId === undefined || this.state !== 'settings') return;
+    button.disabled = true;
+    const errorEl = this.shadowRoot.getElementById('import-error');
+    if (errorEl) errorEl.hidden = true;
+    try {
+      const value = JSON.parse(await file.text()) as unknown;
+      const currentHistory = await acquireHistoryForCollect(this.deletingCreators.get(pageCreatorId), () =>
+        readCreatorHistoryForCollect(pageCreatorId),
+      );
+      if (this.pageType?.creatorId !== pageCreatorId || this.state !== 'settings') return;
+      const utils = new DownloadUtils();
+      const plan = prepareHistoryPlan(utils, historyForCollect(currentHistory, pageCreatorId));
+      const imported = restoreCollectionFile(value, utils, plan.allocator, plan.history);
+      if (imported.creatorId !== pageCreatorId) {
+        throw new Error(`このページは @${pageCreatorId} ですが、ファイルは @${imported.creatorId} のものです`);
+      }
+      this.guardUnload();
+      this.enterReview(pageCreatorId, imported.result, null, false, DEFAULT_MEDIA_CONCURRENCY);
+    } catch (error) {
+      if (this.pageType?.creatorId !== pageCreatorId || this.state !== 'settings') return;
+      if (errorEl) {
+        errorEl.textContent = error instanceof Error ? error.message : String(error);
+        errorEl.hidden = false;
+      }
+      button.disabled = false;
+    }
+  }
+
   private renderCollecting() {
     if (!this.panelEl) return;
     this.panelEl.className = 'overlay-panel';
@@ -868,14 +967,11 @@ export class OverlayController {
     size.id = 'review-size';
     this.panelEl.appendChild(size);
 
-    // 省いた投稿が一覧に出てこない理由を書く。書かないと「取りこぼした」ように見える
-    const skipped = ctx.result.skippedByHistoryPostIds.size;
-    if (skipped > 0) {
-      const skippedText = document.createElement('p');
-      skippedText.className = 'progress-text';
-      skippedText.textContent = `前回保存済みのため取得を省いた投稿: ${skipped} 件 (この ZIP には含まれません)`;
-      this.panelEl.appendChild(skippedText);
-    }
+    const exportNote = document.createElement('p');
+    exportNote.className = 'review-note';
+    exportNote.textContent =
+      '投稿情報のエクスポートには投稿本文と直接メディア URL が含まれるため、公開しないでください。';
+    this.panelEl.appendChild(exportNote);
 
     const error = document.createElement('p');
     error.className = 'review-error';
@@ -895,6 +991,13 @@ export class OverlayController {
     confirmBtn.addEventListener('click', () => this.confirmReview(confirmBtn));
     btnRow.appendChild(confirmBtn);
 
+    const exportBtn = document.createElement('button');
+    exportBtn.className = 'btn-secondary';
+    exportBtn.textContent = '投稿情報をエクスポート';
+    exportBtn.title = '投稿本文、アセット URL、選択前の収集情報を JSON ファイルへ保存します';
+    exportBtn.addEventListener('click', () => this.exportCollectionFile(ctx));
+    btnRow.appendChild(exportBtn);
+
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'btn-secondary';
     cancelBtn.textContent = '閉じる';
@@ -902,40 +1005,109 @@ export class OverlayController {
     btnRow.appendChild(cancelBtn);
     this.panelEl.appendChild(btnRow);
 
-    this.renderPostList();
     // 初期選択に対する導出もここから始める。ハンドラが読むだけで済む状態を最初から作る
     this.onSelectionChanged();
   }
 
-  /** 拡張子とカバーの選択欄を組み立てる */
+  /** 現在の収集結果を、後から review へ戻せる JSON ファイルとして保存する。 */
+  private exportCollectionFile(ctx: ReviewContext) {
+    const content = JSON.stringify(createCollectionFile(ctx.creatorId, ctx.result), null, 2);
+    const url = URL.createObjectURL(new Blob([content], { type: 'application/json' }));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${new DownloadUtils().encodeFileName(ctx.creatorId)}-fanbox-posts.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  /** 投稿本文、カバー、添付拡張子の選択欄を組み立てる。 */
   private buildExtensionSection(ctx: ReviewContext): HTMLElement {
     const section = document.createElement('section');
     section.className = 'review-section';
 
     const heading = document.createElement('h3');
-    heading.textContent = '添付の拡張子';
+    heading.textContent = '保存する内容';
     section.appendChild(heading);
 
     const note = document.createElement('p');
     note.className = 'review-note';
-    // 「.pdf のみ」と読ませない。拡張子の指定は投稿の添付にしか効かず、カバーは別枠で決まる
-    note.textContent = '拡張子の指定は投稿の添付にだけ効きます。カバー画像は下のトグルで別に選びます。';
+    note.textContent =
+      '件数は下で選択中の投稿だけから集計します。0 件の項目は一時的に無効になり、投稿を選び直すと以前の選択へ戻ります。';
     section.appendChild(note);
+
+    const bodyLabel = document.createElement('label');
+    const bodyBox = document.createElement('input');
+    bodyBox.type = 'checkbox';
+    bodyBox.id = 'review-body';
+    bodyBox.addEventListener('change', () => {
+      ctx.selection.includeBody = bodyBox.checked;
+      this.onSelectionChanged();
+    });
+    bodyLabel.appendChild(bodyBox);
+    const bodyText = document.createElement('span');
+    bodyText.id = 'review-body-label';
+    bodyLabel.appendChild(bodyText);
+    section.appendChild(bodyLabel);
+
+    const coverLabel = document.createElement('label');
+    const coverBox = document.createElement('input');
+    coverBox.type = 'checkbox';
+    coverBox.id = 'review-cover';
+    coverBox.addEventListener('change', () => {
+      ctx.selection.includeCover = coverBox.checked;
+      this.onSelectionChanged();
+    });
+    coverLabel.appendChild(coverBox);
+    const coverText = document.createElement('span');
+    coverText.id = 'review-cover-label';
+    coverLabel.appendChild(coverText);
+    section.appendChild(coverLabel);
 
     const list = document.createElement('div');
     list.className = 'review-chip-list';
-    for (const option of ctx.extensionOptions) {
+    list.id = 'review-extension-list';
+    section.appendChild(list);
+
+    return section;
+  }
+
+  /** 投稿選択に応じて内容オプションの件数・checked・disabled を更新する。 */
+  private renderContentOptions() {
+    const ctx = this.review;
+    if (!ctx) return;
+    const availability = countContentAvailability(ctx.posts, ctx.selection.postIds);
+    const updateToggle = (id: string, labelId: string, desired: boolean, count: number, label: string) => {
+      const box = this.shadowRoot.getElementById(id) as HTMLInputElement | null;
+      const text = this.shadowRoot.getElementById(labelId);
+      if (box) {
+        box.disabled = count === 0;
+        box.checked = count > 0 && desired;
+      }
+      if (text) text.textContent = `${label} (${count})`;
+    };
+    updateToggle('review-body', 'review-body-label', ctx.selection.includeBody, availability.bodyCount, '投稿本文');
+    updateToggle(
+      'review-cover',
+      'review-cover-label',
+      ctx.selection.includeCover,
+      availability.coverCount,
+      'カバー画像',
+    );
+
+    const list = this.shadowRoot.getElementById('review-extension-list');
+    if (!list) return;
+    list.innerHTML = '';
+    for (const option of availability.extensions) {
       const label = document.createElement('label');
       label.className = 'review-chip';
+      if (option.fileCount === 0) label.classList.add('is-disabled');
       const box = document.createElement('input');
       box.type = 'checkbox';
-      box.checked = ctx.selection.extensions.has(option.extension);
+      box.disabled = option.fileCount === 0;
+      box.checked = option.fileCount > 0 && ctx.selection.extensions.has(option.extension);
       box.addEventListener('change', () => {
-        if (box.checked) {
-          ctx.selection.extensions.add(option.extension);
-        } else {
-          ctx.selection.extensions.delete(option.extension);
-        }
+        if (box.checked) ctx.selection.extensions.add(option.extension);
+        else ctx.selection.extensions.delete(option.extension);
         this.onSelectionChanged();
       });
       label.appendChild(box);
@@ -946,28 +1118,12 @@ export class OverlayController {
       );
       list.appendChild(label);
     }
-    if (ctx.extensionOptions.length === 0) {
+    if (availability.extensions.length === 0) {
       const empty = document.createElement('p');
       empty.className = 'progress-text';
       empty.textContent = '添付を持つ投稿がありません';
       list.appendChild(empty);
     }
-    section.appendChild(list);
-
-    const coverLabel = document.createElement('label');
-    const coverBox = document.createElement('input');
-    coverBox.type = 'checkbox';
-    coverBox.id = 'review-cover';
-    coverBox.checked = ctx.selection.includeCover;
-    coverBox.addEventListener('change', () => {
-      ctx.selection.includeCover = coverBox.checked;
-      this.onSelectionChanged();
-    });
-    coverLabel.appendChild(coverBox);
-    coverLabel.appendChild(document.createTextNode('カバー画像を含める'));
-    section.appendChild(coverLabel);
-
-    return section;
   }
 
   /** 投稿の検索・一括操作・一覧を組み立てる */
@@ -990,35 +1146,71 @@ export class OverlayController {
     });
     section.appendChild(search);
 
+    const dateRow = document.createElement('div');
+    dateRow.className = 'review-date-filter';
+    const dateField = document.createElement('select');
+    dateField.id = 'review-date-field';
+    for (const [value, label] of [
+      ['updated', '更新日'],
+      ['published', '公開日'],
+    ] as const) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      dateField.appendChild(option);
+    }
+    dateField.value = ctx.dateField;
+    dateField.addEventListener('change', () => {
+      ctx.dateField = dateField.value === 'published' ? 'published' : 'updated';
+      this.renderPostList();
+    });
+    dateRow.appendChild(dateField);
+    const from = document.createElement('input');
+    from.type = 'date';
+    from.id = 'review-date-from';
+    from.title = 'この日以降 (含む)';
+    from.addEventListener('change', () => {
+      ctx.dateFrom = from.value;
+      this.renderPostList();
+    });
+    dateRow.appendChild(document.createTextNode(' 開始 '));
+    dateRow.appendChild(from);
+    const to = document.createElement('input');
+    to.type = 'date';
+    to.id = 'review-date-to';
+    to.title = 'この日以前 (含む)。開始日と同じ日にすると 1 日指定';
+    to.addEventListener('change', () => {
+      ctx.dateTo = to.value;
+      this.renderPostList();
+    });
+    dateRow.appendChild(document.createTextNode(' 終了 '));
+    dateRow.appendChild(to);
+    section.appendChild(dateRow);
+
     const actions = document.createElement('div');
     actions.className = 'review-actions';
     // 操作は 全選択 / 全解除 / 検索結果の選択 / 検索結果の解除 の 4 つに限る。
-    // 「表示中」を対象にする操作は入れない (検索一致が描画上限を超えたとき、利用者が
-    // どちらを指すのか判別できない)。反転も入れない
+    // 反転は、現在の選択を確認しないまま大きく変えてしまいやすいため入れない。
     actions.appendChild(
       this.buildActionButton('全選択', () => {
         for (const post of ctx.posts) ctx.selection.postIds.add(post.postId);
-        this.renderPostList();
         this.onSelectionChanged();
       }),
     );
     actions.appendChild(
       this.buildActionButton('全解除', () => {
         ctx.selection.postIds.clear();
-        this.renderPostList();
         this.onSelectionChanged();
       }),
     );
     const selectMatched = this.buildActionButton('検索結果をすべて選択', () => {
-      for (const post of filterPosts(ctx.posts, ctx.query)) ctx.selection.postIds.add(post.postId);
-      this.renderPostList();
+      for (const post of this.filteredReviewPosts(ctx)) ctx.selection.postIds.add(post.postId);
       this.onSelectionChanged();
     });
     selectMatched.id = 'review-select-matched';
     actions.appendChild(selectMatched);
     const clearMatched = this.buildActionButton('検索結果をすべて解除', () => {
-      for (const post of filterPosts(ctx.posts, ctx.query)) ctx.selection.postIds.delete(post.postId);
-      this.renderPostList();
+      for (const post of this.filteredReviewPosts(ctx)) ctx.selection.postIds.delete(post.postId);
       this.onSelectionChanged();
     });
     clearMatched.id = 'review-clear-matched';
@@ -1038,6 +1230,15 @@ export class OverlayController {
     return section;
   }
 
+  private filteredReviewPosts(ctx: ReviewContext): PostSummary[] {
+    return filterPosts(ctx.posts, {
+      query: ctx.query,
+      dateField: ctx.dateField,
+      from: ctx.dateFrom,
+      to: ctx.dateTo,
+    });
+  }
+
   private buildActionButton(label: string, onClick: () => void): HTMLButtonElement {
     const button = document.createElement('button');
     button.type = 'button';
@@ -1047,27 +1248,31 @@ export class OverlayController {
     return button;
   }
 
-  /**
-   * 投稿一覧を描き直す。
-   *
-   * 描画は `POST_LIST_RENDER_LIMIT` 件までに抑えるが、選択は postId の集合に対して適用するので
-   * 描画されていない投稿も一括操作の対象になる。上限は描画コストだけを抑えるものである。
-   */
+  /** 投稿一覧を描き直す。CSS のスクロール領域内に一致投稿をすべて描画する。 */
   private renderPostList() {
     const ctx = this.review;
     const list = this.shadowRoot.getElementById('review-list');
     const range = this.shadowRoot.getElementById('review-range');
     if (!ctx || !list) return;
 
-    const matched = filterPosts(ctx.posts, ctx.query);
-    const rendered = matched.slice(0, POST_LIST_RENDER_LIMIT);
+    const matched = this.filteredReviewPosts(ctx);
     list.innerHTML = '';
-    for (const post of rendered) {
+    for (const post of matched) {
       const item = document.createElement('li');
+      const available = hasSelectedContent(post, ctx.selection);
+      const saved = isPostSavedForSelection(
+        ctx.history,
+        post,
+        ctx.result.listedRevisions.get(post.postId) ?? null,
+        ctx.selection,
+      );
+      if (!available) item.classList.add('is-disabled');
+      if (saved) item.classList.add('is-saved');
       const label = document.createElement('label');
       const box = document.createElement('input');
       box.type = 'checkbox';
-      box.checked = ctx.selection.postIds.has(post.postId);
+      box.disabled = !available;
+      box.checked = available && ctx.selection.postIds.has(post.postId);
       box.addEventListener('change', () => {
         if (box.checked) {
           ctx.selection.postIds.add(post.postId);
@@ -1083,19 +1288,57 @@ export class OverlayController {
       label.appendChild(title);
       const meta = document.createElement('span');
       meta.className = 'review-post-meta';
-      meta.textContent = `#${post.postId} / 添付 ${post.files.length} 件${post.cover ? ' / カバーあり' : ''}`;
+      const savedText = saved ? '前回保存済み / ' : '';
+      const published = post.publishedDatetime ? ` / 公開 ${post.publishedDatetime.slice(0, 10)}` : '';
+      const updated = post.updatedDatetime ? ` / 更新 ${post.updatedDatetime.slice(0, 10)}` : '';
+      meta.textContent = `${savedText}#${post.postId} / 添付 ${post.files.length} 件${post.cover ? ' / カバーあり' : ''}${published}${updated}`;
       label.appendChild(meta);
       item.appendChild(label);
+
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.textContent = 'ファイル構成を表示';
+      details.appendChild(summary);
+      const files = document.createElement('ul');
+      const body = document.createElement('li');
+      body.textContent = '投稿本文 → index.html';
+      files.appendChild(body);
+      if (post.cover)
+        files.appendChild(this.buildAssetDetail('カバー', post.cover.name, post.cover.extension, post.cover.metadata));
+      for (const file of post.files) {
+        files.appendChild(
+          this.buildAssetDetail(file.key.kind === 'image' ? '画像' : '添付', file.name, file.extension, file.metadata),
+        );
+      }
+      const metadata = document.createElement('li');
+      metadata.textContent = '投稿メタデータ → post.json';
+      files.appendChild(metadata);
+      details.appendChild(files);
+      item.appendChild(details);
       list.appendChild(item);
     }
-    if (range) range.textContent = describeRenderedRange(matched.length, rendered.length);
+    if (range) range.textContent = describeRenderedRange(matched.length, matched.length);
 
-    const hasQuery = ctx.query.trim() !== '';
+    const hasQuery = ctx.query.trim() !== '' || ctx.dateFrom !== '' || ctx.dateTo !== '';
     for (const id of ['review-select-matched', 'review-clear-matched']) {
       const button = this.shadowRoot.getElementById(id) as HTMLButtonElement | null;
       // 検索語が無いときは「検索結果」が全件と同義になり、全選択 / 全解除と区別が付かない
       if (button) button.disabled = !hasQuery;
     }
+  }
+
+  private buildAssetDetail(
+    kind: string,
+    name: string,
+    extension: string,
+    metadata: { readonly size?: number; readonly width?: number; readonly height?: number },
+  ): HTMLLIElement {
+    const item = document.createElement('li');
+    const dimensions =
+      metadata.width !== undefined && metadata.height !== undefined ? ` / ${metadata.width}×${metadata.height}` : '';
+    const size = metadata.size === undefined ? 'サイズ不明' : formatByteSize(metadata.size);
+    item.textContent = `${kind}: ${name}${extension} / ${size}${dimensions}`;
+    return item;
   }
 
   /**
@@ -1115,6 +1358,8 @@ export class OverlayController {
       ctx.prepareTimer = null;
       this.prepareProjection(ctx);
     }, PROJECTION_DEBOUNCE_MS);
+    this.renderContentOptions();
+    this.renderPostList();
     this.refreshReviewSummary();
   }
 
@@ -1129,7 +1374,7 @@ export class OverlayController {
     // 導出待ちの間にパネルが閉じられた、または再収集された場合は捨てる
     if (this.review !== ctx) return;
     try {
-      const json = ctx.result.downloadObject.project(toSelection(ctx.selection));
+      const json = ctx.result.downloadObject.project(toSelection(ctx.posts, ctx.selection));
       const { manifest } = preflightDownload(json);
       ctx.prepared = { json, manifest };
       ctx.errorMessage = null;
@@ -1154,6 +1399,7 @@ export class OverlayController {
     if (sizeEl) sizeEl.textContent = describeSizeEstimate(counts);
     publishTestState({
       'selected-post-count': String(counts.postCount),
+      'selected-body-count': String(counts.bodyCount),
       'selected-file-count': String(counts.fileCount),
       'selected-cover-count': String(counts.coverCount),
     });
@@ -1173,7 +1419,7 @@ export class OverlayController {
     if (confirmBtn) {
       // 投稿が 0 件なら picker を出さない。押せてしまうと、書くものが無いのに新規ファイルだけ作る。
       // 収集済みの投稿から作った集合なので、要素があれば必ずどれかの投稿に対応する
-      confirmBtn.disabled = ctx.selection.postIds.size === 0 || ctx.prepared === null;
+      confirmBtn.disabled = effectivePostIds(ctx.posts, ctx.selection).size === 0 || ctx.prepared === null;
     }
   }
 
@@ -1295,7 +1541,7 @@ export class OverlayController {
     this.renderComplete(message);
   }
 
-  private async startCollecting(settings: CollectorSettings, ignoreHistory = false) {
+  private async startCollecting(settings: CollectorSettings, includePreviouslySaved = false) {
     if (!this.pageType) return;
     resetTestState();
     // 新しい収集を始めた時点で、前の ZIP フェーズの結果は観測状態に載せてはいけない
@@ -1315,7 +1561,7 @@ export class OverlayController {
       // 保存先の確保は review の確定時なので、ここで待ってもユーザアクティベーションは失効しない
       const collectCreatorId = this.pageType.creatorId;
       const history = await acquireHistoryForCollect(this.deletingCreators.get(collectCreatorId), () =>
-        readCreatorHistoryForCollect(collectCreatorId),
+        readCreatorHistoryForCollect(collectCreatorId, signal),
       );
       if (!this.isCurrentCollect(signal)) return;
       const creatorId = this.pageType.creatorId;
@@ -1334,8 +1580,8 @@ export class OverlayController {
         },
         signal,
         historyForCollect(history, creatorId),
-        // 「前回保存分も取得する」は省略だけを止める。凍結名は据え置く
-        !ignoreHistory,
+        // 編集検出と review での再選択に post.info が必要なので、保存実績があっても常に収集する。
+        false,
       );
 
       // 状態に触る前に現行かを見る (ZIP フェーズと同じ順序)
@@ -1347,7 +1593,7 @@ export class OverlayController {
 
       // 収集で分かったことは ZIP を作るかに関わらず記録する。全件が省かれた回は ZIP を
       // 作らないので、ここで書かないと走査実績と最終利用時刻がその回だけ残らない
-      const observationError = await recordObservation(creatorId, result);
+      const observationError = await recordObservation(creatorId, result, signal);
       if (!this.isCurrentCollect(signal)) return;
 
       publishTestState({
@@ -1377,7 +1623,7 @@ export class OverlayController {
         return;
       }
 
-      this.enterReview(creatorId, result, observationError);
+      this.enterReview(creatorId, result, observationError, includePreviouslySaved, settings.mediaConcurrency);
     } catch (e) {
       // hidePanel() や新しい収集が既に走っているなら、旧実行はここで降りる。
       // エラー表示も publish も新実行のものを上書きしてしまう
@@ -1411,15 +1657,33 @@ export class OverlayController {
   }
 
   /** 収集結果を review 画面に載せる。収集用の controller はここで役目を終える */
-  private enterReview(creatorId: string, result: CollectResult, observationError: string | null) {
+  private enterReview(
+    creatorId: string,
+    result: CollectResult,
+    observationError: string | null,
+    includePreviouslySaved: boolean,
+    mediaConcurrency = DEFAULT_MEDIA_CONCURRENCY,
+  ) {
     const posts = result.downloadObject.listPosts();
+    const selectAll = createInitialSelection(posts);
+    const savedPostIds = new Set(
+      posts
+        .filter((post) =>
+          isPostSavedForSelection(result.historyUsed, post, result.listedRevisions.get(post.postId) ?? null, selectAll),
+        )
+        .map((post) => post.postId),
+    );
     this.review = {
       creatorId,
       result,
       posts,
-      extensionOptions: listExtensionOptions(posts),
-      selection: createInitialSelection(posts),
+      selection: createInitialSelection(posts, includePreviouslySaved ? new Set() : savedPostIds),
+      history: result.historyUsed,
+      mediaConcurrency: Math.max(1, Math.min(MAX_MEDIA_CONCURRENCY, Math.trunc(mediaConcurrency) || 1)),
       query: '',
+      dateField: 'updated',
+      dateFrom: '',
+      dateTo: '',
       prepared: null,
       prepareTimer: null,
       errorMessage: null,
@@ -1456,7 +1720,7 @@ export class OverlayController {
           if (this.downloadRunId !== runId) return;
           const logArea = this.shadowRoot.getElementById('dl-log') as HTMLTextAreaElement | null;
           if (logArea) {
-            logArea.value += `${message}\n`;
+            logArea.value += `${formatDownloadLog(message)}\n`;
             logArea.scrollTop = logArea.scrollHeight;
           }
         },
@@ -1473,6 +1737,7 @@ export class OverlayController {
         downloadProgress,
         signal,
         () => this.downloadRunId === runId,
+        ctx.mediaConcurrency,
       );
       // 履歴の記録は現行かの判定より前に行う。ZIP を書けたという事実は、その実行が
       // 今の画面のものかどうかに依らない (Issue #56)

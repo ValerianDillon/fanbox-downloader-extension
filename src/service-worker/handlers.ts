@@ -15,6 +15,11 @@ import { type HistoryStorageArea, HistoryStore } from './history-store';
  * ユニットテストから直接 import してもグローバルな chrome スタブなしに読み込める。
  */
 const backoffStore = new BackoffStore();
+export const API_FETCH_TIMEOUT_MS = 30_000;
+
+type ApiFetchOptions = {
+  timeoutMs?: number;
+};
 
 /**
  * store.get() を安全化する。BackoffStore の get()/record() は chrome.storage.session を
@@ -79,16 +84,19 @@ export type ApiFetchResponse = {
 /**
  * api.fanbox.cc への fetch プロキシ本体。429 ならバックオフ期限を記録してから応答する。
  *
- * content script が sendMessageAbortable で待ち合わせを中断していても、この関数自体は
- * 最後まで完走する (fetch そのものを打ち切る仕組みは持たない。真の直列化には service worker 側で
- * AbortController を message 連携させる必要があるが、Issue #16 のスコープ外としている)。
- * そのため、中断された直後に届いた 429 の Retry-After も取りこぼさずに記録できる。
+ * content script が sendMessageAbortable で待ち合わせを中断しても、その中断はこの関数へは
+ * 伝播しない。そのため、中断された直後に届いた 429 の Retry-After も取りこぼさずに記録できる。
+ * 一方、応答のない fetch は内部タイムアウトで打ち切り、message 応答を必ず返す。
  *
  * @param store 省略時はモジュール共有の singleton を使う。テストでは service worker の
  *   1 回のライフタイムを表す独立したインスタンスを都度渡すことで、同一プロセス内で
  *   複数の「起動」を再現できる (BackoffStore のコメント参照)。
  */
-export async function handleFetchApi(url: string, store: BackoffStore = backoffStore): Promise<ApiFetchResponse> {
+export async function handleFetchApi(
+  url: string,
+  store: BackoffStore = backoffStore,
+  options: ApiFetchOptions = {},
+): Promise<ApiFetchResponse> {
   // fetch を発行できたときだけ値が入る。catch 側は「発行前に失敗したか」を判別できないと
   // 実発行していない時刻を報告しかねないので、try の外で持つ
   let issuedAt: number | undefined;
@@ -114,34 +122,43 @@ export async function handleFetchApi(url: string, store: BackoffStore = backoffS
       return { ok: false, status: 0, retryAfter: null, backoffUntil: knownBackoffUntil, kind: 'backoff' };
     }
 
-    // 発行時刻の記録は fetch の直前で採る。ここより前 (safeGet の前) で採ると、
-    // 期限の読み取りに掛かった時間ぶん実発行より早い時刻を報告することになる
-    issuedAt = Date.now();
-    const r = await fetch(url, { credentials: 'include' });
-    const retryAfter = r.headers.get('Retry-After');
-    if (r.status === 429) {
-      // 解釈は共有セッションと同じ実装 (download-helper/api-session) を使う。別実装にすると
-      // 解釈が食い違い、セッションが「読めない値なので固定バックオフ」と判断した Retry-After を
-      // service worker 側が期限として記録してしまう。記録はタブと収集をまたいで共有され、
-      // 次の発行はその期限まで deferred で待たされるので、食い違いはそのまま長すぎる待機になる。
-      const waitMs = parseRetryAfterMs(retryAfter, Date.now()) ?? null;
-      // Retry-After が読めないときは新たな期限を主張しない (現在の記録をそのまま返す)。
-      // 何秒待てばよいかの推測はサーバーの指示ではなく content script 側のポリシーなので、
-      // ここで決め打ちにしない。
-      //
-      // record (永続化) には safeRecord を使う: 429 を受け取ったという事実と Retry-After は
-      // fetch から確実に得られているので、永続化の失敗をここで例外にすると、この関数の外側の
-      // catch が「通信障害 (status: 0)」にすり替えてしまい、content script は既知の
-      // Retry-After を無視して短い間隔で再送してしまう。
-      const backoffUntil = waitMs !== null ? await safeRecord(store, Date.now() + waitMs) : await safeGet(store);
-      return { ok: false, status: 429, retryAfter, backoffUntil, issuedAt };
+    const controller = new AbortController();
+    const timeoutMs = options.timeoutMs ?? API_FETCH_TIMEOUT_MS;
+    const timeoutId = setTimeout(() => {
+      controller.abort(new DOMException(`FANBOX API が ${timeoutMs}ms 以内に応答しませんでした`, 'TimeoutError'));
+    }, timeoutMs);
+    try {
+      // 発行時刻の記録は fetch の直前で採る。ここより前 (safeGet の前) で採ると、
+      // 期限の読み取りに掛かった時間ぶん実発行より早い時刻を報告することになる
+      issuedAt = Date.now();
+      const r = await fetch(url, { credentials: 'include', signal: controller.signal });
+      const retryAfter = r.headers.get('Retry-After');
+      if (r.status === 429) {
+        // 解釈は共有セッションと同じ実装 (download-helper/api-session) を使う。別実装にすると
+        // 解釈が食い違い、セッションが「読めない値なので固定バックオフ」と判断した Retry-After を
+        // service worker 側が期限として記録してしまう。記録はタブと収集をまたいで共有され、
+        // 次の発行はその期限まで deferred で待たされるので、食い違いはそのまま長すぎる待機になる。
+        const waitMs = parseRetryAfterMs(retryAfter, Date.now()) ?? null;
+        // Retry-After が読めないときは新たな期限を主張しない (現在の記録をそのまま返す)。
+        // 何秒待てばよいかの推測はサーバーの指示ではなく content script 側のポリシーなので、
+        // ここで決め打ちにしない。
+        //
+        // record (永続化) には safeRecord を使う: 429 を受け取ったという事実と Retry-After は
+        // fetch から確実に得られているので、永続化の失敗をここで例外にすると、この関数の外側の
+        // catch が「通信障害 (status: 0)」にすり替えてしまい、content script は既知の
+        // Retry-After を無視して短い間隔で再送してしまう。
+        const backoffUntil = waitMs !== null ? await safeRecord(store, Date.now() + waitMs) : await safeGet(store);
+        return { ok: false, status: 429, retryAfter, backoffUntil, issuedAt };
+      }
+      const backoffUntil = await safeGet(store);
+      if (!r.ok) {
+        return { ok: false, status: r.status, retryAfter, backoffUntil, issuedAt };
+      }
+      const body = await r.text();
+      return { ok: true, status: r.status, retryAfter, body, backoffUntil, issuedAt };
+    } finally {
+      clearTimeout(timeoutId);
     }
-    const backoffUntil = await safeGet(store);
-    if (!r.ok) {
-      return { ok: false, status: r.status, retryAfter, backoffUntil, issuedAt };
-    }
-    const body = await r.text();
-    return { ok: true, status: r.status, retryAfter, body, backoffUntil, issuedAt };
   } catch (e) {
     // ここに到達するのは fetch() 自体の失敗 (実際の通信障害) のみ。safeGet/safeRecord は
     // 例外を投げないので、store へのアクセス失敗がここに紛れ込んで「通信障害」を誤って

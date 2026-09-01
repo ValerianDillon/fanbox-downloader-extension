@@ -44,7 +44,8 @@ Codexはファイルを編集する前に、各ruleのYAML frontmatterにある 
 ## 実機テスト (実 FANBOX)
 
 ランチャーは `scripts/live-browser.ts`。
-起動方法・手順・診断・安全上の注意は `.claude/skills/extension-live-test/SKILL.md` が共有SoTであり、Codexからは `.agents/skills/extension-live-test/SKILL.md` を入口として利用する。
+起動方法・手順・診断・安全上の注意は `.agents/skills/extension-live-test/SKILL.md` が共有SoTである。
+Claude Code は `.claude/skills/extension-live-test/SKILL.md` の wrapper から共有SoTを参照する。
 
 ## コーディング規約
 

@@ -3,9 +3,9 @@
  * 実機テストの CDP ターゲット (service worker / page) で任意の JS 式を評価する CLI。
  *
  * scripts/live-browser.ts が公開する CDP endpoint に対し、対象ターゲットの
- * webSocketDebuggerUrl へ直接 WebSocket 接続して Runtime.evaluate を送る
- * (chrome-devtools MCP が同じ endpoint を掴んでいると playwright.connectOverCDP は
- * タイムアウトすることがあるため、生 CDP を使う。詳細は SKILL.md 参照)。
+ * webSocketDebuggerUrl へ直接 WebSocket 接続して Runtime.evaluate を送る。
+ * agent-browser が page target を操作している間も service worker target を直接調べられるよう、
+ * Playwright への二重接続ではなく生 CDP を使う。詳細は SKILL.md を参照する。
  *
  * 使い方: bun scripts/live-cdp-eval.ts <sw|page> <expression> [--port <n>]
  *   sw   ... type === 'service_worker' のターゲットを対象にする

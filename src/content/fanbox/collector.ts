@@ -24,6 +24,8 @@ export type CollectorSettings = {
   isIgnoreFree: boolean;
   limit: number | null;
   apiIntervalMs: number | null;
+  /** ZIP フェーズの並列数。収集では使わず review まで運ぶ。 */
+  mediaConcurrency?: number;
 };
 
 /**
@@ -111,6 +113,8 @@ export type CollectResult = {
    * 一覧から消えた投稿の判断材料としては完走と変わらない。
    */
   limited: boolean;
+  /** archive 名と前回保存済み表示に使用できた履歴。凍結名が不正なら null。 */
+  historyUsed: CreatorHistory | null;
 };
 
 export type ProgressCallback = (current: number, total: number) => void;
@@ -314,6 +318,7 @@ export async function collect(
     // 取りこぼしも無い) は履歴側の復号が検査する
     completedFullScan: completedFullScan && stoppedReason === undefined,
     limited,
+    historyUsed: plan.history,
   };
 }
 
@@ -422,7 +427,7 @@ async function getItemsByCreator(
       stoppedByLimit = true;
       return counts();
     }
-    console.log(`${i + 1}回目`);
+    console.info('[FBDL] 投稿一覧ページを取得', { page: i + 1, pageCount: urls.length, url: urls[i] });
 
     // try は一覧ページ 1 回分の取得だけを囲む。以前は投稿ループ全体 (addByPostInfo や
     // onProgress 呼び出しを含む) までこの try に入っており、そこで発生した想定外の例外
@@ -448,7 +453,7 @@ async function getItemsByCreator(
       // それ以外の想定外の例外を握りつぶすと、こちらのバグが「一覧ページの取得に
       // 失敗した」として静かに握り潰され、部分 ZIP がそのまま保存されてしまう
       if (!(e instanceof HttpError)) throw e;
-      console.error(`${i + 1}回目の投稿リスト取得に失敗:`, e);
+      console.error('[FBDL] 投稿一覧ページの取得に失敗', { page: i + 1, pageCount: urls.length, error: e });
       failedPageCount++;
       continue;
     }
@@ -456,7 +461,11 @@ async function getItemsByCreator(
     if (i === 0) {
       totalEstimate = urls.length * postList.length;
     }
-    console.log(`投稿の数:${postList.length}`);
+    console.info('[FBDL] 投稿一覧ページを取得完了', {
+      page: i + 1,
+      pageCount: urls.length,
+      postCount: postList.length,
+    });
 
     // この try は投稿ループの中で再試行枠の枯渇 (RateLimitExhaustedError /
     // TransportExhaustedError) が起きた場合に限り、それまでの集計 (counts()) を失わずに
