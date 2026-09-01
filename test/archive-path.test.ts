@@ -83,6 +83,19 @@ describe('投稿ディレクトリ', () => {
     expect(utils.encodeFileName(normalized)).toBe(normalized);
   });
 
+  test.each(['/', '%', '?'])('正規化で膨らむ %s の繰り返しも最終セグメントを上限内に収める', (character) => {
+    const allocator = createPostIdArchivePathAllocator(new DownloadUtils());
+    const [name] = allocator.allocatePostDirectoryNames([makePost('123', character.repeat(190))]);
+    expect(byteLength(name)).toBeLessThanOrEqual(200);
+  });
+
+  test('符号化した postId だけで上限を超える場合は拒否する', () => {
+    const allocator = createPostIdArchivePathAllocator(new DownloadUtils());
+    expect(() => allocator.allocatePostDirectoryNames([makePost('_'.repeat(50), 'title')])).toThrow(
+      'UTF-8 202 bytes, 上限 200 bytes',
+    );
+  });
+
   test('凍結済みディレクトリを使い、未保存投稿だけ現在の規則で割り当てる', () => {
     const allocator = createPostIdArchivePathAllocator(new DownloadUtils(), {
       postDirectories: new Map([['p1', '過去タイトル [p1]']]),

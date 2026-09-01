@@ -1,3 +1,4 @@
+import { parseRetryAfterMs } from 'download-helper/api-session';
 import type {
   DownloadJsonObj,
   DownloadZipResult,
@@ -44,6 +45,60 @@ function hostnameOf(url: string): string {
   }
 }
 
+type MediaCooldownDependencies = {
+  readonly now: () => number;
+  readonly sleep: (ms: number, signal?: AbortSignal) => Promise<boolean>;
+};
+
+export type MediaCooldown = {
+  /** 既知の期限まで待つ。中断された場合は false。 */
+  readonly wait: (host: string, signal?: AbortSignal) => Promise<boolean>;
+  /** 429 の Retry-After を host の共有期限へ反映する。読めない場合は 1 秒を使う。 */
+  readonly defer: (host: string, retryAfter: string | null) => void;
+};
+
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  if (ms <= 0) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (completed: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      signal?.removeEventListener('abort', onAbort);
+      resolve(completed);
+    };
+    const onAbort = () => finish(false);
+    const timeoutId = setTimeout(() => finish(true), ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+
+/** 同一 ZIP 実行内で host ごとの Retry-After 期限を共有する。 */
+export function createMediaCooldown(dependencies: Partial<MediaCooldownDependencies> = {}): MediaCooldown {
+  const now = dependencies.now ?? Date.now;
+  const sleep = dependencies.sleep ?? sleepAbortable;
+  const untilByHost = new Map<string, number>();
+  return {
+    async wait(host, signal) {
+      for (;;) {
+        if (signal?.aborted) return false;
+        const remaining = (untilByHost.get(host) ?? 0) - now();
+        if (remaining <= 0) return true;
+        if (!(await sleep(remaining, signal))) return false;
+        // 待機中に別 worker がより長い Retry-After を観測していれば、その期限も守る。
+      }
+    },
+    defer(host, retryAfter) {
+      const observedAt = now();
+      const waitMs = parseRetryAfterMs(retryAfter, observedAt) ?? 1000;
+      untilByHost.set(host, Math.max(untilByHost.get(host) ?? 0, observedAt + waitMs));
+    },
+  };
+}
+
 /**
  * リトライ付き fetch (service worker プロキシ経由)
  *
@@ -57,8 +112,7 @@ function hostnameOf(url: string): string {
  * 分割転送により存在しなくなったため、サイズ失敗を再試行から除外する分岐は持たない。
  *
  * 中断されたら即座に null を返す。downloadZip は次のループ境界で signal を見て
- * ZIP を閉じるので、ここで例外にする必要はない。リトライ待ちを挟むと、
- * キャンセルしてから実際に止まるまでが retries × 1 秒ぶん延びる。
+ * ZIP を閉じるので、ここで例外にする必要はない。固定待機と cooldown 待機も signal で打ち切る。
  *
  * 試行単位の観測 (Issue #18 第 1 段階): 実際に応答を受け取れた試行ごとに `attempts` へ記録し、
  * 併せて構造化ログとして console.info に単一オブジェクトで出力する。中断により応答を
@@ -76,10 +130,12 @@ export async function fetchWithRetry(
   signal: AbortSignal | undefined,
   kind: 'cover' | 'file',
   attempts: MediaFetchAttempt[],
+  cooldown: MediaCooldown = createMediaCooldown(),
 ): Promise<Blob | null> {
   const host = hostnameOf(url);
   for (let i = 0; i <= retries; i++) {
     if (signal?.aborted) return null;
+    if (!(await cooldown.wait(host, signal))) return null;
     const result = await fetchMediaViaPort(url, signal);
     if (result) {
       const attempt: MediaFetchAttempt = {
@@ -92,6 +148,7 @@ export async function fetchWithRetry(
       attempts.push(attempt);
       console.info('[FBDL] メディア取得', attempt);
       if (result.blob) return result.blob;
+      if (result.status === 429) cooldown.defer(host, result.retryAfter);
     }
     if (signal?.aborted) return null;
     if (i < retries) {
@@ -101,7 +158,8 @@ export async function fetchWithRetry(
         retry: i + 1,
         maxRetries: retries,
       });
-      await utils.sleep(1000);
+      // 429 は host 共有の cooldown が次の loop 先頭で待つ。それ以外は対象単位で 1 秒待つ。
+      if (result?.status !== 429 && !(await sleepAbortable(1000, signal))) return null;
     }
   }
   return null;
@@ -274,8 +332,9 @@ export async function downloadAsZip(
   mediaConcurrency = DEFAULT_MEDIA_CONCURRENCY,
 ): Promise<DownloadAsZipResult> {
   const attempts: MediaFetchAttempt[] = [];
+  const cooldown = createMediaCooldown();
   const directFetchFile = wrapFetchFileForTest(
-    (url, name, context) => fetchWithRetry(url, name, 1, signal, context.kind, attempts),
+    (url, name, context) => fetchWithRetry(url, name, 1, signal, context.kind, attempts, cooldown),
     shouldPublish,
   );
   const fetchFile = createConcurrentFetchFile(downloadObj, directFetchFile, mediaConcurrency, signal);

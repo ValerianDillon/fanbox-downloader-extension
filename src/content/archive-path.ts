@@ -171,7 +171,6 @@ function truncateToBytes(value: string, maxBytes: number): string {
  * @param budgetBytes 投稿タイトルに割り当てられる UTF-8 バイト数
  */
 function toNameSlug(name: string, utils: DownloadUtils, budgetBytes: number): string {
-  const truncated = truncateToBytes(name, budgetBytes);
   // encodeFileName は Windows で使えない文字を置き換えるが、`%` は残す。共有層の HTML 生成が使う
   // encodeURI も `%` を符号化しないので、`%2F資料` という名前は ZIP ではそのままなのに HTML の
   // 参照は `/資料` として解釈され、実在しないファイルを指す。全角へ寄せるのは encodeFileName が
@@ -181,10 +180,13 @@ function toNameSlug(name: string, utils: DownloadUtils, budgetBytes: number): st
   // `%` と `?` は encodeFileName が写さない。`%` は HTML の参照がずれ (encodeURI が符号化しない)、
   // `?` は Windows でファイル名に使えない。encodeFileName が他の使えない文字に取っているのと
   // 同じやり方で全角へ寄せる
-  const escaped = utils.encodeFileName(toWellFormed(truncated)).replaceAll('%', '％').replaceAll('?', '？');
+  const escaped = utils.encodeFileName(toWellFormed(name)).replaceAll('%', '％').replaceAll('?', '？');
+  // 正規化で 1 byte の文字が全角 3 bytes へ膨らみうるので、バイト予算による切り詰めは
+  // 正規化後に行う。先に切ると `/` の繰り返しなどで最終セグメントが予算を超える。
+  const truncated = truncateToBytes(escaped, budgetBytes);
   // 末尾の空白とピリオドは encodeFileName が残す。Windows はそれらを取り除いて解釈するので、
   // 残すと共有層の予約名判定と食い違う
-  return escaped.replace(/[\s.]+$/u, '');
+  return truncated.replace(/[\s.]+$/u, '');
 }
 
 /**
@@ -252,7 +254,10 @@ export function createPostIdArchivePathAllocator(
     const identity = `[${toSafeIdentity(post.postId)}]`;
     // 識別子を先に確保し、残りをタイトルに割り当てる。間の空白 1 byte も引く。
     const slug = toNameSlug(post.name, utils, SEGMENT_MAX_BYTES - byteLength(identity) - 1);
-    return slug === '' ? identity : `${slug} ${identity}`;
+    const directory = slug === '' ? identity : `${slug} ${identity}`;
+    // postId の符号化自体が長い場合もあるので、組み立て後のセグメント全体を契約で検証する。
+    assertUsableSegment(directory, `投稿ディレクトリ名 (${post.postId})`, utils);
+    return directory;
   };
 
   return {

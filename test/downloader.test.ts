@@ -4,6 +4,7 @@ import { DownloadHelper, DownloadUtils } from 'download-helper/download-helper';
 import type { DownloadProgress, FileSystemFileHandle, MediaFetchAttempt } from '../src/content/downloader';
 import {
   createConcurrentFetchFile,
+  createMediaCooldown,
   downloadAsZip,
   fetchWithRetry,
   formatDownloadLog,
@@ -392,7 +393,7 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
   test('試行記録は chrome.storage.local にも残る (実行が失敗しても)', async () => {
     // console.info への出力はページを閉じると消えるため、通常利用で 429 が出ているかを
     // 後から判断できない (Issue #51 の観測)
-    restoreRuntime = installFakeMediaRuntime(simpleResponder(() => ({ status: 429, retryAfter: '3' }))).restore;
+    restoreRuntime = installFakeMediaRuntime(simpleResponder(() => ({ status: 429, retryAfter: '0' }))).restore;
     const backing = new Map<string, unknown>();
     // biome-ignore lint/suspicious/noExplicitAny: chrome storage mock
     (globalThis as any).chrome.storage = { local: createFakeSessionStorage(backing) };
@@ -423,14 +424,14 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
 
       const stored = backing.get(MEDIA_ATTEMPT_STORAGE_KEY) as typeof attempts;
       expect(stored).toHaveLength(attempts.length);
-      expect(stored.every((a) => a.status === 429 && a.retryAfter === '3' && a.host === 'example.test')).toBe(true);
+      expect(stored.every((a) => a.status === 429 && a.retryAfter === '0' && a.host === 'example.test')).toBe(true);
     } finally {
       globalThis.setTimeout = origSetTimeout;
     }
   });
 
   test('取得に 2 回とも失敗 (429) すると zip.failedFileCount に反映され、attempts にも 2 回分の 429 が残る', async () => {
-    restoreRuntime = installFakeMediaRuntime(simpleResponder(() => ({ status: 429, retryAfter: '3' }))).restore;
+    restoreRuntime = installFakeMediaRuntime(simpleResponder(() => ({ status: 429, retryAfter: '0' }))).restore;
     const origSetTimeout = globalThis.setTimeout;
     // fetchWithRetry の再試行間の 1 秒待機を仮想時間で進める
     globalThis.setTimeout = ((handler: TimerHandler) =>
@@ -463,7 +464,7 @@ describe('downloadAsZip - cover/files も日時付与 (chrome モック)', () =>
 
       // 1 対象最大 2 試行なので、429 が 2 回とも記録に残る
       expect(attempts.length).toBe(2);
-      expect(attempts.every((a) => a.status === 429 && a.retryAfter === '3' && a.kind === 'file')).toBe(true);
+      expect(attempts.every((a) => a.status === 429 && a.retryAfter === '0' && a.kind === 'file')).toBe(true);
     } finally {
       globalThis.setTimeout = origSetTimeout;
     }
@@ -488,11 +489,6 @@ describe('fetchWithRetry の試行記録 (Issue #18)', () => {
   });
 
   test('初回 429 → 再試行 200 で成功しても、初回の 429 が試行記録に残る', async () => {
-    // fetchWithRetry の再試行間には 1 秒の固定待機 (utils.sleep) があるため、
-    // setTimeout を即時実行に置換して仮想時間で進める (test/fanbox/api.test.ts と同じ手法)
-    globalThis.setTimeout = ((handler: TimerHandler) =>
-      origSetTimeout(handler as () => void, 0)) as unknown as typeof setTimeout;
-
     let calls = 0;
     const runtime = installFakeMediaRuntime(
       simpleResponder(() => {
@@ -506,7 +502,23 @@ describe('fetchWithRetry の試行記録 (Issue #18)', () => {
     console.info = ((...args: unknown[]) => loggedAttempts.push(args[1])) as typeof console.info;
 
     const attempts: MediaFetchAttempt[] = [];
-    const blob = await fetchWithRetry('https://downloads.fanbox.cc/f', 'f.bin', 1, undefined, 'file', attempts);
+    let now = 0;
+    const cooldown = createMediaCooldown({
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+        return true;
+      },
+    });
+    const blob = await fetchWithRetry(
+      'https://downloads.fanbox.cc/f',
+      'f.bin',
+      1,
+      undefined,
+      'file',
+      attempts,
+      cooldown,
+    );
 
     expect(blob).not.toBeNull();
     expect(calls).toBe(2);
@@ -518,6 +530,45 @@ describe('fetchWithRetry の試行記録 (Issue #18)', () => {
     expect(attempts[1].retryAfter).toBeNull();
     // 試行ごとに console.info へ単一オブジェクトとして構造化ログを出す
     expect(loggedAttempts).toEqual(attempts);
+  });
+
+  test('最初の 429 が同一 host の後続取得と全 retry を Retry-After まで止める', async () => {
+    const calls: string[] = [];
+    const runtime = installFakeMediaRuntime(
+      simpleResponder((request) => {
+        calls.push(request.url);
+        if (request.url.endsWith('/a') && calls.length === 1) return { status: 429, retryAfter: '60' };
+        return { status: 200, body: new TextEncoder().encode('ok') };
+      }),
+    );
+    restoreRuntime = runtime.restore;
+    let now = 1000;
+    const sleepers: Array<{ until: number; resolve: (completed: boolean) => void }> = [];
+    const cooldown = createMediaCooldown({
+      now: () => now,
+      sleep: (ms) =>
+        new Promise<boolean>((resolve) => {
+          sleepers.push({ until: now + ms, resolve });
+        }),
+    });
+    const attempts: MediaFetchAttempt[] = [];
+    const a = fetchWithRetry('https://downloads.fanbox.cc/a', 'a.bin', 1, undefined, 'file', attempts, cooldown);
+    while (attempts.length === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+    const b = fetchWithRetry('https://downloads.fanbox.cc/b', 'b.bin', 1, undefined, 'file', attempts, cooldown);
+    await Promise.resolve();
+
+    expect(calls).toEqual(['https://downloads.fanbox.cc/a']);
+    expect(sleepers).toHaveLength(2);
+
+    now += 60_000;
+    for (const sleeper of sleepers.splice(0)) {
+      expect(sleeper.until).toBe(now);
+      sleeper.resolve(true);
+    }
+    const results = await Promise.all([a, b]);
+    expect(results.every((blob) => blob !== null)).toBe(true);
+    expect(calls.filter((url) => url.endsWith('/a'))).toHaveLength(2);
+    expect(calls.filter((url) => url.endsWith('/b'))).toHaveLength(1);
   });
 
   test('通信失敗 (service worker が status:0 を返す) は 2 回とも status 0 で記録され、最終的に blob は null', async () => {

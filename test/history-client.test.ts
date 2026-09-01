@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   applyCreatorHistory,
+  HISTORY_MESSAGE_TIMEOUT_MS,
   readCreatorHistory,
   readCreatorHistoryForCollect,
   removeCreatorHistory,
@@ -100,6 +101,36 @@ describe('コンテンツスクリプトの履歴クライアント', () => {
     const result = await applyCreatorHistory(update);
 
     expect(result).toEqual({ ok: true });
+  });
+
+  test('service worker が応答しなくても上限時間後に失敗を返す (収集完了画面を止め続けないため)。', async () => {
+    installChrome({ runtime: { sendMessage: () => new Promise(() => {}) } });
+    const originalSetTimeout = globalThis.setTimeout;
+    let timeout: (() => void) | undefined;
+    globalThis.setTimeout = ((handler: TimerHandler, ms?: number) => {
+      expect(ms).toBe(HISTORY_MESSAGE_TIMEOUT_MS);
+      timeout = handler as () => void;
+      return 1;
+    }) as unknown as typeof setTimeout;
+    try {
+      const pending = applyCreatorHistory(update);
+      timeout?.();
+      const result = await pending;
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('35 秒以内');
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
+  });
+
+  test('収集の AbortSignal で service worker の未応答待機を打ち切る', async () => {
+    installChrome({ runtime: { sendMessage: () => new Promise(() => {}) } });
+    const controller = new AbortController();
+    const pending = applyCreatorHistory(update, controller.signal);
+    controller.abort();
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('AbortError');
   });
 
   test('応答が undefined なら applyCreatorHistory は ok: false を返す (listener の無い service worker を成功と誤認しないため)。', async () => {

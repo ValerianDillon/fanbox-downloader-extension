@@ -92,6 +92,13 @@ describe('投稿情報ファイル', () => {
     ['duplicate revision', (value: Record<string, unknown>) => (value.listedRevisions as unknown[]).push(['p1', null])],
     ['invalid count', (value: Record<string, unknown>) => (value.failedPageCount = -1)],
     ['invalid exportedAt', (value: Record<string, unknown>) => (value.exportedAt = 'not-a-date')],
+    [
+      'script 付き投稿 HTML',
+      (value: Record<string, unknown>) =>
+        ((value.collection as { posts: Array<{ html: string[] }> }).posts[0].html = [
+          '<script>globalThis.pwned=1</script>',
+        ]),
+    ],
   ])('%s が壊れた外部ファイルを理由付きで拒否する', (_label, mutate) => {
     const value = JSON.parse(JSON.stringify(createCollectionFile('creator', makeResult()))) as Record<string, unknown>;
     mutate(value);

@@ -366,9 +366,13 @@ export function joinHistoryErrors(observationError: string | null, saveError: st
  *
  * ZIP を作るかに関わらず送る。理由は `buildObservationUpdate` の JSDoc を参照。
  */
-export async function recordObservation(creatorId: string, result: CollectResult): Promise<string | null> {
+export async function recordObservation(
+  creatorId: string,
+  result: CollectResult,
+  signal?: AbortSignal,
+): Promise<string | null> {
   try {
-    const response = await applyCreatorHistory(buildObservationUpdate(creatorId, result));
+    const response = await applyCreatorHistory(buildObservationUpdate(creatorId, result), signal);
     return response.ok ? null : (response.error ?? '不明な理由');
   } catch (e) {
     console.error('収集結果の記録に失敗:', e);
@@ -1557,7 +1561,7 @@ export class OverlayController {
       // 保存先の確保は review の確定時なので、ここで待ってもユーザアクティベーションは失効しない
       const collectCreatorId = this.pageType.creatorId;
       const history = await acquireHistoryForCollect(this.deletingCreators.get(collectCreatorId), () =>
-        readCreatorHistoryForCollect(collectCreatorId),
+        readCreatorHistoryForCollect(collectCreatorId, signal),
       );
       if (!this.isCurrentCollect(signal)) return;
       const creatorId = this.pageType.creatorId;
@@ -1589,7 +1593,7 @@ export class OverlayController {
 
       // 収集で分かったことは ZIP を作るかに関わらず記録する。全件が省かれた回は ZIP を
       // 作らないので、ここで書かないと走査実績と最終利用時刻がその回だけ残らない
-      const observationError = await recordObservation(creatorId, result);
+      const observationError = await recordObservation(creatorId, result, signal);
       if (!this.isCurrentCollect(signal)) return;
 
       publishTestState({
