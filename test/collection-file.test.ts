@@ -93,6 +93,11 @@ describe('投稿情報ファイル', () => {
     ['invalid count', (value: Record<string, unknown>) => (value.failedPageCount = -1)],
     ['invalid exportedAt', (value: Record<string, unknown>) => (value.exportedAt = 'not-a-date')],
     [
+      'javascript creator URL',
+      (value: Record<string, unknown>) =>
+        ((value.collection as { url: string }).url = 'javascript:fetch("https://evil.test")'),
+    ],
+    [
       'script 付き投稿 HTML',
       (value: Record<string, unknown>) =>
         ((value.collection as { posts: Array<{ html: string[] }> }).posts[0].html = [
