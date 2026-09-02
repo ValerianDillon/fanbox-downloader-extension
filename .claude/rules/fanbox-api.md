@@ -27,4 +27,4 @@ paths:
 
 本文の検証は `addByPostInfo` が行い、収集が実際に読むフィールドだけを厳密に確かめる。情報 JSON に写すだけの付随メタデータは型を検証しない (`invalid` は収集全体の中断を意味するため、読まないフィールドの型変化で全件止めない)。
 
-アセットの `id` は必須検証になった (ValerianDillon/download-helper#41)。無いと `invalid` になり収集が止まる。
+アセットの `id` は必須 (ValerianDillon/download-helper#41)。無いと `invalid` になり収集が止まる。

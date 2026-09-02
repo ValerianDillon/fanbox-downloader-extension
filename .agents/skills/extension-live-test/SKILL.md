@@ -159,7 +159,7 @@ bun scripts/live-cdp-eval.ts sw "(async()=>{const r=await chrome.storage.local.g
 
 記録を消すときは `chrome.storage.local.remove('fbdlMediaAttempts')`。
 
-記録は蓄積先も内容も拡張の実装 (`src/content/media-attempt-log.ts`) 側の契約なので、何を保存しているか・なぜそこに置くかは AGENTS.md を参照する。
+記録は蓄積先も内容も拡張の実装 (`src/content/media-attempt-log.ts`) 側の契約なので、何を保存しているか・なぜそこに置くかは `.claude/rules/media-attempts.md` を参照する。
 
 ## 実機では再現できない経路 (バックオフ待機)
 

@@ -6,7 +6,7 @@ paths:
 
 # archive path の採番 (Issue #56)
 
-`src/content/archive-path.ts` の allocator を共有層に差し替える。
+`src/content/archive-path.ts` の allocator (`createPostIdArchivePathAllocator`) は postId 由来の採番で、共有層の `ArchivePathAllocator` 契約を実装する。
 従来の採番 (`createLegacyArchivePathAllocator`) は同名グループの件数に依存するため、**同名の投稿やアセットが増減すると過去に割り当てた名前まで変わる**。
 複数の ZIP をまたいで同じ投稿を同定できないので、差分ダウンロードの保存実績が指す先を失う。
 
